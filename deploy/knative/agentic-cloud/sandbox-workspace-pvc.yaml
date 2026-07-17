@@ -1,0 +1,23 @@
+# EXPERIMENTAL — shared RWX sandbox workspace, deviates from the shipped P2 design
+# (docs/specs/2026-07-02-p2-shared-sandbox-pool-design.md §D1), which chose per-sandbox
+# RWO and explicitly rejected RWX, citing cross-pod fetch/worktree contention. This PVC
+# lets all 3 pool sandboxes on agentic-cloud mount ONE /workspace, to try the "sandboxes
+# share state" model that ibm-scale-csi (GPFS, RWX-capable) now makes possible.
+#
+# Risk: harness/src/converge.ts uses a single shared object store /workspace/repo + one
+# fixed lock /workspace/.sh-fetch.lock, guarded by flock — written assuming a per-pod FS.
+# With one shared PVC across 3 pods this becomes a cross-pod lock on a shared git repo.
+# flock is POSIX-correct cross-pod on GPFS, so it should serialize correctly, but this is
+# UNTESTED — validate via a real BugStone Act 2 run (parallel leaves across the pool)
+# before trusting it. See .jacohn notes for the validation plan.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sandbox-workspace-shared
+  namespace: serverless-harness
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: ibm-scale-csi
+  resources:
+    requests:
+      storage: 5Gi

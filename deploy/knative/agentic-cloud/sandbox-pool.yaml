@@ -1,0 +1,126 @@
+# EXPERIMENTAL — agentic-cloud sandbox pool on ONE shared RWX PVC (sandbox-workspace-shared,
+# see sandbox-workspace-pvc.yaml in this dir) instead of the default pool's per-sandbox RWO
+# volumeClaimTemplates (deploy/knative/sandbox-pool.yaml). See that file's header comment for
+# why this deviates from the shipped design and what to validate before trusting it.
+#
+# agent-sandbox v0.5.0's controller DeepCopies podTemplate.spec and only mutates .Volumes to
+# merge in volumeClaimTemplate-derived volumes — so with volumeClaimTemplates omitted here, a
+# plain `volumes: [...persistentVolumeClaim...]` in podTemplate.spec passes straight through.
+#
+# Mirrors the live agentic-cloud config otherwise: image, resources, topologySpreadConstraints
+# (node-spread, upstreamed as #134) unchanged.
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata:
+  name: sandbox-0
+  namespace: serverless-harness
+  labels:
+    app: sandbox
+spec:
+  podTemplate:
+    metadata:
+      labels:
+        sh.kagenti.io/sandbox-pool: default
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              sh.kagenti.io/sandbox-pool: default
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: sandbox-workspace-shared
+      containers:
+        - name: sandbox
+          image: 10.43.28.116:5000/serverless-harness-sandbox:k3s-agentic-cloud
+          workingDir: /workspace
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+
+---
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata:
+  name: sandbox-1
+  namespace: serverless-harness
+  labels:
+    app: sandbox
+spec:
+  podTemplate:
+    metadata:
+      labels:
+        sh.kagenti.io/sandbox-pool: default
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              sh.kagenti.io/sandbox-pool: default
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: sandbox-workspace-shared
+      containers:
+        - name: sandbox
+          image: 10.43.28.116:5000/serverless-harness-sandbox:k3s-agentic-cloud
+          workingDir: /workspace
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+
+---
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata:
+  name: sandbox-2
+  namespace: serverless-harness
+  labels:
+    app: sandbox
+spec:
+  podTemplate:
+    metadata:
+      labels:
+        sh.kagenti.io/sandbox-pool: default
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              sh.kagenti.io/sandbox-pool: default
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: sandbox-workspace-shared
+      containers:
+        - name: sandbox
+          image: 10.43.28.116:5000/serverless-harness-sandbox:k3s-agentic-cloud
+          workingDir: /workspace
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
