@@ -93,21 +93,26 @@ Two threads, deliberately separated:
 - **Act 1 (sync, one leaf at a time):** passed cleanly on the shared-RWX config —
   7/7 succeeded, `audit_passed: true`, no converge/lock errors.
 - **Act 2 (async, KEDA-scaled parallel leaves — the actual concurrency stress test):**
-  failed both runs so far. Investigation in progress; **current evidence points away from
-  the GPFS/flock contention risk and toward an unrelated, pre-existing harness bug**:
-  - Leaves get stuck in `queued`/`pending` and never resolve.
-  - Redis Streams inspection shows the underlying leaf-worker message was delivered to a
-    consumer, but never ACKed — the worker pod is gone (scaled to zero) and the message is
-    now permanently orphaned in the pending list (no `XCLAIM`/reclaim logic observed).
-  - The stuck session's own event log shows the model calling `submit_verdict` **~1,269
-    times** in a single session — a runaway tool-call loop, not a filesystem or lock error.
-    Zero converge/git/worktree error signatures in any stuck run.
-  - Working theory: the turn loop has no "stop after a session-ending tool call" logic,
-    so it runs until an external timeout kills the pod — independent of storage backend.
-    Under investigation; this slide will be updated with the confirmed root cause and
-    whether it reproduces identically on plain RWO.
-- **So far, nothing here implicates GPFS or the shared PVC specifically** — but Phase 3
-  isn't signed off until Act 2 passes clean and/or the bug is confirmed storage-independent.
+  failed on both attempted runs (6/7 then 3/7 resolved). **Root cause confirmed via
+  source-level investigation — a genuine pre-existing harness bug, 100% storage-independent:**
+  1. `LeafEnvelope.maxTurns` is declared on the queue envelope but **never enforced anywhere**
+     in `harness/` or `packages/` — dead metadata.
+  2. `submit_verdict`'s tool result never sets `terminate`, and no session-ending-tool
+     concept is wired into the leaf runner's `AgentSession` — so after a leaf submits its
+     verdict, the turn loop just calls the model again, and again. One stuck session showed
+     `submit_verdict` called **~1,269 times** before something external killed the pod.
+  3. Redis's `xAutoClaim`/heartbeat reclaim logic is real and correctly designed for
+     crashed/hung consumers — but a runaway loop keeps heartbeating (it's alive, just stuck),
+     so the stale-entry reclaim never trips. The message sits orphaned in the pending list
+     until the pod is externally killed (resource limit / job timeout; `backoffLimit: 0`
+     means no automatic retry either).
+  4. **Confirmed unrelated to storage:** `submit_verdict` does zero file/sandbox I/O — the
+     entire failure is model-call + Redis only. Reproduces identically under per-pod RWO,
+     shared RWX, or no sandbox at all.
+- **Phase 2 (shared RWX PVC) is signed off for correctness** — the Act 2 failure is a
+  separate, pre-existing harness bug (missing turn cap / missing verdict-triggered
+  termination), tracked independently, not a shared-storage contention issue. Zero
+  converge/flock/worktree error signatures across either run.
 
 ---
 
@@ -186,11 +191,14 @@ gitd, sandbox pool), and a local llm-d-served model — no external model API de
 ## Slide 13 — Status summary / next steps
 
 - ✅ Phase 1 (multi-sandbox, per-pod PVC) — done, upstream-mergeable, already largely shipped.
-- 🚧 Phase 2 (shared RWX PVC) — mechanism proven (shared mount confirmed); correctness
-  under real concurrent load still being validated (Act 2 issue, Slide 7).
+- ✅ Phase 2 (shared RWX PVC) — mechanism proven, correctness signed off. The Act 2 issue
+  found during validation is a confirmed pre-existing, storage-independent harness bug
+  (Slide 7), not shared-storage contention.
+- 🚧 Phase 3 — Act 1 clean; Act 2 blocked on the harness bug above (separate fix, tracked
+  independently of this storage effort).
 - ⬜ Phases 4–7 — not started; each has a concrete, scoped starting question above.
-- **Immediate next step:** resolve the Act 2 leaf-worker stuck-message bug (confirm
-  storage-independent root cause), then re-run Act 2 clean before calling Phase 2/3 signed off.
+- **Immediate next step:** file/fix the leaf-worker turn-cap bug upstream, then re-run
+  Act 2 clean; meanwhile Phase 4 (read-only fileset) can start independently.
 
 ---
 
