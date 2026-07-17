@@ -146,6 +146,9 @@ Two threads, deliberately separated:
 - Not started. Open questions: which S3 endpoint (IBM Cloud Object Storage vs. other),
   AFM mode (independent-writer vs. read-only cache), what exactly gets tiered (raw results
   dir vs. a curated subset).
+- **See the companion educational deck** — [`2026-07-17-gpfs-afm-for-serverless-harness.md`](2026-07-17-gpfs-afm-for-serverless-harness.md) —
+  which walks through AFM mechanics for this exact use case, plus a related DR idea
+  (restoring cluster/PVC state from S3) that isn't yet its own phase here.
 
 ---
 
