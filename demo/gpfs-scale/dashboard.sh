@@ -27,4 +27,5 @@ exec "$DASHBOARD_PY" "$DEMO_DIR/dashboard.py" \
   --namespace "${KAGENTI_NS:-serverless-harness}" \
   --service "${KAGENTI_KSVC:-serverless-harness}" \
   --pool-selector "${KAGENTI_POOL_SELECTOR:-sh.kagenti.io/sandbox-pool=default}" \
-  --interval "${INTERVAL:-2}"
+  --interval "${INTERVAL:-2}" \
+  --watch

@@ -103,7 +103,9 @@ MODEL="another/model" ./run-bugstone.sh act1
 The dashboard waits for and automatically follows the newest Act 1 or Act 2 run, so it
 can remain open across multiple runs. Its header switches between waiting, running,
 complete, and failed states; the elapsed time advances only while a run is active and
-freezes when that run ends. The pipeline still streams its normal output in
+freezes when that run ends. It also reloads itself when `dashboard.py` changes, making
+layout iteration possible without repeatedly restarting `dashboard.sh`. The pipeline
+still streams its normal output in
 the second terminal and records the same output for the dashboard. Press Ctrl-C in the
 dashboard terminal when you are finished.
 

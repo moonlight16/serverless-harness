@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import signal
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -118,7 +120,7 @@ def phases_panel(lines: list[str], run_state: str) -> Panel:
 
     table = Table(box=None, expand=True, show_header=False, padding=(0, 1))
     table.add_column("State", width=3, justify="center")
-    table.add_column("Phase", width=20, style="bold cyan", no_wrap=True)
+    table.add_column("Phase", width=18, style="bold cyan", no_wrap=True)
     table.add_column("Purpose", ratio=1)
 
     def add(state: str, phase: str, purpose: str) -> None:
@@ -130,21 +132,21 @@ def phases_panel(lines: list[str], run_state: str) -> Panel:
         }[state]
         table.add_row(f"[{style}]{icon}[/]", phase, f"[{style}]{purpose}[/]")
 
-    add("done" if phase_b_started else "active", "Phase A", "Find candidates with deterministic static analysis")
+    add("done" if phase_b_started else "active", "Phase A", "Deterministic candidate scan")
     add(
         "done" if phase_b_done else "active" if phase_b_started else "pending",
         "Phase B",
-        "Use LLM agents to verify candidates in isolated leaf sessions",
+        "LLM verification in isolated leaf sessions",
     )
     # The serverless-harness demo stops after Phase B. Keep the remainder visible
     # so viewers see where this experiment sits in the complete BugStone pipeline.
-    add("not-run", "Phase C Triage", "Re-check findings and filter false positives — not run in this demo")
-    add("not-run", "Phase C Validation", "Validate exploitability per finding — not run in this demo")
-    add("not-run", "Phase D", "Produce reports and patches — not run in this demo")
+    add("not-run", "Phase C Triage", "Filter false positives (not run)")
+    add("not-run", "Phase C Validation", "Validate exploitability (not run)")
+    add("not-run", "Phase D", "Reports and patches (not run)")
 
     report_state = "done" if run_state == "complete" and phase_b_done else "active" if run_state == "complete" else "pending"
     report_icon = {"done": "[green]✓[/]", "active": "[yellow]▶[/]", "pending": "[dim]○[/]"}[report_state]
-    footer = Text.from_markup(f"  {report_icon}  [bold cyan]Report[/]  Build the demo's Phase A/B HTML report")
+    footer = Text.from_markup(f"  {report_icon}  [bold cyan]Report[/]  Demo Phase A/B HTML report")
     return Panel(Group(table, footer), title="BugStone pipeline", border_style="green")
 
 
@@ -228,11 +230,11 @@ fi
 
 
 def pod_table(title: str, rows: list[dict[str, str]], empty: str) -> Panel:
-    table = Table(box=box.SIMPLE, expand=True, show_header=True, header_style="bold cyan")
-    table.add_column("Pod", ratio=4, no_wrap=True)
-    table.add_column("Phase", ratio=1)
-    table.add_column("Ready", ratio=1)
-    table.add_column("Node", ratio=2, no_wrap=True)
+    table = Table(box=box.SIMPLE, expand=True, show_header=True, header_style="bold cyan", padding=(0, 1))
+    table.add_column("Pod", ratio=1, no_wrap=True, overflow="ellipsis")
+    table.add_column("Phase", width=10, no_wrap=True)
+    table.add_column("Ready", width=5, no_wrap=True)
+    table.add_column("Node", width=14, no_wrap=True, overflow="ellipsis")
     if rows:
         for row in rows:
             color = "green" if row["phase"] == "Running" else "yellow"
@@ -256,15 +258,15 @@ def storage_panel(lines: list[str]) -> Panel:
             entries.append(parts[1])
         elif parts[0] == "WORKTREE" and len(parts) == 2:
             worktrees.append(parts[1])
-    stats = Table.grid(expand=True)
-    stats.add_column(style="bold magenta")
-    stats.add_column()
+    stats = Table.grid(expand=True, padding=(0, 1))
+    stats.add_column(style="bold magenta", width=18, no_wrap=True)
+    stats.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
     stats.add_row("Repository", summary.get("repo", "unavailable"))
     stats.add_row("HEAD", summary.get("head", "-"))
     stats.add_row("Git objects / size", f"{summary.get('objects', '-')} / {summary.get('size', '-')}")
     stats.add_row("Active worktrees", summary.get("leaves", "-"))
     stats.add_row("Fetch lock file", summary.get("lock", "-"))
-    tree = Text("\n/workspace/\n", style="bold")
+    tree = Text("\n/workspace/\n", style="bold", overflow="ellipsis", no_wrap=True)
     for entry in entries[:12]:
         tree.append(f"  ├── {entry}\n", style="bright_blue" if entry.endswith("/") else "white")
     for worktree in worktrees[:8]:
@@ -276,12 +278,12 @@ def pvc_panel(pvcs: list[dict[str, Any]], sandboxes: list[dict[str, str]]) -> Pa
     mounted: dict[str, list[str]] = {}
     for sandbox in sandboxes:
         mounted.setdefault(sandbox["claim"], []).append(sandbox["name"])
-    table = Table(box=box.SIMPLE, expand=True, header_style="bold magenta")
-    table.add_column("PVC", ratio=3, no_wrap=True)
-    table.add_column("Mode", ratio=1)
-    table.add_column("Class", ratio=2)
-    table.add_column("Size", ratio=1)
-    table.add_column("Mounted by", ratio=3)
+    table = Table(box=box.SIMPLE, expand=True, header_style="bold magenta", padding=(0, 1))
+    table.add_column("PVC", ratio=3, no_wrap=True, overflow="ellipsis")
+    table.add_column("Mode", width=4, no_wrap=True)
+    table.add_column("Class", width=13, no_wrap=True, overflow="ellipsis")
+    table.add_column("Size", width=5, no_wrap=True)
+    table.add_column("Mounted", ratio=2, no_wrap=True, overflow="ellipsis")
     workspace_claims = {row["claim"] for row in sandboxes if row["claim"] != "-"}
     shown = 0
     for pvc in pvcs:
@@ -291,7 +293,7 @@ def pvc_panel(pvcs: list[dict[str, Any]], sandboxes: list[dict[str, str]]) -> Pa
             continue
         table.add_row(
             name,
-            ",".join(spec.get("accessModes", [])) or "-",
+            ",".join({"ReadWriteMany": "RWX", "ReadWriteOnce": "RWO", "ReadOnlyMany": "ROX"}.get(mode, mode) for mode in spec.get("accessModes", [])) or "-",
             spec.get("storageClassName", "-"),
             status.get("capacity", {}).get("storage", "-"),
             ", ".join(mounted.get(name, [])) or "-",
@@ -329,11 +331,20 @@ def render(
     state: dict[str, Any], run: RunInfo, peak_harness: int, peak_workers: int,
 ) -> Layout:
     layout = Layout()
-    layout.split_column(Layout(name="header", size=3), Layout(name="pipeline", size=4), Layout(name="body", size=28), Layout(name="logs"))
-    layout["body"].split_row(Layout(name="compute", ratio=3), Layout(name="storage", ratio=2))
-    layout["compute"].split_column(Layout(name="harness", size=9), Layout(name="workers", size=9), Layout(name="sandboxes", size=10))
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="pipeline", size=4),
+        Layout(name="body"),
+        Layout(name="logs", size=9),
+    )
+    layout["body"].split_row(Layout(name="compute", ratio=11), Layout(name="storage", ratio=9))
+    layout["compute"].split_column(
+        Layout(name="harness", ratio=3),
+        Layout(name="workers", ratio=3),
+        Layout(name="sandboxes", ratio=2),
+    )
     layout["storage"].split_column(Layout(name="workspace"), Layout(name="pvcs", size=9))
-    layout["logs"].split_row(Layout(name="phases", ratio=3), Layout(name="tail", ratio=2))
+    layout["logs"].split_row(Layout(name="phases", ratio=11), Layout(name="tail", ratio=9))
 
     status = {
         "waiting": "[bold cyan]WAITING FOR NEXT RUN[/]",
@@ -349,8 +360,8 @@ def render(
     layout["header"].update(
         Panel(
             Align.center(
-                f"[bold]BugStone + Shared GPFS[/]   [cyan]{act_label}[/]   elapsed {duration}   "
-                f"[dim]{run.model}[/]   {status}"
+                f"[bold]BugStone + GPFS[/]  [cyan]{act_label}[/]  {duration}  "
+                f"[dim]{run.model}[/]  {status}"
             ),
             style="white on dark_blue",
         )
@@ -368,13 +379,13 @@ def render(
         "failed": f"[bold red]✗ FAILED during {stage}[/]  {detail}",
     }[run.state]
     layout["pipeline"].update(Panel(f"[dim]{flow}[/]\n{stage_status}", title=f"{act_label} pipeline"))
-    layout["harness"].update(pod_table(f"Knative harness pods — current {len(state['harness'])}, peak {peak_harness}", state["harness"][:5], "scaled to zero"))
-    layout["workers"].update(pod_table(f"KEDA leaf workers — current {len(state['workers'])}, peak {peak_workers}, queue {state['queue']}", state["workers"][:5], "none (expected during Act 1)"))
+    layout["harness"].update(pod_table(f"Knative harness — {len(state['harness'])} now / {peak_harness} peak", state["harness"][:6], "scaled to zero"))
+    layout["workers"].update(pod_table(f"KEDA workers — {len(state['workers'])} now / {peak_workers} peak / queue {state['queue']}", state["workers"][:6], "none (expected during Act 1)"))
 
     sandboxes = Table(box=box.SIMPLE, expand=True)
-    sandboxes.add_column("Sandbox", style="cyan")
-    sandboxes.add_column("Node")
-    sandboxes.add_column("Shared claim", style="magenta")
+    sandboxes.add_column("Sandbox", width=10, style="cyan", no_wrap=True, overflow="ellipsis")
+    sandboxes.add_column("Node", width=14, no_wrap=True, overflow="ellipsis")
+    sandboxes.add_column("Shared claim", ratio=1, style="magenta", no_wrap=True, overflow="ellipsis")
     for row in state["sandboxes"]:
         sandboxes.add_row(row["name"], row["node"], row["claim"])
     layout["sandboxes"].update(Panel(sandboxes, title="Sandbox pool", border_style="blue"))
@@ -424,12 +435,17 @@ async def run_dashboard(
     service: str,
     pool_selector: str,
     interval: float,
+    watch: bool,
 ) -> None:
     active_log: Path | None = None
     peak_harness = 0
     peak_workers = 0
+    source_file = Path(__file__)
+    source_mtime = source_file.stat().st_mtime_ns
     with Live(screen=True, auto_refresh=False, redirect_stdout=False, redirect_stderr=False) as live:
         while True:
+            if watch and source_file.stat().st_mtime_ns != source_mtime:
+                raise ReloadDashboard
             run = latest_run(log_dir)
             if run.log_file != active_log:
                 active_log = run.log_file
@@ -439,9 +455,7 @@ async def run_dashboard(
             peak_harness = max(peak_harness, len(state["harness"]))
             peak_workers = max(peak_workers, len(state["workers"]))
             live.update(
-                render(
-                    state, run, peak_harness, peak_workers,
-                ),
+                render(state, run, peak_harness, peak_workers),
                 refresh=True,
             )
             await asyncio.sleep(interval)
@@ -454,17 +468,24 @@ async def run_dashboard(
 @click.option("--service", default="serverless-harness", show_default=True)
 @click.option("--pool-selector", default="sh.kagenti.io/sandbox-pool=default", show_default=True)
 @click.option("--interval", type=click.FloatRange(min=0.5), default=2.0, show_default=True)
+@click.option("--watch/--no-watch", default=True, show_default=True, help="Reload when dashboard.py changes.")
 def main(**kwargs: Any) -> None:
     """Watch for BugStone runs and render them in a persistent dashboard."""
     signal.signal(signal.SIGTERM, lambda *_: raise_keyboard_interrupt())
     try:
         asyncio.run(run_dashboard(**kwargs))
+    except ReloadDashboard:
+        os.execv(sys.executable, [sys.executable, *sys.argv])
     except KeyboardInterrupt:
         pass
 
 
 def raise_keyboard_interrupt() -> None:
     raise KeyboardInterrupt
+
+
+class ReloadDashboard(Exception):
+    """Request a clean process reload after the dashboard source changes."""
 
 
 if __name__ == "__main__":
