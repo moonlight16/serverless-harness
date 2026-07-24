@@ -1,7 +1,15 @@
 diff --git a/agent_specifics/serverless_harness/cluster_io.py b/agent_specifics/serverless_harness/cluster_io.py
 --- a/agent_specifics/serverless_harness/cluster_io.py
 +++ b/agent_specifics/serverless_harness/cluster_io.py
-@@ -36,6 +36,11 @@ def _headers() -> dict:
+@@ -9,6 +9,7 @@ There is no /work PVC, no resultRef file, no done-marker file.
+ """
+ import json
+ import os
++import time
+ 
+ import requests
+ 
+@@ -36,6 +37,11 @@ def _headers() -> dict:
      host = os.environ.get("KAGENTI_HOST_HEADER", "")
      if host and os.environ.get("KAGENTI_CLUSTER", "kind") == "kind":
          h["Host"] = host
@@ -11,6 +19,41 @@ diff --git a/agent_specifics/serverless_harness/cluster_io.py b/agent_specifics/
 +    if auth_header and auth_value:
 +        h[auth_header] = auth_value
      return h
+ 
+ 
+@@ -43,12 +49,27 @@ def post_run_leaf(envelope: dict, timeout: int = 300) -> dict:
+     """Synchronous POST /runs. Returns the LeafResult (verdict inline on success)."""
+-    resp = requests.post(
+-        f"{_base()}/runs",
+-        headers=_headers(),
+-        data=json.dumps(envelope),
+-        timeout=timeout,
+-        verify=_verify(),
+-    )
++    try:
++        resp = requests.post(
++            f"{_base()}/runs",
++            headers=_headers(),
++            data=json.dumps(envelope),
++            timeout=timeout,
++            verify=_verify(),
++        )
++    except requests.ConnectionError as original_error:
++        # Some external load balancers close an otherwise healthy idle request
++        # before a long-running synchronous leaf returns. The harness persists
++        # the result by session ID, so recover it without dispatching a duplicate.
++        deadline = time.monotonic() + timeout
++        while time.monotonic() < deadline:
++            try:
++                result = poll_status(envelope["sessionId"])
++                if result.get("status") in _TERMINAL:
++                    return result
++            except requests.RequestException:
++                pass
++            time.sleep(2)
++        raise original_error
+     resp.raise_for_status()
+     return resp.json()
  
  
 diff --git a/agent_specifics/serverless_harness/env.sh b/agent_specifics/serverless_harness/env.sh
