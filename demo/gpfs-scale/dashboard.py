@@ -62,7 +62,9 @@ def pod_rows(payload: Any) -> list[dict[str, str]]:
         rows.append(
             {
                 "name": meta.get("name", "?"),
-                "phase": status.get("phase", "?"),
+                # Kubernetes leaves status.phase=Running while graceful pod
+                # deletion is in progress; deletionTimestamp is authoritative.
+                "phase": "Terminating" if meta.get("deletionTimestamp") else status.get("phase", "?"),
                 "ready": ready,
                 "node": pod.get("spec", {}).get("nodeName", "-"),
                 "claim": next(
@@ -237,7 +239,7 @@ def pod_table(title: str, rows: list[dict[str, str]], empty: str) -> Panel:
     table.add_column("Node", width=14, no_wrap=True, overflow="ellipsis")
     if rows:
         for row in rows:
-            color = "green" if row["phase"] == "Running" else "yellow"
+            color = "green" if row["phase"] == "Running" else "red" if row["phase"] == "Terminating" else "yellow"
             table.add_row(row["name"], f"[{color}]{row['phase']}[/]", row["ready"], row["node"])
     else:
         table.add_row(f"[dim]{empty}[/]", "", "", "")
@@ -283,7 +285,7 @@ def pvc_panel(pvcs: list[dict[str, Any]], sandboxes: list[dict[str, str]]) -> Pa
     table.add_column("Mode", width=4, no_wrap=True)
     table.add_column("Class", width=13, no_wrap=True, overflow="ellipsis")
     table.add_column("Size", width=5, no_wrap=True)
-    table.add_column("Mounted", ratio=2, no_wrap=True, overflow="ellipsis")
+    table.add_column("Sandboxes", ratio=2, no_wrap=True, overflow="ellipsis")
     workspace_claims = {row["claim"] for row in sandboxes if row["claim"] != "-"}
     shown = 0
     for pvc in pvcs:
@@ -296,7 +298,10 @@ def pvc_panel(pvcs: list[dict[str, Any]], sandboxes: list[dict[str, str]]) -> Pa
             ",".join({"ReadWriteMany": "RWX", "ReadWriteOnce": "RWO", "ReadOnlyMany": "ROX"}.get(mode, mode) for mode in spec.get("accessModes", [])) or "-",
             spec.get("storageClassName", "-"),
             status.get("capacity", {}).get("storage", "-"),
-            ", ".join(mounted.get(name, [])) or "-",
+            ", ".join(
+                sandbox.removeprefix("sandbox-") if sandbox.startswith("sandbox-") else sandbox
+                for sandbox in mounted.get(name, [])
+            ) or "-",
         )
         shown += 1
     if not shown:
