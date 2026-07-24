@@ -8,6 +8,7 @@ import json
 import re
 import signal
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -109,7 +110,7 @@ def read_log(path: Path) -> dict[str, Any]:
     return {"tail": lines[-14:], "tail_full": lines, "stage": stage}
 
 
-def phases_panel(lines: list[str], complete: bool) -> Panel:
+def phases_panel(lines: list[str], run_state: str) -> Panel:
     """Show BugStone's canonical phases as a fixed status display."""
     log = "\n".join(lines)
     phase_b_started = bool(re.search(r"prepare Phase B|run Phase B|enqueue", log, re.I))
@@ -141,7 +142,7 @@ def phases_panel(lines: list[str], complete: bool) -> Panel:
     add("not-run", "Phase C Validation", "Validate exploitability per finding — not run in this demo")
     add("not-run", "Phase D", "Produce reports and patches — not run in this demo")
 
-    report_state = "done" if complete and phase_b_done else "active" if complete else "pending"
+    report_state = "done" if run_state == "complete" and phase_b_done else "active" if run_state == "complete" else "pending"
     report_icon = {"done": "[green]✓[/]", "active": "[yellow]▶[/]", "pending": "[dim]○[/]"}[report_state]
     footer = Text.from_markup(f"  {report_icon}  [bold cyan]Report[/]  Build the demo's Phase A/B HTML report")
     return Panel(Group(table, footer), title="BugStone pipeline", border_style="green")
@@ -307,9 +308,25 @@ def log_panel(title: str, lines: list[str], style: str) -> Panel:
     return Panel(text, title=title, border_style=style)
 
 
+@dataclass(frozen=True)
+class RunInfo:
+    log_file: Path
+    act: str
+    model: str
+    started: int | None
+    ended: int | None
+    state: str
+    exit_code: int | None = None
+
+    @property
+    def elapsed(self) -> int:
+        if self.started is None:
+            return 0
+        return max(0, (self.ended or int(time.time())) - self.started)
+
+
 def render(
-    state: dict[str, Any], act: str, model: str, elapsed: int, log_file: Path,
-    complete: bool, peak_harness: int, peak_workers: int,
+    state: dict[str, Any], run: RunInfo, peak_harness: int, peak_workers: int,
 ) -> Layout:
     layout = Layout()
     layout.split_column(Layout(name="header", size=3), Layout(name="pipeline", size=4), Layout(name="body", size=28), Layout(name="logs"))
@@ -318,12 +335,22 @@ def render(
     layout["storage"].split_column(Layout(name="workspace"), Layout(name="pvcs", size=9))
     layout["logs"].split_row(Layout(name="phases", ratio=3), Layout(name="tail", ratio=2))
 
-    status = "[bold green]RUN COMPLETE — press Ctrl-C to exit[/]" if complete else "[bold yellow]RUNNING[/]"
+    status = {
+        "waiting": "[bold cyan]WAITING FOR NEXT RUN[/]",
+        "running": "[bold yellow]RUNNING[/]",
+        "complete": "[bold green]RUN COMPLETE[/]",
+        "failed": f"[bold red]RUN FAILED (exit {run.exit_code if run.exit_code is not None else '?'})[/]",
+    }[run.state]
+    duration = f"{run.elapsed}s" if run.started is not None else "—"
+    act_label = {
+        "act1": "ACT 1 · synchronous leaves",
+        "act2": "ACT 2 · KEDA-scaled leaves",
+    }.get(run.act, run.act.upper())
     layout["header"].update(
         Panel(
             Align.center(
-                f"[bold]BugStone + Shared GPFS[/]   [cyan]{act}[/]   {elapsed}s   "
-                f"[dim]{model}[/]   {status}"
+                f"[bold]BugStone + Shared GPFS[/]   [cyan]{act_label}[/]   elapsed {duration}   "
+                f"[dim]{run.model}[/]   {status}"
             ),
             style="white on dark_blue",
         )
@@ -331,10 +358,16 @@ def render(
     stage, detail = state["log"]["stage"]
     flow = (
         "Phase A  →  Prepare  →  Publish  →  Queue  →  KEDA verify  →  Reconcile  →  Report"
-        if act == "act2"
+        if run.act == "act2"
         else "Phase A  →  Prepare  →  Publish  →  Synchronous leaf verification  →  Report"
     )
-    layout["pipeline"].update(Panel(f"[dim]{flow}[/]\n[bold yellow]▶ {stage}[/]  {detail}", title="Pipeline"))
+    stage_status = {
+        "waiting": f"[bold cyan]○ READY[/]  {detail}",
+        "running": f"[bold yellow]▶ {stage}[/]  {detail}",
+        "complete": f"[bold green]✓ {stage}[/]  {detail}",
+        "failed": f"[bold red]✗ FAILED during {stage}[/]  {detail}",
+    }[run.state]
+    layout["pipeline"].update(Panel(f"[dim]{flow}[/]\n{stage_status}", title=f"{act_label} pipeline"))
     layout["harness"].update(pod_table(f"Knative harness pods — current {len(state['harness'])}, peak {peak_harness}", state["harness"][:5], "scaled to zero"))
     layout["workers"].update(pod_table(f"KEDA leaf workers — current {len(state['workers'])}, peak {peak_workers}, queue {state['queue']}", state["workers"][:5], "none (expected during Act 1)"))
 
@@ -347,16 +380,16 @@ def render(
     layout["sandboxes"].update(Panel(sandboxes, title="Sandbox pool", border_style="blue"))
     layout["workspace"].update(storage_panel(state["storage"]))
     layout["pvcs"].update(pvc_panel(state["pvcs"], state["sandboxes"]))
-    layout["phases"].update(phases_panel(state["log"]["tail_full"], complete))
-    layout["tail"].update(log_panel(f"Live BugStone log — {log_file.name}", state["log"]["tail"], "white"))
+    layout["phases"].update(phases_panel(state["log"]["tail_full"], run.state))
+    layout["tail"].update(log_panel(f"BugStone log — {run.log_file.name}", state["log"]["tail"], "white"))
     return layout
 
 
-def latest_run(log_dir: Path) -> tuple[Path, str, str, int]:
+def latest_run(log_dir: Path) -> RunInfo:
     """Return the newest run log and the metadata written by the runner."""
     logs = list(log_dir.glob("act[12]-*.log"))
     if not logs:
-        return log_dir / "waiting.log", "waiting", "waiting for a run", int(time.time())
+        return RunInfo(log_dir / "waiting.log", "no active run", "start Act 1 or Act 2", None, None, "waiting")
     log_file = max(logs, key=lambda path: path.stat().st_mtime)
     metadata: dict[str, str] = {}
     try:
@@ -368,7 +401,20 @@ def latest_run(log_dir: Path) -> tuple[Path, str, str, int]:
     act = metadata.get("act", log_file.name.split("-", 1)[0])
     model = metadata.get("model", "unknown")
     started = int(metadata.get("started", int(log_file.stat().st_mtime)))
-    return log_file, act, model, started
+    status_file = Path(f"{log_file}.status")
+    exit_code: int | None = None
+    if status_file.exists():
+        try:
+            exit_code = int(status_file.read_text().strip())
+        except (OSError, ValueError):
+            pass
+    state = metadata.get("state", "running")
+    if exit_code is not None:
+        state = "complete" if exit_code == 0 else "failed"
+    ended = int(metadata["ended"]) if metadata.get("ended", "").isdigit() else None
+    if state in {"complete", "failed"} and ended is None:
+        ended = int(status_file.stat().st_mtime)
+    return RunInfo(log_file, act, model, started, ended, state, exit_code)
 
 
 async def run_dashboard(
@@ -384,20 +430,17 @@ async def run_dashboard(
     peak_workers = 0
     with Live(screen=True, auto_refresh=False, redirect_stdout=False, redirect_stderr=False) as live:
         while True:
-            log_file, act, model, started = latest_run(log_dir)
-            if log_file != active_log:
-                active_log = log_file
+            run = latest_run(log_dir)
+            if run.log_file != active_log:
+                active_log = run.log_file
                 peak_harness = 0
                 peak_workers = 0
-            status_file = Path(f"{log_file}.status")
-            complete = status_file.exists()
-            state = await gather(context, namespace, service, pool_selector, log_file)
+            state = await gather(context, namespace, service, pool_selector, run.log_file)
             peak_harness = max(peak_harness, len(state["harness"]))
             peak_workers = max(peak_workers, len(state["workers"]))
             live.update(
                 render(
-                    state, act, model, max(0, int(time.time()) - started), log_file,
-                    complete, peak_harness, peak_workers,
+                    state, run, peak_harness, peak_workers,
                 ),
                 refresh=True,
             )

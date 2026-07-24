@@ -114,13 +114,20 @@ run_workload() {
 mkdir -p "$DEMO_DIR/.bugstone/logs"
 RUN_LOG="$DEMO_DIR/.bugstone/logs/${ACT}-$(date +%Y%m%d-%H%M%S).log"
 RUN_STATUS_FILE="$RUN_LOG.status"
-printf 'act=%s\nmodel=%s\nstarted=%s\n' "$ACT" "$MODEL" "$(date +%s)" >"$RUN_LOG.meta"
+RUN_META_FILE="$RUN_LOG.meta"
+RUN_STARTED="$(date +%s)"
+printf 'act=%s\nmodel=%s\nstarted=%s\nstate=running\n' \
+  "$ACT" "$MODEL" "$RUN_STARTED" >"$RUN_META_FILE"
 
 set +e
 run_workload 2>&1 | tee "$RUN_LOG"
 RUN_STATUS=${PIPESTATUS[0]}
 set -e
+RUN_ENDED="$(date +%s)"
 printf '%s\n' "$RUN_STATUS" >"$RUN_STATUS_FILE"
+printf 'ended=%s\nexit_code=%s\nstate=%s\n' \
+  "$RUN_ENDED" "$RUN_STATUS" "$([ "$RUN_STATUS" -eq 0 ] && echo complete || echo failed)" \
+  >>"$RUN_META_FILE"
 
 echo
 echo "full log: $RUN_LOG"
