@@ -11,6 +11,7 @@ import signal
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,26 @@ async def kubectl_json(context: str, namespace: str, *args: str) -> Any:
         return {"error": raw}
 
 
+def kubernetes_age(timestamp: str | None) -> str:
+    """Format an RFC 3339 creation time like kubectl's compact AGE column."""
+    if not timestamp:
+        return "-"
+    try:
+        created = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return "-"
+    seconds = max(0, int((datetime.now(timezone.utc) - created).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h"
+    return f"{hours // 24}d"
+
+
 def pod_rows(payload: Any) -> list[dict[str, str]]:
     rows = []
     for pod in payload.get("items", []) if isinstance(payload, dict) else []:
@@ -66,6 +87,7 @@ def pod_rows(payload: Any) -> list[dict[str, str]]:
                 # deletion is in progress; deletionTimestamp is authoritative.
                 "phase": "Terminating" if meta.get("deletionTimestamp") else status.get("phase", "?"),
                 "ready": ready,
+                "age": kubernetes_age(meta.get("creationTimestamp")),
                 "node": pod.get("spec", {}).get("nodeName", "-"),
                 "claim": next(
                     (
@@ -156,25 +178,16 @@ async def gather(
     context: str, namespace: str, service: str, pool_selector: str, log_file: Path
 ) -> dict[str, Any]:
     storage_script = r"""
-repo=no; [ -d /workspace/repo ] && repo=yes
-leaves=0; [ -d /workspace/leaves ] && leaves=$(find /workspace/leaves -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
-lock=no; [ -f /workspace/.sh-fetch.lock ] && lock=yes
-size=-; head=-; objects=-
-if [ "$repo" = yes ]; then
-  size=$(du -sh /workspace/repo 2>/dev/null | awk '{print $1}')
-  head=$(git -C /workspace/repo rev-parse --short FETCH_HEAD 2>/dev/null || echo initializing)
-  objects=$(git -C /workspace/repo count-objects 2>/dev/null | awk '{print $1}' || echo -)
-fi
-printf 'SUMMARY|%s|%s|%s|%s|%s\n' "$repo" "$head" "$objects" "$size" "$lock"
-printf 'LEAVES|%s\n' "$leaves"
 for entry in /workspace/* /workspace/.[!.]*; do
   [ -e "$entry" ] || continue
   name=${entry#/workspace/}; [ -d "$entry" ] && name="$name/"
   printf 'ENTRY|%s\n' "$name"
 done
-if [ -d /workspace/leaves ]; then
-  find /workspace/leaves -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | head -n 10 | sed 's#^/workspace/leaves/#WORKTREE|#'
-fi
+printf 'DISK|%s\n' "$(df -h /workspace 2>/dev/null | awk 'NR==2 {print $2 " total · " $3 " used · " $4 " free"}')"
+printf 'REPO_BEGIN\n'
+ls -la /workspace/repo 2>&1 | head -n 12 | sed 's/^/REPO|/'
+printf 'WORKTREES_BEGIN\n'
+git -C /workspace/repo worktree list --porcelain 2>&1 | head -n 40 | sed 's/^/WORKTREE|/'
 """
     sandboxes, pvcs, harness, workers, queue, storage, log = await asyncio.gather(
         kubectl_json(context, namespace, "get", "pods", "-l", pool_selector, "-o", "json"),
@@ -236,44 +249,77 @@ def pod_table(title: str, rows: list[dict[str, str]], empty: str) -> Panel:
     table.add_column("Pod", ratio=1, no_wrap=True, overflow="ellipsis")
     table.add_column("Phase", width=10, no_wrap=True)
     table.add_column("Ready", width=5, no_wrap=True)
+    table.add_column("Age", width=5, no_wrap=True)
     table.add_column("Node", width=14, no_wrap=True, overflow="ellipsis")
     if rows:
         for row in rows:
             color = "green" if row["phase"] == "Running" else "red" if row["phase"] == "Terminating" else "yellow"
-            table.add_row(row["name"], f"[{color}]{row['phase']}[/]", row["ready"], row["node"])
+            table.add_row(row["name"], f"[{color}]{row['phase']}[/]", row["ready"], row["age"], row["node"])
     else:
-        table.add_row(f"[dim]{empty}[/]", "", "", "")
+        table.add_row(f"[dim]{empty}[/]", "", "", "", "")
     return Panel(table, title=title, border_style="cyan")
 
 
 def storage_panel(lines: list[str]) -> Panel:
-    summary: dict[str, str] = {}
     entries: list[str] = []
-    worktrees: list[str] = []
+    disk = "unavailable"
     for line in lines:
-        parts = line.split("|")
-        if parts[0] == "SUMMARY" and len(parts) >= 6:
-            summary = dict(zip(("repo", "head", "objects", "size", "lock"), parts[1:6]))
-        elif parts[0] == "LEAVES" and len(parts) == 2:
-            summary["leaves"] = parts[1]
-        elif parts[0] == "ENTRY" and len(parts) == 2:
-            entries.append(parts[1])
-        elif parts[0] == "WORKTREE" and len(parts) == 2:
-            worktrees.append(parts[1])
+        kind, _, value = line.partition("|")
+        if kind == "ENTRY":
+            entries.append(value)
+        elif kind == "DISK":
+            disk = value or "unavailable"
     stats = Table.grid(expand=True, padding=(0, 1))
-    stats.add_column(style="bold magenta", width=18, no_wrap=True)
+    stats.add_column(style="bold magenta", width=12, no_wrap=True)
     stats.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
-    stats.add_row("Repository", summary.get("repo", "unavailable"))
-    stats.add_row("HEAD", summary.get("head", "-"))
-    stats.add_row("Git objects / size", f"{summary.get('objects', '-')} / {summary.get('size', '-')}")
-    stats.add_row("Active worktrees", summary.get("leaves", "-"))
-    stats.add_row("Fetch lock file", summary.get("lock", "-"))
+    stats.add_row("Filesystem", "IBM Storage Scale / GPFS")
+    stats.add_row("Capacity", disk)
     tree = Text("\n/workspace/\n", style="bold", overflow="ellipsis", no_wrap=True)
     for entry in entries[:12]:
         tree.append(f"  ├── {entry}\n", style="bright_blue" if entry.endswith("/") else "white")
-    for worktree in worktrees[:8]:
-        tree.append(f"  │   └── leaves/{worktree}\n", style="yellow")
-    return Panel(Group(stats, tree), title="Shared GPFS workspace — live", border_style="magenta")
+    return Panel(Group(stats, tree), title="Shared GPFS filesystem — live", border_style="magenta")
+
+
+def git_panel(lines: list[str]) -> Panel:
+    repo = [line.partition("|")[2] for line in lines if line.startswith("REPO|")]
+    raw_worktrees = [line.partition("|")[2] for line in lines if line.startswith("WORKTREE|")]
+    text = Text()
+    text.append("$ ls -la /workspace/repo\n", style="bold cyan")
+    text.append("\n".join(repo) or "repository not initialized", style="white")
+    text.append("\n\n$ git -C /workspace/repo worktree list\n", style="bold cyan")
+
+    records: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in raw_worktrees + [""]:
+        if not line:
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value or "yes"
+
+    table = Table(box=None, expand=True, show_header=True, header_style="bold yellow", padding=(0, 1))
+    table.add_column("Kind", width=7, no_wrap=True)
+    table.add_column("Checkout / candidate", ratio=1, no_wrap=True, overflow="ellipsis")
+    table.add_column("Commit", width=8, no_wrap=True)
+    table.add_column("State", width=13, no_wrap=True)
+    for record in records:
+        path = record.get("worktree", "?")
+        commit = record.get("HEAD", "-")[:7]
+        if path == "/workspace/repo":
+            label = "/workspace/repo (.git object store)"
+            state = "initializing" if commit == "0000000" else record.get("branch", "base").removeprefix("refs/heads/")
+            kind = "Base"
+        else:
+            leaf = path.removeprefix("/workspace/leaves/")
+            label = re.sub(r"^run-\d+-", "", leaf).replace("--", " · ")
+            state = "detached" if "detached" in record else record.get("branch", "worktree").removeprefix("refs/heads/")
+            kind = "Leaf"
+        table.add_row(kind, label, commit, state)
+    if not records:
+        table.add_row("—", "No repository/worktrees yet", "—", "waiting")
+    return Panel(Group(text, table), title="Shared Git repository + leaf worktrees", border_style="cyan")
 
 
 def pvc_panel(pvcs: list[dict[str, Any]], sandboxes: list[dict[str, str]]) -> Panel:
@@ -348,7 +394,11 @@ def render(
         Layout(name="workers", ratio=3),
         Layout(name="sandboxes", ratio=2),
     )
-    layout["storage"].split_column(Layout(name="workspace"), Layout(name="pvcs", size=9))
+    layout["storage"].split_column(
+        Layout(name="workspace", ratio=1),
+        Layout(name="git", ratio=1),
+        Layout(name="pvcs", size=9),
+    )
     layout["logs"].split_row(Layout(name="phases", ratio=11), Layout(name="tail", ratio=9))
 
     status = {
@@ -395,6 +445,7 @@ def render(
         sandboxes.add_row(row["name"], row["node"], row["claim"])
     layout["sandboxes"].update(Panel(sandboxes, title="Sandbox pool", border_style="blue"))
     layout["workspace"].update(storage_panel(state["storage"]))
+    layout["git"].update(git_panel(state["storage"]))
     layout["pvcs"].update(pvc_panel(state["pvcs"], state["sandboxes"]))
     layout["phases"].update(phases_panel(state["log"]["tail_full"], run.state))
     layout["tail"].update(log_panel(f"BugStone log — {run.log_file.name}", state["log"]["tail"], "white"))
