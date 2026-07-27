@@ -202,7 +202,16 @@ git -C /workspace/repo worktree list --porcelain 2>&1 | head -n 40 | sed 's/^/WO
             "-o",
             "json",
         ),
-        kubectl_json(context, namespace, "get", "pods", "-l", "app=leaf-worker", "-o", "json"),
+        kubectl_json(
+            context,
+            namespace,
+            "get",
+            "pods",
+            "-l",
+            "scaledjob.keda.sh/name=leaf-worker",
+            "-o",
+            "json",
+        ),
         command(
             "kubectl",
             "--context",
