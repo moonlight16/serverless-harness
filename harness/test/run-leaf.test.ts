@@ -206,11 +206,18 @@ describe("realProduceVerdict transport wiring (Task 9)", () => {
 
     const env: LeafEnvelope = {
       sessionId: "run/pod-1",
+      workloadId: "workload-1",
+      sandboxPoolSelector: "context.rossoctl.io/pool=workload-1",
       item: { item_id: "i1", file: "f", pattern: "p" },
       repoUrl: "https://git.example/r.git",
       ref: "abc123",
     };
     await runLeaf(env);
+
+    expect(selectPoolSandboxMock).toHaveBeenCalledWith(
+      expect.objectContaining({ KAGENTI_SANDBOX_POOL_SELECTOR: "context.rossoctl.io/pool=workload-1" }),
+      expect.any(String), expect.any(String), expect.any(Object),
+    );
 
     // Built once for converge and once for cleanup — the pod path never shares a transport
     // across phases, exactly like the pre-Task-9 code.

@@ -44,6 +44,18 @@ elif ! git -C "$BUGSTONE_DIR" apply --reverse --check "$BUGSTONE_PATCH" 2>/dev/n
   exit 1
 fi
 
+# Follow-up demos may layer a small adapter patch without changing this working
+# static-pool demo. The default remains empty and preserves the original path.
+if [ -n "${BUGSTONE_EXTRA_PATCH:-}" ]; then
+  if git -C "$BUGSTONE_DIR" apply --check "$BUGSTONE_EXTRA_PATCH" 2>/dev/null; then
+    echo "--- apply BugStone follow-up adapter patch ---"
+    git -C "$BUGSTONE_DIR" apply "$BUGSTONE_EXTRA_PATCH"
+  elif ! git -C "$BUGSTONE_DIR" apply --reverse --check "$BUGSTONE_EXTRA_PATCH" 2>/dev/null; then
+    echo "BugStone follow-up patch does not apply cleanly: $BUGSTONE_EXTRA_PATCH" >&2
+    exit 1
+  fi
+fi
+
 cd "$BUGSTONE_DIR"
 
 if [ ! -x venv/bin/python3 ]; then

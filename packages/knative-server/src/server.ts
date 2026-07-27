@@ -1,13 +1,16 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { runTurn, type TurnConfig } from "@sh/harness/run-turn";
 import { runLeaf, leafSessionId, validateItem, type LeafEnvelope, type LeafResult } from "@sh/harness/run-leaf";
 import { RedisWorkQueue } from "@sh/work-queue";
 import { RedisResultStore, toResultRecord, writeResult, readResult } from "@sh/harness/leaf-result-store";
+import { createWorkload, deleteWorkload, getWorkload, type WorkloadRecord, type WorkloadRequest } from "./context-service.js";
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const JSON_HEADERS = { "Content-Type": "application/json" };
 const RESULT_TTL_SECONDS = parseInt(process.env.LEAF_RESULT_TTL_SECONDS ?? "86400", 10);
+const WORKLOAD_NAME = /^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -117,8 +120,79 @@ function getResultStore(): RedisResultStore {
   return resultStore;
 }
 
+const workloadKey = (id: string) => `sh:workload:${id}`;
+
+async function saveWorkload(record: WorkloadRecord): Promise<void> {
+  await getResultStore().set(workloadKey(record.workloadId), JSON.stringify(record));
+}
+
+async function findWorkload(id: string): Promise<WorkloadRecord | null> {
+  const raw = await getResultStore().get(workloadKey(id));
+  if (!raw) return null;
+  try { return JSON.parse(raw) as WorkloadRecord; } catch { return null; }
+}
+
+async function resolveRunWorkload(body: any, res: ServerResponse): Promise<any | null> {
+  if (!body?.workloadId) return body;
+  const record = await findWorkload(body.workloadId);
+  if (!record || record.status === "deleted") {
+    res.writeHead(404, JSON_HEADERS).end(JSON.stringify({ error: "workload_not_found" }));
+    return null;
+  }
+  return { ...body, sandboxPoolSelector: record.sandboxSelector };
+}
+
+async function handleCreateWorkload(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let spec: WorkloadRequest;
+  try { spec = JSON.parse(await readBody(req)) as WorkloadRequest; }
+  catch { res.writeHead(400, JSON_HEADERS).end(JSON.stringify({ error: "invalid_json" })); return; }
+  const workloadId = spec.name ?? `wl-${randomUUID().slice(0, 8)}`;
+  if (workloadId.length > 50 || !WORKLOAD_NAME.test(workloadId)) {
+    res.writeHead(400, JSON_HEADERS).end(JSON.stringify({ error: "workload_name_invalid" }));
+    return;
+  }
+  try {
+    const record = await createWorkload(workloadId, spec);
+    await saveWorkload(record);
+    res.writeHead(201, JSON_HEADERS).end(JSON.stringify(record));
+  } catch (err) {
+    res.writeHead(502, JSON_HEADERS).end(JSON.stringify({ error: "context_service_error", message: String(err) }));
+  }
+}
+
+async function handleGetWorkload(id: string, res: ServerResponse): Promise<void> {
+  if (!await findWorkload(id)) {
+    res.writeHead(404, JSON_HEADERS).end(JSON.stringify({ error: "workload_not_found" }));
+    return;
+  }
+  try {
+    const record = await getWorkload(id);
+    await saveWorkload(record);
+    res.writeHead(200, JSON_HEADERS).end(JSON.stringify(record));
+  } catch (err) {
+    res.writeHead(502, JSON_HEADERS).end(JSON.stringify({ error: "context_service_error", message: String(err) }));
+  }
+}
+
+async function handleDeleteWorkload(id: string, res: ServerResponse): Promise<void> {
+  const record = await findWorkload(id);
+  if (!record || record.status === "deleted") {
+    res.writeHead(404, JSON_HEADERS).end(JSON.stringify({ error: "workload_not_found" }));
+    return;
+  }
+  try {
+    await deleteWorkload(id);
+    await saveWorkload({ ...record, status: "deleted", readyReplicas: 0 });
+    res.writeHead(204).end();
+  } catch (err) {
+    res.writeHead(502, JSON_HEADERS).end(JSON.stringify({ error: "context_service_error", message: String(err) }));
+  }
+}
+
 async function handleEnqueueLeafParsed(body: any, res: ServerResponse): Promise<void> {
   if (!isRunEnvelope(body)) { res.writeHead(400, JSON_HEADERS).end(JSON.stringify({ error: "envelope_invalid" })); return; }
+  body = await resolveRunWorkload(body, res);
+  if (!body) return;
   const q = getQueue();
   await q.ensureGroup();
   await q.enqueue(body);
@@ -127,6 +201,8 @@ async function handleEnqueueLeafParsed(body: any, res: ServerResponse): Promise<
 
 async function handleRunLeafParsed(body: any, _raw: string, res: ServerResponse): Promise<void> {
   if (!isRunEnvelope(body)) { res.writeHead(400, JSON_HEADERS).end(JSON.stringify({ error: "envelope_invalid" })); return; }
+  body = await resolveRunWorkload(body, res);
+  if (!body) return;
 
   // Spec §4.3: on pool saturation the sync path bounded-waits with backoff, then 503 Retry-After.
   // selectPoolSandbox throws before taking any lease or doing agent work, so re-running runLeaf on a
@@ -188,6 +264,27 @@ function handler(req: IncomingMessage, res: ServerResponse): void {
 
   if (req.method === "GET" && url === "/health") {
     res.writeHead(200).end("ok");
+    return;
+  }
+
+  if (req.method === "POST" && url === "/workloads") {
+    handleCreateWorkload(req, res).catch((err) => {
+      if (!res.headersSent) res.writeHead(500, JSON_HEADERS).end(JSON.stringify({ error: String(err) }));
+    });
+    return;
+  }
+
+  const workloadMatch = url.match(/^\/workloads\/([^/?]+)$/);
+  if (workloadMatch && req.method === "GET") {
+    handleGetWorkload(decodeURIComponent(workloadMatch[1]), res).catch((err) => {
+      if (!res.headersSent) res.writeHead(500, JSON_HEADERS).end(JSON.stringify({ error: String(err) }));
+    });
+    return;
+  }
+  if (workloadMatch && req.method === "DELETE") {
+    handleDeleteWorkload(decodeURIComponent(workloadMatch[1]), res).catch((err) => {
+      if (!res.headersSent) res.writeHead(500, JSON_HEADERS).end(JSON.stringify({ error: String(err) }));
+    });
     return;
   }
 
