@@ -5,6 +5,8 @@ export interface WorkloadRequest {
     shared?: boolean;
     size?: string;
     storageClass?: string;
+    claimName?: string;
+    readOnly?: boolean;
   };
 }
 
@@ -18,6 +20,8 @@ export interface WorkloadRecord {
     size: string;
     accessMode: string;
     storageClass?: string;
+    claimName?: string;
+    readOnly?: boolean;
   };
 }
 
@@ -53,17 +57,21 @@ function workload(pool: ContextPool): WorkloadRecord {
 
 export async function createWorkload(workloadId: string, spec: WorkloadRequest): Promise<WorkloadRecord> {
   const shared = spec.workspace?.shared === true;
+  const claimName = spec.workspace?.claimName;
+  const workspace = claimName
+    ? { claimName, readOnly: spec.workspace?.readOnly }
+    : {
+        size: spec.workspace?.size ?? "1Gi",
+        accessMode: shared ? "ReadWriteMany" : "ReadWriteOnce",
+        ...(spec.workspace?.storageClass ? { storageClass: spec.workspace.storageClass } : {}),
+      };
   const response = await request("/v1/sandbox-pools", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       name: workloadId,
       replicas: spec.sandboxes ?? (shared ? 2 : 1),
-      workspace: {
-        size: spec.workspace?.size ?? "1Gi",
-        accessMode: shared ? "ReadWriteMany" : "ReadWriteOnce",
-        ...(spec.workspace?.storageClass ? { storageClass: spec.workspace.storageClass } : {}),
-      },
+      workspace,
     }),
   });
   return workload(await response.json() as ContextPool);
