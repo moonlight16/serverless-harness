@@ -1,8 +1,19 @@
 # Act 0: Install
 ```
-git clone https://github.com/kagenti/serverless-harness.git && cd serverless-harness
+git clone --recurse-submodules https://github.com/kagenti/serverless-harness.git && cd serverless-harness
 ./deploy/knative/setup-kind.sh
 ```
+
+> To skip the local harness build and use the published image, pull it into the kind
+> cluster first under the tag the manifests reference, then pass `--skip-build`:
+> ```
+> docker pull ghcr.io/rossoctl/serverless-harness:latest
+> docker tag  ghcr.io/rossoctl/serverless-harness:latest dev.local/serverless-harness:local
+> kind load docker-image dev.local/serverless-harness:local --name sh-knative
+> ./deploy/knative/setup-kind.sh --skip-build
+> ```
+> See [`deploy/knative/README-kind.md`](deploy/knative/README-kind.md) for more setup options.
+
 setup inferencing
 
 ```

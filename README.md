@@ -112,53 +112,10 @@ scales to zero and resumes from cold.
 
 > **Prerequisites:** `kind`, `kubectl`, `docker`, and an Anthropic-compatible model credential.
 
-```bash
-# 1. Clone (the Pi agent is a submodule)
-git clone --recurse-submodules https://github.com/kagenti/serverless-harness.git
-cd serverless-harness
-
-# 2. Provide a model credential — either a direct key...
-export ANTHROPIC_API_KEY=sk-...
-#    ...or a Bearer-token gateway (e.g. LiteLLM):
-# export ANTHROPIC_BASE_URL=https://your-gateway
-# export ANTHROPIC_AUTH_TOKEN=...
-
-# 3. One-shot: create cluster, install Knative + Kourier, deploy Redis + sandbox + harness
-./deploy/knative/setup-kind.sh
-```
-
-In a second terminal, expose the gateway and watch pods:
-
-```bash
-kubectl port-forward -n kourier-system svc/kourier 8080:80   # leave running
-watch -n5 'kubectl get pods'                                  # in another pane
-```
-
-**Send the first turn** — a pod cold-starts to handle it, then scales back to zero:
-
-```bash
-curl -s -H "Host: serverless-harness.default.example.com" \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"Remember the secret word: pineapple. Reply only with OK."}' \
-  http://localhost:8080/turn | jq .
-# => { "sessionId": "019ed8e8-...", "response": "OK" }
-```
-
-**Resume across a cold start** — wait ~90s for the pod to terminate, then ask on the *same* session.
-A fresh pod spins up from zero and still remembers the state from Redis:
-
-```bash
-export SID="<sessionId from above>"
-curl -s -H "Host: serverless-harness.default.example.com" \
-  -H "Content-Type: application/json" \
-  -d "{\"sessionId\":\"$SID\",\"prompt\":\"What was the secret word?\"}" \
-  http://localhost:8080/turn | jq .
-# => response contains "pineapple"
-```
-
-See [`serverless-harness-demo.md`](serverless-harness-demo.md) for the full guided walkthrough
-(including sandbox command execution) and [`deploy/knative/SMOKE.md`](deploy/knative/SMOKE.md) for the
-verified smoke-test claims.
+See [`serverless-harness-demo.md`](serverless-harness-demo.md) for the guided walkthrough
+(cold start → scale-to-zero → resume → sandbox command execution) and
+[`deploy/knative/README-kind.md`](deploy/knative/README-kind.md) for setup options and troubleshooting.
+[`deploy/knative/SMOKE.md`](deploy/knative/SMOKE.md) documents the verified smoke-test claims.
 
 ---
 
