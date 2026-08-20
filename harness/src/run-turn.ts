@@ -54,7 +54,12 @@ export function resolveModelSelection(
  */
 /**
  * Parse SH_MODEL_HEADERS — a JSON object of extra request headers to send to a custom endpoint
- * (e.g. `{"RITS_API_KEY":"…"}`) — into a header map. Empty/absent ⇒ {}. Throws on non-object JSON.
+ * (e.g. `{"RITS_API_KEY":"${RITS_API_KEY}"}`) — into a header map. Empty/absent ⇒ {}. Throws on
+ * non-object JSON.
+ *
+ * String values support `${VAR}` interpolation from `env`, so a secret header value can be supplied
+ * via a secretKeyRef env var (e.g. RITS_API_KEY) rather than an inline literal in the manifest.
+ * An unset `${VAR}` interpolates to the empty string.
  */
 function parseModelHeaders(env: NodeJS.ProcessEnv): Record<string, string> {
   const raw = env.SH_MODEL_HEADERS;
@@ -68,7 +73,14 @@ function parseModelHeaders(env: NodeJS.ProcessEnv): Record<string, string> {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error(`SH_MODEL_HEADERS must be a JSON object of header name→value pairs.`);
   }
-  return parsed as Record<string, string>;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+    out[k] =
+      typeof v === "string"
+        ? v.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name: string) => env[name] ?? "")
+        : String(v);
+  }
+  return out;
 }
 
 function synthesizeCustomModel(modelId: string, env: NodeJS.ProcessEnv): Model<"anthropic-messages"> {

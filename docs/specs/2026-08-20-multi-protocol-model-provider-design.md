@@ -76,7 +76,7 @@ absent, it defaults to `anthropic` (today's behavior).
 | `SH_MODEL_API` | `anthropic` \| `openai-completions` \| `openai-responses` | `anthropic` |
 | `SH_MODEL` | served model id (used as `id` + `name`) | — (required) |
 | `SH_MODEL_BASE_URL` | endpoint base URL | falls back to `ANTHROPIC_BASE_URL` (anthropic) / `OPENAI_BASE_URL` (openai\*) for back-compat |
-| `SH_MODEL_HEADERS` | JSON object of extra request headers, e.g. `{"RITS_API_KEY":"…"}` | `{}` |
+| `SH_MODEL_HEADERS` | JSON object of extra request headers, e.g. `{"RITS_API_KEY":"${RITS_API_KEY}"}`. String values support `${VAR}` interpolation from env, so a secret value flows in via a secretKeyRef env (no inline literal) | `{}` |
 | `SH_MODEL_AUTH` | `bearer` \| `custom-header` \| `none` — how the endpoint authenticates | `bearer` |
 | `SH_MODEL_CONTEXT_WINDOW` / `SH_MODEL_MAX_TOKENS` / `SH_MODEL_PROVIDER` | existing knobs, unchanged | 131072 / 8192 / per-protocol |
 

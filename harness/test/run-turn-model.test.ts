@@ -152,6 +152,20 @@ describe("requireModel with SH_MODEL_API=openai-completions (OpenAI-compatible e
     expect(m.headers.RITS_API_KEY).toBe("abc123");
   });
 
+  it("interpolates ${VAR} in header values from env (secretKeyRef indirection)", () => {
+    const m = requireModel("openai", "m", {
+      SH_MODEL_CUSTOM: "1",
+      SH_MODEL_API: "openai-completions",
+      SH_MODEL_BASE_URL: "https://rits.example/v1",
+      SH_MODEL_AUTH: "custom-header",
+      SH_MODEL_HEADERS: '{"RITS_API_KEY":"${RITS_API_KEY}"}',
+      RITS_API_KEY: "secret-from-secretkeyref",
+      OPENAI_API_KEY: "present",
+    }) as { headers: Record<string, string | null> };
+    expect(m.headers.RITS_API_KEY).toBe("secret-from-secretkeyref");
+    expect(m.headers.Authorization).toBeNull();
+  });
+
   it("requires SH_MODEL_BASE_URL or OPENAI_BASE_URL", () => {
     expect(() =>
       requireModel("openai", "m", { SH_MODEL_CUSTOM: "1", SH_MODEL_API: "openai-completions" }),
