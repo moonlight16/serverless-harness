@@ -89,6 +89,42 @@ This triggers an automatic revision rollout. Available model IDs:
 When using a gateway (LiteLLM, etc.), the model ID must match what the gateway
 accepts — consult your gateway's model routing configuration.
 
+### Custom / self-hosted endpoints
+
+For a model id not in the built-in registry, set `SH_MODEL_CUSTOM=1` and select the wire
+protocol with `SH_MODEL_API`:
+
+- **Anthropic-compatible** (`/v1/messages`; direct Anthropic or LiteLLM Anthropic-format) —
+  the default. Point `ANTHROPIC_BASE_URL` (or `SH_MODEL_BASE_URL`) at the endpoint.
+- **OpenAI-compatible** (`/v1/chat/completions`; RITS / vLLM / OpenAI / Azure) — set
+  `SH_MODEL_API=openai-completions` and point `SH_MODEL_BASE_URL` (or `OPENAI_BASE_URL`) at it:
+
+```yaml
+- name: SH_MODEL
+  value: "ibm-granite/granite-4.1-8b"
+- name: SH_MODEL_CUSTOM
+  value: "1"
+- name: SH_MODEL_API
+  value: "openai-completions"
+- name: SH_MODEL_BASE_URL
+  value: "https://<host>/granite-4-1-8b/v1"
+- name: OPENAI_API_KEY
+  value: "<key>"                            # standard Bearer auth (default)
+```
+
+For custom-header auth (e.g. IBM RITS's `RITS_API_KEY`), keep the secret in a `secretKeyRef`
+env and reference it from `SH_MODEL_HEADERS` via `${VAR}` (the default Bearer is stripped):
+
+```yaml
+- name: SH_MODEL_AUTH
+  value: "custom-header"
+- name: SH_MODEL_HEADERS
+  value: '{"RITS_API_KEY":"${RITS_API_KEY}"}'   # RITS_API_KEY from a secretKeyRef env
+```
+
+> Tool-calling is a per-endpoint capability: only routes with the vLLM tool-call parser
+> enabled return structured tool calls. Sniff a new model with a tool-requiring prompt first.
+
 ## What it installs
 
 | Component | How |

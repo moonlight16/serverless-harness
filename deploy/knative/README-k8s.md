@@ -139,6 +139,31 @@ export ANTHROPIC_AUTH_TOKEN=...            # or a placeholder if the endpoint ne
 export ANTHROPIC_BASE_URL=http://my-model.my-ns.svc.cluster.local:8000
 ```
 
+To target an **OpenAI-compatible endpoint** (RITS / vLLM / OpenAI / Azure serving
+`/v1/chat/completions`), set `SH_MODEL_API=openai-completions` and point
+`SH_MODEL_BASE_URL` (or `OPENAI_BASE_URL`) at it:
+
+```bash
+export SH_MODEL=ibm-granite/granite-4.1-8b
+export SH_MODEL_CUSTOM=1
+export SH_MODEL_API=openai-completions
+export SH_MODEL_BASE_URL=https://<host>/granite-4-1-8b/v1
+export OPENAI_API_KEY=<key>                # standard Bearer auth (default)
+```
+
+For an endpoint that authenticates via a **custom header** instead of a Bearer token
+(e.g. IBM RITS's `RITS_API_KEY`), keep the secret in a `secretKeyRef` env var and
+reference it from `SH_MODEL_HEADERS` via `${VAR}` — the default `Authorization` Bearer
+is then stripped:
+
+```bash
+export SH_MODEL_AUTH=custom-header
+export SH_MODEL_HEADERS='{"RITS_API_KEY":"${RITS_API_KEY}"}'   # RITS_API_KEY supplied via secretKeyRef
+```
+
+> Tool-calling is a per-endpoint capability: only routes with the vLLM tool-call parser
+> enabled return structured tool calls. Sniff a new model with a tool-requiring prompt first.
+
 ## Reaching the service without a port-forward
 
 `--ingress nodeport` patches the Kourier service to `NodePort`, so you can reach the

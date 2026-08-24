@@ -52,11 +52,43 @@ export function resolveModelSelection(
  * cost/context numbers are placeholders (self-hosted, not billed); contextWindow/maxTokens are
  * conservative defaults — override via SH_MODEL_CONTEXT_WINDOW / SH_MODEL_MAX_TOKENS if needed.
  */
+/**
+ * Parse SH_MODEL_HEADERS — a JSON object of extra request headers to send to a custom endpoint
+ * (e.g. `{"RITS_API_KEY":"${RITS_API_KEY}"}`) — into a header map. Empty/absent ⇒ {}. Throws on
+ * non-object JSON.
+ *
+ * String values support `${VAR}` interpolation from `env`, so a secret header value can be supplied
+ * via a secretKeyRef env var (e.g. RITS_API_KEY) rather than an inline literal in the manifest.
+ * An unset `${VAR}` interpolates to the empty string.
+ */
+function parseModelHeaders(env: NodeJS.ProcessEnv): Record<string, string> {
+  const raw = env.SH_MODEL_HEADERS;
+  if (!raw) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`SH_MODEL_HEADERS must be a JSON object of header name→value pairs (got: ${raw}).`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`SH_MODEL_HEADERS must be a JSON object of header name→value pairs.`);
+  }
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+    out[k] =
+      typeof v === "string"
+        ? v.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name: string) => env[name] ?? "")
+        : String(v);
+  }
+  return out;
+}
+
 function synthesizeCustomModel(modelId: string, env: NodeJS.ProcessEnv): Model<"anthropic-messages"> {
-  const baseUrl = env.ANTHROPIC_BASE_URL;
+  // SH_MODEL_BASE_URL is the protocol-neutral knob; ANTHROPIC_BASE_URL is the back-compat fallback.
+  const baseUrl = env.SH_MODEL_BASE_URL || env.ANTHROPIC_BASE_URL;
   if (!baseUrl) {
     throw new Error(
-      `SH_MODEL_CUSTOM=1 requires ANTHROPIC_BASE_URL (the Anthropic-compatible endpoint to send "${modelId}" to).`,
+      `SH_MODEL_CUSTOM=1 (anthropic) requires SH_MODEL_BASE_URL or ANTHROPIC_BASE_URL (the Anthropic-compatible endpoint to send "${modelId}" to).`,
     );
   }
   const contextWindow = Number(env.SH_MODEL_CONTEXT_WINDOW) || 131072;
@@ -86,14 +118,71 @@ function synthesizeCustomModel(modelId: string, env: NodeJS.ProcessEnv): Model<"
 }
 
 /**
+ * Synthesize an OpenAI Chat Completions model for an OpenAI-compatible endpoint (RITS / vLLM /
+ * OpenAI / Azure / most OSS gateways), reached via SH_MODEL_CUSTOM=1 +
+ * SH_MODEL_API=openai-completions. Pi's openai-completions provider reads `model.baseUrl` and
+ * spreads `model.headers` into the request; the API key is resolved from OPENAI_API_KEY.
+ *
+ * Auth (SH_MODEL_AUTH):
+ *   - "bearer" (default): pi sends `Authorization: Bearer <OPENAI_API_KEY>` (standard OpenAI/vLLM).
+ *   - "custom-header": the endpoint authenticates via a header in SH_MODEL_HEADERS (e.g. RITS's
+ *     `RITS_API_KEY`); strip the default Authorization so the SDK Bearer isn't also sent. pi's
+ *     client still requires a non-empty OPENAI_API_KEY, so seed a placeholder when unset.
+ *   - "none": no auth header.
+ */
+function synthesizeOpenAICompletionsModel(
+  modelId: string,
+  env: NodeJS.ProcessEnv,
+): Model<"openai-completions"> {
+  const baseUrl = env.SH_MODEL_BASE_URL || env.OPENAI_BASE_URL;
+  if (!baseUrl) {
+    throw new Error(
+      `SH_MODEL_CUSTOM=1 with SH_MODEL_API=openai-completions requires SH_MODEL_BASE_URL or OPENAI_BASE_URL (the OpenAI-compatible endpoint to send "${modelId}" to).`,
+    );
+  }
+  const contextWindow = Number(env.SH_MODEL_CONTEXT_WINDOW) || 131072;
+  const maxTokens = Number(env.SH_MODEL_MAX_TOKENS) || 8192;
+  const auth = env.SH_MODEL_AUTH ?? "bearer";
+  const headers: Record<string, string | null> = { ...parseModelHeaders(env) };
+  if (auth === "custom-header" || auth === "none") {
+    // Endpoint authenticates via a custom header (already in `headers`) or not at all — strip the
+    // SDK's default Authorization Bearer so an unknown/empty Bearer isn't sent. pi's openai client
+    // still requires a non-empty api key even when the Bearer is unused, so seed a placeholder.
+    headers.Authorization = null;
+    if (!env.OPENAI_API_KEY) process.env.OPENAI_API_KEY = "unused";
+  }
+  const model: Model<"openai-completions"> = {
+    id: modelId,
+    name: modelId,
+    api: "openai-completions",
+    // provider "openai" so pi resolves the api key from OPENAI_API_KEY (env-api-keys.ts). Request
+    // routing is by baseUrl + api; provider only drives the key lookup. Overridable via SH_MODEL_PROVIDER.
+    provider: (env.SH_MODEL_PROVIDER ?? "openai") as Model<"openai-completions">["provider"],
+    baseUrl,
+    headers: headers as unknown as Record<string, string>,
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow,
+    maxTokens,
+  };
+  return model;
+}
+
+/**
  * Resolve a model from the pi-ai registry, throwing a clear error when the id is unknown.
  * getModel() returns undefined for an unknown provider/model (e.g. the dotted
  * "claude-sonnet-4.6" is a github-copilot key, not an anthropic one) — without this guard
  * the caller crashes later on `baseModel.headers`. Returns the model object on success.
  *
- * SH_MODEL_CUSTOM=1 bypasses the registry entirely and synthesizes an Anthropic-compatible
- * model from SH_MODEL + ANTHROPIC_BASE_URL — for self-hosted endpoints (vLLM/llm-d) whose
- * served model id is not a known Anthropic id. See synthesizeCustomModel().
+ * SH_MODEL_CUSTOM=1 bypasses the registry entirely and synthesizes a model for a custom endpoint.
+ * SH_MODEL_API selects the wire protocol (default "anthropic"):
+ *   - "anthropic"          → Anthropic Messages via SH_MODEL_BASE_URL/ANTHROPIC_BASE_URL (default;
+ *                            covers direct Anthropic + LiteLLM Anthropic-format). synthesizeCustomModel().
+ *   - "openai-completions" → OpenAI Chat Completions via SH_MODEL_BASE_URL/OPENAI_BASE_URL + headers/auth
+ *                            (RITS/vLLM/OpenAI/Azure). synthesizeOpenAICompletionsModel().
+ *   - "openai-responses"   → deferred (see docs/specs/2026-08-20-multi-protocol-model-provider-design.md).
+ * See that spec for the config schema.
  */
 export function requireModel(
   provider: string,
@@ -101,7 +190,22 @@ export function requireModel(
   env: NodeJS.ProcessEnv = process.env,
 ) {
   if (env.SH_MODEL_CUSTOM === "1") {
-    return synthesizeCustomModel(modelId, env);
+    const api = env.SH_MODEL_API ?? "anthropic";
+    switch (api) {
+      case "anthropic":
+      case "anthropic-messages":
+        return synthesizeCustomModel(modelId, env);
+      case "openai-completions":
+        return synthesizeOpenAICompletionsModel(modelId, env);
+      case "openai-responses":
+        throw new Error(
+          `SH_MODEL_API=openai-responses is not yet implemented (deferred; see docs/specs/2026-08-20-multi-protocol-model-provider-design.md §7). Use openai-completions.`,
+        );
+      default:
+        throw new Error(
+          `Unknown SH_MODEL_API "${api}". Expected: anthropic | openai-completions | openai-responses.`,
+        );
+    }
   }
   const model = getModel(provider as never, modelId as never);
   if (model) return model;
@@ -143,6 +247,12 @@ export function applyModelGateway<M extends { headers?: Record<string, unknown> 
   baseModel: M,
   config?: Pick<TurnConfig, "anthropicBaseUrl" | "anthropicAuthToken">,
 ): M {
+  // The Anthropic gateway rewrite (Bearer + strip x-api-key + seed ANTHROPIC_API_KEY, and the
+  // litellm compat-flag disables) applies ONLY to the Anthropic-messages path. OpenAI-compatible
+  // models carry their own baseUrl/headers/auth from synthesizeOpenAICompletionsModel — leave
+  // them untouched (else we'd clobber baseUrl with ANTHROPIC_BASE_URL and inject a wrong Bearer).
+  const api = (baseModel as { api?: string }).api;
+  if (api && api !== "anthropic-messages") return baseModel;
   // `||` (not `??`) so an empty-string config value falls back to the env var rather than
   // suppressing it — "" is a "not set" sentinel here, not a meaningful credential.
   const authToken = config?.anthropicAuthToken || process.env.ANTHROPIC_AUTH_TOKEN;
