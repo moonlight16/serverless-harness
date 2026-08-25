@@ -146,7 +146,14 @@ Stream, and idles back toward zero. KEDA watches the queue depth and scales
 
 ```bash
 kubectl apply -f deploy/knative/leaf-scaledjob.yaml
+kubectl get scaledjob leaf-worker   # => NAME leaf-worker ... (must exist before 2d)
 ```
+
+> The ScaledJob is what KEDA scales `0→N` on. If this `get` returns
+> `No resources found`, 2d will accept the batch but **no `leaf-worker` pods
+> ever start** and 2e polls forever — confirm it exists here first. Note a
+> ScaledJob does not survive a `kind delete`/recreate, so re-apply it on a
+> fresh cluster.
 
 ### 2b. Seed a small repo into the sandbox
 
