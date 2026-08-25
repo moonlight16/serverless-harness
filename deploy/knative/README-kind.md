@@ -48,9 +48,15 @@ curl -H 'Host: serverless-harness.default.example.com' \
 ## Options
 
 ```
---skip-build             Do not build/load the harness image (use existing)
+--build                  Force a local harness build from this checkout
+--skip-build             Do not build/pull the harness image (use existing dev.local tag)
+--image <ref>            Published harness image to pull (default: ghcr.io/rossoctl/serverless-harness:latest)
 --cluster-name <name>    Kind cluster name (default: sh-knative)
 ```
+
+By default (no `--build`/`--skip-build`) the script **pulls the published harness image** and
+loads it into the cluster, falling back to a local build only if the pull is unavailable
+(offline or image missing). Use `--build` to always build from source.
 
 Environment variables:
 
@@ -58,6 +64,8 @@ Environment variables:
 |----------|---------|-------------|
 | `CLUSTER_NAME` | `sh-knative` | Kind cluster name |
 | `KNATIVE_VERSION` | `v1.14.0` | Knative Serving version |
+| `SH_IMAGE` | `ghcr.io/rossoctl/serverless-harness:latest` | Published harness image pulled by default (same as `--image`) |
+| `FORCE_BUILD` | `false` | Force a local build (same as `--build`) |
 | `KEDA_VERSION` | `v2.14.0` | KEDA version |
 
 ## Choosing the model

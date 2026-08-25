@@ -4,14 +4,13 @@ git clone --recurse-submodules https://github.com/kagenti/serverless-harness.git
 ./deploy/knative/setup-kind.sh
 ```
 
-> To skip the local harness build and use the published image, pull it into the kind
-> cluster first under the tag the manifests reference, then pass `--skip-build`:
-> ```
-> docker pull ghcr.io/rossoctl/serverless-harness:latest
-> docker tag  ghcr.io/rossoctl/serverless-harness:latest dev.local/serverless-harness:local
-> kind load docker-image dev.local/serverless-harness:local --name sh-knative
-> ./deploy/knative/setup-kind.sh --skip-build
-> ```
+> By default `setup-kind.sh` **pulls the published harness image**
+> (`ghcr.io/rossoctl/serverless-harness:latest`) and loads it into the kind cluster — a
+> first-time quickstart needs no local Docker build. If the pull is unavailable (offline, or
+> the image is missing) it transparently falls back to building from this checkout.
+> - `--build` — force a local build (use when testing local source changes).
+> - `--skip-build` — reuse an image you already loaded as `dev.local/serverless-harness:local`.
+>
 > See [`deploy/knative/README-kind.md`](deploy/knative/README-kind.md) for more setup options.
 
 setup inferencing

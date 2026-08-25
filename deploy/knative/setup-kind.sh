@@ -9,7 +9,15 @@
 #   - ANTHROPIC_API_KEY env var set
 #
 # Usage:
-#   ./deploy/knative/setup-kind.sh [--skip-build] [--cluster-name <name>]
+#   ./deploy/knative/setup-kind.sh [--skip-build] [--build] [--image <ref>] [--cluster-name <name>]
+#
+# Harness image (dev.local/serverless-harness:local, referenced by service.yaml):
+#   default      Pull the published image ($SH_IMAGE) and load it into kind; if the pull is
+#                unavailable (offline / image missing), transparently fall back to a local build.
+#                A first-time quickstart therefore needs no local Docker build.
+#   --build      Force a local build from this checkout (use when testing local source changes).
+#   --skip-build Do neither; assume dev.local/serverless-harness:local is already loaded.
+#   --image <ref> / SH_IMAGE=<ref>  Override the published image to pull.
 
 set -euo pipefail
 
@@ -17,17 +25,59 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CLUSTER_NAME="${CLUSTER_NAME:-sh-knative}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
+FORCE_BUILD="${FORCE_BUILD:-false}"
 KNATIVE_VERSION="${KNATIVE_VERSION:-v1.14.0}"
+# Published harness image pulled by default (public GHCR package under the rossoctl org).
+SH_IMAGE="${SH_IMAGE:-ghcr.io/rossoctl/serverless-harness:latest}"
+# Local tag the Knative manifests reference; the pulled/built image is (re)tagged to this.
+LOCAL_IMAGE="${LOCAL_IMAGE:-dev.local/serverless-harness:local}"
 
 # Parse args
 for arg in "$@"; do
   case $arg in
     --skip-build) SKIP_BUILD=true ;;
+    --build) FORCE_BUILD=true ;;
     --cluster-name) shift; CLUSTER_NAME="$1" ;;
     --cluster-name=*) CLUSTER_NAME="${arg#*=}" ;;
+    --image) shift; SH_IMAGE="$1" ;;
+    --image=*) SH_IMAGE="${arg#*=}" ;;
   esac
   shift 2>/dev/null || true
 done
+
+# Provide the harness image referenced by service.yaml ($LOCAL_IMAGE). By default we pull the
+# published image (fast path — no local build needed for a first-time quickstart) and fall back
+# to a local build only if the pull is unavailable. --build forces a local build; --skip-build
+# assumes the image is already loaded. Sets HARNESS_IMAGE_LOADED when it (re)loads an image.
+ensure_harness_image() {
+  HARNESS_IMAGE_LOADED=false
+  if [ "$SKIP_BUILD" = "true" ]; then
+    echo "--- Skipping harness image build/pull (--skip-build): expecting $LOCAL_IMAGE preloaded ---"
+    return 0
+  fi
+  if [ "$FORCE_BUILD" != "true" ]; then
+    echo "--- Pulling published harness image: $SH_IMAGE ---"
+    if docker pull "$SH_IMAGE"; then
+      docker tag "$SH_IMAGE" "$LOCAL_IMAGE"
+      echo "--- Loading pulled image into kind ---"
+      kind load docker-image "$LOCAL_IMAGE" --name "$CLUSTER_NAME"
+      HARNESS_IMAGE_LOADED=true
+      return 0
+    fi
+    echo "--- Pull unavailable ($SH_IMAGE); falling back to a local build ---"
+  else
+    echo "--- Building serverless-harness image locally (--build) ---"
+  fi
+  docker build --load -t "$LOCAL_IMAGE" "$REPO_ROOT"
+  echo "--- Loading built image into kind ---"
+  kind load docker-image "$LOCAL_IMAGE" --name "$CLUSTER_NAME"
+  HARNESS_IMAGE_LOADED=true
+}
+
+# When sourced by tests (SH_SOURCE_ONLY=1), stop here so only the functions above are exposed.
+if [ "${SH_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0
+fi
 
 echo "=== M4 Knative Setup (cluster: $CLUSTER_NAME) ==="
 
@@ -124,13 +174,9 @@ kubectl -n default wait --for=condition=Ready pod -l "$POOL_SELECTOR" --timeout=
   exit 1
 }
 
-# 7. Build and load harness image
-if [ "$SKIP_BUILD" != "true" ]; then
-  echo "--- Building serverless-harness image ---"
-  docker build --load -t dev.local/serverless-harness:local "$REPO_ROOT"
-  echo "--- Loading image into kind ---"
-  kind load docker-image dev.local/serverless-harness:local --name "$CLUSTER_NAME"
-fi
+# 7. Provide the harness image ($LOCAL_IMAGE) referenced by service.yaml (pull by default,
+#    local build with --build, or reuse a preloaded image with --skip-build).
+ensure_harness_image
 
 # 8. Create LLM credentials secret (supports direct API key or gateway bridge)
 if [ "${SH_AUTHBRIDGE:-0}" = "1" ]; then
@@ -268,8 +314,9 @@ kubectl apply -f "$SCRIPT_DIR/service.yaml"
 # The image tag (dev.local/serverless-harness:local) is mutable, so re-applying an unchanged
 # service spec does NOT roll a new Revision — Knative would keep serving the previous Revision
 # (pinned to the OLD image digest) and a freshly built image would never be deployed. Force a new
-# Revision by stamping a build marker into the template so the rebuilt image is always picked up.
-if [ "$SKIP_BUILD" != "true" ]; then
+# Revision by stamping a build marker into the template so the (re)loaded image is always picked up.
+# Stamp whenever we loaded an image this run (pull or build); skip when --skip-build reused one.
+if [ "${HARNESS_IMAGE_LOADED:-false}" = "true" ]; then
   kubectl -n default patch ksvc serverless-harness --type merge \
     -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"deploy.sh/build-ts\":\"$(date +%s)\"}}}}}"
 fi
