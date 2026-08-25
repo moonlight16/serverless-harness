@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/kagenti/serverless-harness/gen/go v0.0.0
-	google.golang.org/grpc v1.82.0
+	google.golang.org/grpc v1.82.1
 )
 
 require (
