@@ -113,7 +113,7 @@ scales to zero and resumes from cold — no local image build required.
 > **Prerequisites:** `kind`, `kubectl`, `docker`, and an Anthropic-compatible model credential.
 
 ```bash
-git clone --recurse-submodules https://github.com/kagenti/serverless-harness.git
+git clone --recurse-submodules https://github.com/rossoctl/serverless-harness.git
 cd serverless-harness
 
 export ANTHROPIC_API_KEY=sk-...    # ...or a gateway: ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN

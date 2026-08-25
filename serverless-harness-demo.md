@@ -11,15 +11,15 @@ Two differentiators, two acts:
 
 | Act | What a plain agent does | What the harness does |
 |-----|-------------------------|-----------------------|
-| **A — Durable resume** | Stays resident (burning compute) or forgets on restart | Scales to **zero**, then cold-starts and **remembers** — state lives in Redis, not the process |
-| **B — Fan-out from zero** | Grinds a batch serially in one resident process | Materializes **N worker pods on demand**, drains the queue, collapses back to **zero** |
+| **1 — Durable resume** | Stays resident (burning compute) or forgets on restart | Scales to **zero**, then cold-starts and **remembers** — state lives in Redis, not the process |
+| **2 — Fan-out from zero** | Grinds a batch serially in one resident process | Materializes **N worker pods on demand**, drains the queue, collapses back to **zero** |
 
 ---
 
 ## Act 0: Install
 
 ```bash
-git clone --recurse-submodules https://github.com/kagenti/serverless-harness.git && cd serverless-harness
+git clone --recurse-submodules https://github.com/rossoctl/serverless-harness.git && cd serverless-harness
 ./deploy/knative/setup-kind.sh
 ```
 
@@ -30,8 +30,8 @@ git clone --recurse-submodules https://github.com/kagenti/serverless-harness.git
 > reuses an image you already loaded as `dev.local/serverless-harness:local`.
 > See [`deploy/knative/README-kind.md`](deploy/knative/README-kind.md) for more setup options.
 
-`setup-kind.sh` installs everything Act A needs (Knative + Kourier, Redis, the
-sandbox pod) **and** KEDA, which Act B's fan-out rides on.
+`setup-kind.sh` installs everything Act 1 needs (Knative + Kourier, Redis, the
+sandbox pod) **and** KEDA, which Act 2's fan-out rides on.
 
 **Set up inferencing** — a direct key or a Bearer-token gateway (e.g. LiteLLM):
 
