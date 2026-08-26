@@ -56,7 +56,8 @@ and share the turn-execution core with `/turn` rather than forking it.
 | `toResultRecord` | branch per status | `+ responded` branch |
 | `isRunEnvelope` (`knative-server/src/server.ts`) | `isLeafEnvelope(o) \|\| isSolveEnvelope(o)` | `+ \|\| isPromptEnvelope(o)` |
 | `handleLeafStatus` | wire cases for done/solved/paused/failed | `+ responded` case → `{ status:"responded", text }` |
-| `leaf-job-runner`, `classify-outcome`, `/runs` route, KEDA `ScaledJob` | kind-agnostic | **no change** |
+| `classify-outcome`, `/runs` route, KEDA `ScaledJob` | kind-agnostic | **no change** |
+| `leaf-job-runner` (`processOne`) | returns the leaf status union | type-level only: `+ "responded"` in the return union + doc comment; no behavioral change (a terminal `responded` acks like `solved`) |
 
 The invariant that shapes everything below: `LeafResult` is a discriminated union where **each
 `status` discriminant maps to exactly one payload field** (`done`→`verdict`, `solved`→`patch`, …).

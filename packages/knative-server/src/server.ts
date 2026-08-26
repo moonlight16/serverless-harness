@@ -162,6 +162,15 @@ async function resolveRunWorkload(body: any, res: ServerResponse): Promise<any |
     res.writeHead(404, JSON_HEADERS).end(JSON.stringify({ error: "workload_not_found" }));
     return null;
   }
+  if (body.kind === "prompt") {
+    // Prompt leaves inherit /turn's sandbox model and get no per-leaf pool isolation (ADR 0028).
+    // The workloadId still gates existence (404 above), but its pool selector is intentionally
+    // ignored here rather than injected and then silently dropped by executeTurn downstream.
+    if (record.sandboxSelector) {
+      console.warn(`workload '${body.workloadId}': sandbox pool selector ignored for kind:prompt leaf (ADR 0028)`);
+    }
+    return body;
+  }
   return { ...body, sandboxPoolSelector: record.sandboxSelector };
 }
 

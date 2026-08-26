@@ -38,7 +38,7 @@ default`) and inherits `/turn`'s `resolveSandboxConfig` sandbox routing.
 ## Consequences
 
 - Positive: a prompt behaves identically sync (`/turn`, `async:false`) or async (`async:true`) because it runs the *same* code; the `/runs` route, job runner, and KEDA `ScaledJob` are unchanged; prompt leaves inherit async resumability for free from the durable session log.
-- Negative / accepted cost: prompt leaves get no per-leaf pool isolation (they share `/turn`'s sandbox model), so a fleet of async prompts is not lease-bounded the way solve leaves are; `runTurn` is refactored, so its behavior is now pinned by a regression test rather than by being the only caller.
+- Negative / accepted cost: prompt leaves get no per-leaf pool isolation (they share `/turn`'s sandbox model), so a fleet of async prompts is not lease-bounded the way solve leaves are; `runTurn` is refactored, so its behavior is now pinned by a regression test rather than by being the only caller. A prompt leaf may still be addressed to a `workloadId` (the workload gates existence and returns 404 if absent), but its pool selector is intentionally ignored — the API boundary logs a warning rather than injecting a selector that `executeTurn` would silently drop.
 - Follow-up owed: pool-based isolation (a `selectPoolSandbox` lease) for prompt leaves, deferred until a driver needs it; extend `deploy/knative/leaf-async-smoke.sh` with a `responded` claim.
 
 ---

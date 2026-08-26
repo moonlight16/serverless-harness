@@ -348,6 +348,15 @@ describe("runLeaf — prompt routing", () => {
     }));
   });
 
+  it("maps a non-terminal stopReason (max_tokens) → responded", async () => {
+    const executeTurn = vi.fn(async () => ({
+      sessionId: "run-1-i1", response: "capped answer", stopReason: "max_tokens",
+      usage: { input: 5, output: 9, cacheRead: 0, cacheWrite: 0, total: 14 },
+    }));
+    const r = await runLeaf(base, undefined, { executeTurn });
+    expect(r).toEqual({ status: "responded", text: "capped answer", usage: { input: 5, output: 9, cacheRead: 0, cacheWrite: 0, total: 14 } });
+  });
+
   it("maps stopReason error → failed/error carrying the message", async () => {
     const executeTurn = vi.fn(async () => ({
       sessionId: "run-1-i1", response: "", stopReason: "error", errorMessage: "model exploded",
