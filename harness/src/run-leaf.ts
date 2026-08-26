@@ -11,7 +11,7 @@ import { k8sSandboxExtension, KubectlTransport } from "@sh/k8s-sandbox";
 import { selectPoolSandbox, SandboxPoolSaturatedError } from "./select-sandbox.js";
 import { convergeWorkspace, cleanupWorkspace, captureWorkspaceDiff } from "./converge.js";
 import { setupSwebenchWorkspace, captureSwebenchDiff, cleanupSwebench, swebenchVenvDir, buildSwebenchSolvePrompt } from "./swebench-setup.js";
-import { resolveModelSelection, requireModel, applyModelGateway, type TurnConfig } from "./run-turn.js";
+import { resolveModelSelection, requireModel, applyModelGateway, sumBranchUsage, type TurnConfig } from "./run-turn.js";
 import { BufferedRedisBackend } from "./buffered-redis-backend.js";
 import { flushExtension } from "./flush-extension.js";
 import { checkpointExtension } from "./checkpoint-extension.js";
@@ -318,16 +318,10 @@ export const realProduceSolve: ProduceSolve = async (env, config, capture) => {
       // (session.getSessionStats() accesses message.usage non-defensively and throws on this pi build).
       // Best-effort: never let a usage hiccup fail an otherwise-solved leaf.
       try {
-        const u = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-        const branch = (sessionManager as { getBranch?: () => unknown[] }).getBranch?.() ?? [];
-        for (const entry of branch as Array<{ type?: string; message?: { role?: string; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number } } }>) {
-          if (entry?.type === "message" && entry.message?.role === "assistant" && entry.message.usage) {
-            const m = entry.message.usage;
-            u.input += m.input; u.output += m.output; u.cacheRead += m.cacheRead; u.cacheWrite += m.cacheWrite;
-          }
-        }
-        capture.usage = { ...u, total: u.input + u.output + u.cacheRead + u.cacheWrite };
-      } catch { /* usage is best-effort */ }
+        capture.usage = sumBranchUsage(sessionManager);
+      } catch {
+        /* usage is best-effort */
+      }
       capture.patch = swebench ? await captureSwebenchDiff(transport, sid) : await captureWorkspaceDiff(transport, sid);
     } finally {
       await backend.flush();

@@ -297,6 +297,31 @@ export function applyModelGateway<M extends { headers?: Record<string, unknown> 
   };
 }
 
+/**
+ * Best-effort cumulative token usage summed off a session's loaded branch.
+ * Mirrors the defensive pattern budget-voter.ts uses: pi's getSessionStats()
+ * reads message.usage non-defensively and throws on this build, so we walk
+ * getBranch() directly. Always returns a LeafUsage (zeros for an empty branch);
+ * callers wrap the call in try/catch so a usage hiccup never fails the turn.
+ */
+export function sumBranchUsage(sm: unknown): LeafUsage {
+  const u = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  const branch = (sm as { getBranch?: () => unknown[] }).getBranch?.() ?? [];
+  for (const entry of branch as Array<{
+    type?: string;
+    message?: { role?: string; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number } };
+  }>) {
+    if (entry?.type === "message" && entry.message?.role === "assistant" && entry.message.usage) {
+      const m = entry.message.usage;
+      u.input += m.input;
+      u.output += m.output;
+      u.cacheRead += m.cacheRead;
+      u.cacheWrite += m.cacheWrite;
+    }
+  }
+  return { ...u, total: u.input + u.output + u.cacheRead + u.cacheWrite };
+}
+
 export interface ExecuteTurnInput {
   prompt: string;
   sessionId?: string;
@@ -416,27 +441,10 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<TurnResult> 
 
   await backend.flush();
 
-  // Best-effort per-turn token usage (cumulative across the loaded branch), mirroring
-  // realProduceSolve's capture.usage population in run-leaf.ts. branchSpend() only yields the
-  // scalar total, so sum the assistant-message usage breakdown off the branch directly. Guarded:
-  // a usage hiccup must never fail an otherwise-completed turn.
+  // Best-effort per-turn cumulative token usage; a usage hiccup must never fail a completed turn.
   let usage: LeafUsage | undefined;
   try {
-    const u = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-    const branch = (sessionManager as { getBranch?: () => unknown[] }).getBranch?.() ?? [];
-    for (const entry of branch as Array<{
-      type?: string;
-      message?: { role?: string; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number } };
-    }>) {
-      if (entry?.type === "message" && entry.message?.role === "assistant" && entry.message.usage) {
-        const m = entry.message.usage;
-        u.input += m.input;
-        u.output += m.output;
-        u.cacheRead += m.cacheRead;
-        u.cacheWrite += m.cacheWrite;
-      }
-    }
-    usage = { ...u, total: u.input + u.output + u.cacheRead + u.cacheWrite };
+    usage = sumBranchUsage(sessionManager);
   } catch {
     usage = undefined;
   }
