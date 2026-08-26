@@ -45,6 +45,48 @@ curl -H 'Host: serverless-harness.default.example.com' \
 # => { "sessionId": "019...", "response": "OK" }
 ```
 
+#### Streaming responses (SSE)
+
+`POST /turn` also streams the turn live when the client asks for it with
+`Accept: text/event-stream`. The default (no `Accept`, or any other value) is unchanged — the same
+single JSON body. Streaming is a *representation* of `/turn` chosen by content negotiation, not a
+separate route.
+
+```bash
+curl -N -H 'Host: serverless-harness.default.example.com' \
+     -H 'Content-Type: application/json' \
+     -H 'Accept: text/event-stream' \
+     -d '{"prompt":"Count from 1 to 5, one number per line."}' \
+     http://localhost:8080/turn
+```
+
+`-N` disables curl's output buffering so frames print as they arrive. Each event is
+`event: <type>\ndata: <JSON>\n\n`:
+
+- `event: text` — an assistant-text delta (`{"type":"text","delta":"..."}`)
+- `event: thinking` — a reasoning delta (best-effort; may never fire for some models)
+- `event: tool_use` — a tool call started (`id`, `name`, verbatim `args`)
+- `event: tool_result` — a tool call ended (`id`, `isError`, a byte-capped `preview`)
+- `event: done` — clean finish; carries `sessionId`, `stopReason`, and `usage`
+- `event: error` — the turn ended in an error stop-reason; carries `errorMessage`
+
+The stream ends with exactly one terminal `done` (or `error`) frame. Use the `sessionId` from that
+frame to continue the conversation on a later turn (streaming or not). A client disconnect (Ctrl-C
+on `curl -N`) aborts the in-flight turn; the session still persists to its last durable checkpoint,
+so it resumes identically to a completed turn.
+
+An unknown `sessionId` or a missing `prompt` still returns a real HTTP `404`/`400` with the same JSON
+body as the non-streaming path — the `200` + SSE headers are only sent once the first frame is ready.
+
+Tuning knobs (env): `SH_TURN_STREAM_TOOL_RESULT_PREVIEW_BYTES` (tool-result `preview` byte cap,
+default `2048`) and `SH_TURN_STREAM_KEEPALIVE_MS` (heartbeat interval, default `20000`).
+
+> **Deployment note (Knative):** annotate the streaming revision with
+> `autoscaling.knative.dev/target-burst-capacity: "0"` so the Knative activator drops out of the
+> request path — otherwise it may buffer the response and batch all deltas to the end. The gated
+> smoke `deploy/knative/turn-stream-smoke.sh` (`TURN_STREAM_LIVE_SMOKE=1`) asserts inter-frame
+> timing to catch exactly that.
+
 ## Options
 
 ```

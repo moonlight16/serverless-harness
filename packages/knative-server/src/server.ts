@@ -1,7 +1,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { runTurn, type TurnConfig } from "@sh/harness/run-turn";
+import { runTurn, executeTurn, type TurnConfig } from "@sh/harness/run-turn";
+import { terminalFrame, type TurnStreamFrame } from "@sh/harness/turn-stream";
 import { runLeaf, leafSessionId, validateItem, type LeafEnvelope, type LeafResult } from "@sh/harness/run-leaf";
 import { RedisWorkQueue } from "@sh/work-queue";
 import { RedisResultStore, toResultRecord, writeResult, readResult } from "@sh/harness/leaf-result-store";
@@ -16,6 +17,12 @@ import {
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const JSON_HEADERS = { "Content-Type": "application/json" };
+const SSE_HEADERS = {
+  "Content-Type": "text/event-stream",
+  "Cache-Control": "no-cache",
+  Connection: "keep-alive",
+  "X-Accel-Buffering": "no", // belt-and-suspenders for any nginx fronting Kourier (Envoy ignores it)
+};
 const RESULT_TTL_SECONDS = parseInt(process.env.LEAF_RESULT_TTL_SECONDS ?? "86400", 10);
 const WORKLOAD_NAME = /^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/;
 
@@ -86,6 +93,9 @@ async function handleTurn(req: IncomingMessage, res: ServerResponse): Promise<vo
     return;
   }
 
+  const wantsStream = /text\/event-stream/i.test(req.headers.accept ?? "");
+  if (wantsStream) return handleTurnStream(prompt, sessionId, req, res);
+
   try {
     const result = await runTurn(prompt, sessionId, buildConfig());
     res.writeHead(200, JSON_HEADERS).end(JSON.stringify(result));
@@ -98,6 +108,97 @@ async function handleTurn(req: IncomingMessage, res: ServerResponse): Promise<vo
         ...(sessionId ? { sessionId } : {}),
       }),
     );
+  }
+}
+
+// Serialize frames to the SSE wire form, flushing SSE headers on the FIRST frame (lazy flush →
+// pre-first-frame failures keep sync status-code parity, §3.4). The heartbeat is armed only inside
+// writeFrame, so it never fires before the first real frame.
+function makeFrameWriter(res: ServerResponse, keepaliveMs: number) {
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  const arm = () => {
+    if (keepaliveMs <= 0) return;
+    if (heartbeat) clearInterval(heartbeat);
+    heartbeat = setInterval(() => {
+      if (!res.writableEnded) res.write(": keepalive\n\n"); // SSE comment — invisible to EventSource
+    }, keepaliveMs);
+  };
+  const writeFrame = (frame: TurnStreamFrame) => {
+    if (!res.headersSent) res.writeHead(200, SSE_HEADERS);
+    res.write(`event: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`);
+    arm(); // reset the idle timer on every real frame
+  };
+  const stop = () => {
+    if (heartbeat) clearInterval(heartbeat);
+  };
+  return { writeFrame, stop };
+}
+
+// SSE representation of /turn. Same executeTurn core as the sync path (called directly with the
+// additive onEvent/signal inputs); the server owns transport, lazy flush, heartbeat, and abort.
+async function handleTurnStream(
+  prompt: string,
+  sessionId: string | undefined,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const ac = new AbortController();
+  let clientGone = false;
+  // Client disconnect → abort the in-flight turn (§3.6). The !res.writableEnded guard means a
+  // normal completion (res.end() already called) is a no-op; only a premature close aborts. On
+  // Node 22 the reliable disconnect signal for a half-consumed streaming request is the RESPONSE's
+  // 'close' (the request's own 'close' fires with request-body end, not on socket teardown here).
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      clientGone = true;
+      ac.abort();
+    }
+  });
+
+  const { writeFrame, stop } = makeFrameWriter(res, intEnv("SH_TURN_STREAM_KEEPALIVE_MS", 20000));
+  try {
+    const result = await executeTurn({
+      prompt,
+      sessionId,
+      config: buildConfig(),
+      createIfAbsent: false, // preserve /turn's 404-on-missing-session contract
+      onEvent: (f) => writeFrame(f),
+      signal: ac.signal,
+    });
+    // Terminal frame derived from TurnResult — same facts a sync caller reads (§3.4). Not attempted
+    // after a disconnect (socket is gone; would EPIPE).
+    if (!clientGone && !res.writableEnded) writeFrame(terminalFrame(result));
+  } catch (err) {
+    if (!res.headersSent) {
+      // Pre-first-frame: nothing streamed yet, so reuse the EXACT sync mapping — a bad sessionId
+      // still returns real 404 JSON, byte-identical to the sync path (§3.4 regime 2).
+      const message = err instanceof Error ? err.message : String(err);
+      const status = message.includes("no session in backend") ? 404 : 500;
+      res.writeHead(status, JSON_HEADERS).end(
+        JSON.stringify({
+          error: status === 404 ? "session_not_found" : message,
+          ...(sessionId ? { sessionId } : {}),
+        }),
+      );
+      stop();
+      return;
+    }
+    // Post-first-frame: status codes are spent; degrade to a terminal error frame (§3.4 regime 3).
+    // Guarded so a concurrent disconnect can't double-write / EPIPE.
+    if (!clientGone && !res.writableEnded) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.write(
+        `event: error\ndata: ${JSON.stringify({
+          type: "error",
+          sessionId: sessionId ?? "",
+          stopReason: "error",
+          errorMessage: message,
+        })}\n\n`,
+      );
+    }
+  } finally {
+    stop();
+    if (!res.writableEnded) res.end();
   }
 }
 

@@ -17,6 +17,7 @@ import { toolChoiceExtension } from "./tool-choice-extension.js";
 // Type-only import (erased at compile time) so it is safe against the run-leaf↔run-turn value
 // cycle: run-leaf.ts imports values from run-turn.js, but a `import type` adds no runtime edge.
 import type { LeafUsage } from "./run-leaf.js";
+import { sseExtension, type TurnStreamFrame } from "./turn-stream.js";
 
 export interface TurnConfig {
   redisUrl?: string;
@@ -328,6 +329,8 @@ export interface ExecuteTurnInput {
   config?: TurnConfig;
   createIfAbsent: boolean; // session-open policy: false = /turn 404 contract; true = create-or-resume
   selection?: ModelSelection; // pre-resolved model/provider; default: resolveModelSelection(config)
+  onEvent?: (frame: TurnStreamFrame) => void; // present ⇒ append sseExtension(onEvent) to the stack
+  signal?: AbortSignal; // present ⇒ signal → session.abort() (client disconnect)
 }
 
 /**
@@ -400,6 +403,12 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<TurnResult> 
     );
   }
 
+  if (input.onEvent) {
+    // Streaming sink: same factory seam as flushExtension. Appended only when a caller wants
+    // live frames; absent ⇒ /turn behaves exactly as today.
+    extensionFactories.push(sseExtension(input.onEvent));
+  }
+
   const resourceLoader = new DefaultResourceLoader({
     cwd,
     agentDir,
@@ -418,6 +427,8 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<TurnResult> 
     resourceLoader,
     settingsManager,
   });
+
+  if (input.signal) wireAbort(input.signal, session);
 
   await session.prompt(prompt);
 
@@ -456,6 +467,19 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<TurnResult> 
     ...(errorMessage ? { errorMessage } : {}),
     ...(usage ? { usage } : {}),
   };
+}
+
+/**
+ * Bridge an AbortSignal to a session's abort(): fire immediately if already aborted, else once on
+ * the abort event. Pure and unit-testable — the server owns creating the signal (client disconnect
+ * → AbortController), the core just bridges it to Pi's abort. (§3.2, §3.6)
+ */
+export function wireAbort(signal: AbortSignal, session: { abort: () => void }): void {
+  if (signal.aborted) {
+    session.abort();
+    return;
+  }
+  signal.addEventListener("abort", () => session.abort(), { once: true });
 }
 
 /**
