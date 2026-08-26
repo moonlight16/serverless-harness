@@ -167,7 +167,9 @@ async function resolveRunWorkload(body: any, res: ServerResponse): Promise<any |
     // The workloadId still gates existence (404 above), but its pool selector is intentionally
     // ignored here rather than injected and then silently dropped by executeTurn downstream.
     if (record.sandboxSelector) {
-      console.warn(`workload '${body.workloadId}': sandbox pool selector ignored for kind:prompt leaf (ADR 0028)`);
+      // Log the resolved record.workloadId (the exact key findWorkload matched, validated against
+      // WORKLOAD_NAME at creation) rather than the raw request field — self-evidently not log-injectable.
+      console.warn(`workload '${record.workloadId}': sandbox pool selector ignored for kind:prompt leaf (ADR 0028)`);
     }
     return body;
   }
