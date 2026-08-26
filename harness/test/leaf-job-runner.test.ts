@@ -103,6 +103,18 @@ describe("processOne", () => {
     expect(q.acked).toEqual(["1-0"]);
   });
 
+  it("responded → writes a record + ack, returns responded", async () => {
+    const q = fakeQueue({ entryId: "1-0", envelope: ENV, deliveryCount: 1 });
+    const { store, get } = fakeStore();
+    const r = await processOne(baseDeps({ queue: q, resultStore: store, runLeaf: async () => ({ status: "responded", text: "hi" }) }));
+    expect(r).toBe("responded");
+    // A result record is written and the entry is acked (a prompt leaf is a terminal success).
+    // The persisted record's shape for "responded" is leaf-result-store's concern (a later task);
+    // here we only assert the runner's ack + return behavior.
+    expect(get("run-i1")).not.toBeNull();
+    expect(q.acked).toEqual(["1-0"]);
+  });
+
   it("does not write a record and does not ack on transient error (retry)", async () => {
     const q = fakeQueue({ entryId: "1-0", envelope: ENV, deliveryCount: 1 });
     const { store, get } = fakeStore();

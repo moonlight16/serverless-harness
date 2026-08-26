@@ -23,13 +23,14 @@ export interface LeafJobDeps {
  * Claim and process at most one queue entry.
  * - "idle": nothing to claim.
  * - "deadletter": delivery count exceeded → failed result record + ack, runLeaf not run.
- * - "done"/"failed"/"paused"/"aborted"/"solved": runLeaf reached this terminal/parked state → write the
- *   result record + ack. "solved" is a terminal success (a solve leaf writes a patch record + ack).
+ * - "done"/"failed"/"paused"/"aborted"/"solved"/"responded": runLeaf reached this terminal/parked state → write
+ *   the result record + ack. "solved" is a terminal success (a solve leaf writes a patch record + ack); "responded"
+ *   is likewise a terminal success (a prompt leaf writes a response record + ack).
  * - "retry": transient error → NO record, NOT acked (entry stays pending for reclaim).
  */
 export async function processOne(
   deps: LeafJobDeps,
-): Promise<"done" | "failed" | "paused" | "aborted" | "solved" | "deadletter" | "idle" | "retry"> {
+): Promise<"done" | "failed" | "paused" | "aborted" | "solved" | "responded" | "deadletter" | "idle" | "retry"> {
   const maxAttempts = deps.maxAttempts ?? 3;
   const minIdleMs = deps.minIdleMs ?? 90_000;
   const blockMs = deps.blockMs ?? 5_000;

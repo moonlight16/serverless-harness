@@ -1,7 +1,7 @@
 import { describe, it, expect, afterAll } from "vitest";
 import { RedisSessionBackend } from "@sh/session-backend";
 import type { FileEntry } from "@earendil-works/pi-coding-agent";
-import { runTurn } from "../src/run-turn.js";
+import { runTurn, executeTurn } from "../src/run-turn.js";
 
 const REDIS = process.env.REDIS_URL ?? "redis://127.0.0.1:6379";
 const store = new RedisSessionBackend<FileEntry>(REDIS);
@@ -51,6 +51,23 @@ describe("runTurn()", () => {
   it("throws when sessionId does not exist in Redis", async () => {
     await expect(
       runTurn("hello", "nonexistent-session-id-12345", { redisUrl: REDIS }),
+    ).rejects.toThrow("no session in backend");
+  });
+});
+
+describe("executeTurn / runTurn 404 contract", () => {
+  it("exposes executeTurn as the shared core", () => {
+    expect(typeof executeTurn).toBe("function");
+  });
+
+  it("executeTurn with createIfAbsent:false throws when the session is absent", async () => {
+    await expect(
+      executeTurn({
+        prompt: "hello",
+        sessionId: "nonexistent-session-id-98765",
+        config: { redisUrl: REDIS },
+        createIfAbsent: false,
+      }),
     ).rejects.toThrow("no session in backend");
   });
 });

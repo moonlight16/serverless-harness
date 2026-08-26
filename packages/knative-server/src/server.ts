@@ -111,8 +111,13 @@ export function isSolveEnvelope(o: any): boolean {
     && typeof o.repoUrl === "string" && typeof o.ref === "string";
 }
 
+export function isPromptEnvelope(o: any): boolean {
+  return o && typeof o.sessionId === "string" && o.kind === "prompt"
+    && typeof o.prompt === "string";
+}
+
 export function isRunEnvelope(o: any): boolean {
-  return isLeafEnvelope(o) || isSolveEnvelope(o);
+  return isLeafEnvelope(o) || isSolveEnvelope(o) || isPromptEnvelope(o);
 }
 
 let queue: RedisWorkQueue | undefined;
@@ -156,6 +161,17 @@ async function resolveRunWorkload(body: any, res: ServerResponse): Promise<any |
   if (!record || record.status === "deleted") {
     res.writeHead(404, JSON_HEADERS).end(JSON.stringify({ error: "workload_not_found" }));
     return null;
+  }
+  if (body.kind === "prompt") {
+    // Prompt leaves inherit /turn's sandbox model and get no per-leaf pool isolation (ADR 0028).
+    // The workloadId still gates existence (404 above), but its pool selector is intentionally
+    // ignored here rather than injected and then silently dropped by executeTurn downstream.
+    if (record.sandboxSelector) {
+      // Log the resolved record.workloadId (the exact key findWorkload matched, validated against
+      // WORKLOAD_NAME at creation) rather than the raw request field — self-evidently not log-injectable.
+      console.warn(`workload '${record.workloadId}': sandbox pool selector ignored for kind:prompt leaf (ADR 0028)`);
+    }
+    return body;
   }
   return { ...body, sandboxPoolSelector: record.sandboxSelector };
 }
@@ -261,6 +277,7 @@ async function handleLeafStatus(url: URL, res: ServerResponse): Promise<void> {
   if (record.status === "solved") { res.writeHead(200, JSON_HEADERS).end(JSON.stringify({ status: "solved", patch: record.patch })); return; }
   if (record.status === "paused") { res.writeHead(200, JSON_HEADERS).end(JSON.stringify({ status: "paused", gateId: record.gate?.gateId, gate: record.gate })); return; }
   if (record.status === "failed") { res.writeHead(200, JSON_HEADERS).end(JSON.stringify({ status: "failed", reason: record.reason ?? undefined })); return; }
+  if (record.status === "responded") { res.writeHead(200, JSON_HEADERS).end(JSON.stringify({ status: "responded", text: record.text })); return; }
   res.writeHead(200, JSON_HEADERS).end(JSON.stringify({ status: record.status }));
 }
 

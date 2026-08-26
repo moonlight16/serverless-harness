@@ -128,6 +128,26 @@ describe("optional workload lifecycle", () => {
     );
   });
 
+  it("gates a prompt leaf on its workload but ignores the pool selector (ADR 0028)", async () => {
+    await json("POST", "/workloads", { name: "demo-workload" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    runLeaf.mockResolvedValue({ status: "responded", text: "a summary" });
+    const response = await json("POST", "/runs", {
+      workloadId: "demo-workload",
+      sessionId: "run/p1",
+      kind: "prompt",
+      prompt: "Summarize the repo.",
+      item: { item_id: "i", file: "f", pattern: "p" },
+    });
+    expect(response.status).toBe(200);
+    expect(runLeaf).toHaveBeenCalledWith(
+      expect.not.objectContaining({ sandboxPoolSelector: expect.anything() }),
+      expect.any(Object),
+    );
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
   it("deletes the workload through Context Service", async () => {
     await json("POST", "/workloads", { name: "demo-workload" });
     const response = await fetch(base + "/workloads/demo-workload", { method: "DELETE" });

@@ -92,6 +92,19 @@ describe("LeafEnvelope repo ref fields", () => {
   });
 });
 
+describe("LeafEnvelope prompt fields", () => {
+  it("accepts kind:prompt with a prompt string", () => {
+    const env: LeafEnvelope = {
+      sessionId: "run-a/item-1",
+      item: { item_id: "item-1", file: "a.ts", pattern: "x" },
+      kind: "prompt",
+      prompt: "Summarize the repo.",
+    };
+    expect(env.kind).toBe("prompt");
+    expect(env.prompt).toBe("Summarize the repo.");
+  });
+});
+
 describe("validateItem", () => {
   it("accepts a well-formed item", () => {
     expect(validateItem({ item_id: "i", file: "f", pattern: "p" })).toEqual({ item_id: "i", file: "f", pattern: "p", require_approval: false });
@@ -314,6 +327,53 @@ describe("runLeaf — solve routing", () => {
     });
     expect(r.status).toBe("failed");
     expect((r as { reason?: string }).reason).toBe("saturated");
+  });
+});
+
+describe("runLeaf — prompt routing", () => {
+  const base: LeafEnvelope = {
+    sessionId: "run-1/i1", item: { item_id: "x", file: "f", pattern: "p" },
+    kind: "prompt", prompt: "Summarize the repo.",
+  };
+
+  it("maps end_turn → responded with the assistant text and usage", async () => {
+    const executeTurn = vi.fn(async () => ({
+      sessionId: "run-1-i1", response: "here is a summary", stopReason: "end_turn",
+      usage: { input: 3, output: 7, cacheRead: 0, cacheWrite: 0, total: 10 },
+    }));
+    const r = await runLeaf(base, undefined, { executeTurn });
+    expect(r).toEqual({ status: "responded", text: "here is a summary", usage: { input: 3, output: 7, cacheRead: 0, cacheWrite: 0, total: 10 } });
+    expect(executeTurn).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: "Summarize the repo.", sessionId: "run-1/i1", createIfAbsent: true,
+    }));
+  });
+
+  it("maps a non-terminal stopReason (max_tokens) → responded", async () => {
+    const executeTurn = vi.fn(async () => ({
+      sessionId: "run-1-i1", response: "capped answer", stopReason: "max_tokens",
+      usage: { input: 5, output: 9, cacheRead: 0, cacheWrite: 0, total: 14 },
+    }));
+    const r = await runLeaf(base, undefined, { executeTurn });
+    expect(r).toEqual({ status: "responded", text: "capped answer", usage: { input: 5, output: 9, cacheRead: 0, cacheWrite: 0, total: 14 } });
+  });
+
+  it("maps stopReason error → failed/error carrying the message", async () => {
+    const executeTurn = vi.fn(async () => ({
+      sessionId: "run-1-i1", response: "", stopReason: "error", errorMessage: "model exploded",
+    }));
+    const r = await runLeaf(base, undefined, { executeTurn });
+    expect(r).toEqual({ status: "failed", reason: "error", message: "model exploded" });
+  });
+
+  it("maps stopReason aborted → aborted", async () => {
+    const executeTurn = vi.fn(async () => ({ sessionId: "run-1-i1", response: "", stopReason: "aborted" }));
+    const r = await runLeaf(base, undefined, { executeTurn });
+    expect(r).toEqual({ status: "aborted" });
+  });
+
+  it("fails bad_inputs when prompt is missing", async () => {
+    const r = await runLeaf({ sessionId: "s", item: base.item, kind: "prompt" }, undefined, { executeTurn: vi.fn() });
+    expect(r).toEqual({ status: "failed", reason: "bad_inputs" });
   });
 });
 

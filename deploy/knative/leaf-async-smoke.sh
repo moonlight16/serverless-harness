@@ -38,13 +38,13 @@ adispatch() {
   adispatch_item "$RUN/$id" "$id" "${ITEM_FILE[$id]}" "${ITEM_PAT[$id]}" "$model"
 }
 
-# poll_status <sessionId> -> echoes final status JSON (done|failed|aborted) or times out (exit 1)
+# poll_status <sessionId> -> echoes final status JSON (done|failed|aborted|solved|responded) or times out (exit 1)
 poll_status() {
   local sid="$1" i=0 resp status
   while [ "$i" -lt 60 ]; do
     resp=$(curl -s --max-time 10 -H "$HOST_HEADER" "$BASE/runs/status?sessionId=$(jq -rn --arg s "$sid" '$s|@uri')")
     status=$(echo "$resp" | jq -r '.status')
-    case "$status" in done|failed|aborted) echo "$resp"; return 0;; esac
+    case "$status" in done|failed|aborted|solved|responded) echo "$resp"; return 0;; esac
     i=$((i+1)); sleep 2
   done
   echo "$resp"; return 1
@@ -122,6 +122,19 @@ claim 6 "Malformed async envelope (missing item) is rejected with HTTP 400"
 neg_body=$(jq -nc --arg s "$RUN/ineg" '{sessionId:$s, async:true}')
 neg_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -H "$HOST_HEADER" -H "Content-Type: application/json" -d "$neg_body" "$BASE/runs")
 if [ "$neg_code" = "400" ]; then ok "malformed async envelope rejected (HTTP 400)"; else ko "expected HTTP 400, got $neg_code"; fi
+
+# Claim 7: kind:prompt rides the async queue and resolves to status=responded with non-empty text.
+# A bare prompt envelope (no item/workspaceRef) validates via isPromptEnvelope and runs via runPromptLeaf.
+claim 7 "kind:prompt async → status=responded with non-empty text"
+prompt_body=$(jq -nc --arg s "$RUN/p1" --arg p "In one sentence, say hello." \
+  '{sessionId:$s, kind:"prompt", prompt:$p, async:true}')
+p_acc=$(curl -s --max-time 30 -H "$HOST_HEADER" -H "Content-Type: application/json" -d "$prompt_body" "$BASE/runs")
+p_st=$(echo "$p_acc" | jq -r '.status // "none"')
+if [ "$p_st" = "accepted" ]; then ok "prompt async dispatch accepted"; else ko "prompt async dispatch not accepted: $p_acc"; fi
+res=$(poll_status "$RUN/p1")
+p_final=$(echo "$res" | jq -r '.status // "none"')
+if [ "$p_final" = "responded" ]; then ok "prompt run reached responded"; else ko "prompt run not responded: $res"; fi
+if echo "$res" | jq -e '(.text // "") | length > 0' >/dev/null 2>&1; then ok "prompt response text is non-empty"; else ko "prompt response text empty: $res"; fi
 
 echo ""; echo "=== Results: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then echo "ASYNC SMOKE FAIL"; exit 1; else echo "ASYNC SMOKE PASS"; exit 0; fi

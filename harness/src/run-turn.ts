@@ -14,6 +14,9 @@ import { k8sSandboxExtension, resolveSandboxConfig } from "@sh/k8s-sandbox";
 import { checkpointExtension } from "./checkpoint-extension.js";
 import { budgetVoterExtension, branchSpend } from "./budget-voter.js";
 import { toolChoiceExtension } from "./tool-choice-extension.js";
+// Type-only import (erased at compile time) so it is safe against the run-leaf↔run-turn value
+// cycle: run-leaf.ts imports values from run-turn.js, but a `import type` adds no runtime edge.
+import type { LeafUsage } from "./run-leaf.js";
 
 export interface TurnConfig {
   redisUrl?: string;
@@ -230,6 +233,7 @@ export interface TurnResult {
   response: string;
   stopReason: string;
   errorMessage?: string;
+  usage?: LeafUsage;
 }
 
 /**
@@ -293,20 +297,77 @@ export function applyModelGateway<M extends { headers?: Record<string, unknown> 
   };
 }
 
-export async function runTurn(
-  prompt: string,
-  sessionId: string | undefined,
-  config?: TurnConfig,
-): Promise<TurnResult> {
+/**
+ * Best-effort cumulative token usage summed off a session's loaded branch.
+ * Mirrors the defensive pattern budget-voter.ts uses: pi's getSessionStats()
+ * reads message.usage non-defensively and throws on this build, so we walk
+ * getBranch() directly. Always returns a LeafUsage (zeros for an empty branch);
+ * callers wrap the call in try/catch so a usage hiccup never fails the turn.
+ */
+export function sumBranchUsage(sm: unknown): LeafUsage {
+  const u = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  const branch = (sm as { getBranch?: () => unknown[] }).getBranch?.() ?? [];
+  for (const entry of branch as Array<{
+    type?: string;
+    message?: { role?: string; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number } };
+  }>) {
+    if (entry?.type === "message" && entry.message?.role === "assistant" && entry.message.usage) {
+      const m = entry.message.usage;
+      u.input += m.input;
+      u.output += m.output;
+      u.cacheRead += m.cacheRead;
+      u.cacheWrite += m.cacheWrite;
+    }
+  }
+  return { ...u, total: u.input + u.output + u.cacheRead + u.cacheWrite };
+}
+
+export interface ExecuteTurnInput {
+  prompt: string;
+  sessionId?: string;
+  config?: TurnConfig;
+  createIfAbsent: boolean; // session-open policy: false = /turn 404 contract; true = create-or-resume
+  selection?: ModelSelection; // pre-resolved model/provider; default: resolveModelSelection(config)
+}
+
+/**
+ * Shared turn core: opens (or, when createIfAbsent, creates) a session, wires the extension
+ * stack, resolves the model, runs one Pi turn, and extracts text + best-effort usage.
+ *
+ * runTurn (`/turn`) binds createIfAbsent:false — a missing session id 404s ("no session in
+ * backend"). A prompt leaf binds createIfAbsent:true — a fresh id creates, a re-dispatched id
+ * resumes — and may pass a pre-resolved `selection` (leaf precedence over /turn's config default).
+ */
+export async function executeTurn(input: ExecuteTurnInput): Promise<TurnResult> {
+  const { prompt, sessionId, config, createIfAbsent } = input;
   const redisUrl = config?.redisUrl ?? "redis://localhost:6379";
   const cwd = config?.cwd ?? process.cwd();
 
   const store = new RedisSessionBackend<FileEntry>(redisUrl);
   const backend = new BufferedRedisBackend(store);
 
-  const sessionManager = sessionId
-    ? await SessionManager.openFromCheckpoint(sessionId, backend, cwd)
-    : SessionManager.create(cwd, undefined, undefined, backend);
+  let sessionManager;
+  if (sessionId) {
+    if (createIfAbsent) {
+      // create-or-resume: resume the durable session if present, else create a fresh one under the
+      // supplied id. openFromCheckpoint throws "no session in backend" for a missing checkpoint;
+      // fall back to create in that case, but re-throw any other error.
+      try {
+        sessionManager = await SessionManager.openFromCheckpoint(sessionId, backend, cwd);
+      } catch (err) {
+        if (err instanceof Error && err.message.includes("no session in backend")) {
+          sessionManager = SessionManager.create(cwd, undefined, { id: sessionId }, backend);
+        } else {
+          throw err;
+        }
+      }
+    } else {
+      // /turn contract: a supplied id MUST already exist — openFromCheckpoint 404s otherwise.
+      sessionManager = await SessionManager.openFromCheckpoint(sessionId, backend, cwd);
+    }
+  } else {
+    sessionManager = SessionManager.create(cwd, undefined, undefined, backend);
+  }
 
   const agentDir = getAgentDir();
   const settingsManager = SettingsManager.create(cwd, agentDir);
@@ -347,7 +408,7 @@ export async function runTurn(
   });
   await resourceLoader.reload();
 
-  const { provider, modelId } = resolveModelSelection(config);
+  const { provider, modelId } = input.selection ?? resolveModelSelection(config);
   const baseModel = requireModel(provider, modelId);
   const model = applyModelGateway(baseModel, config);
 
@@ -380,10 +441,31 @@ export async function runTurn(
 
   await backend.flush();
 
+  // Best-effort per-turn cumulative token usage; a usage hiccup must never fail a completed turn.
+  let usage: LeafUsage | undefined;
+  try {
+    usage = sumBranchUsage(sessionManager);
+  } catch {
+    usage = undefined;
+  }
+
   return {
     sessionId: sessionManager.getSessionId(),
     response,
     stopReason,
     ...(errorMessage ? { errorMessage } : {}),
+    ...(usage ? { usage } : {}),
   };
+}
+
+/**
+ * Thin wrapper preserving the `/turn` public signature and its 404-on-missing-session contract:
+ * createIfAbsent:false makes a supplied-but-absent sessionId throw "no session in backend".
+ */
+export async function runTurn(
+  prompt: string,
+  sessionId?: string,
+  config?: TurnConfig,
+): Promise<TurnResult> {
+  return executeTurn({ prompt, sessionId, config, createIfAbsent: false });
 }
