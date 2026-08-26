@@ -38,6 +38,7 @@ spec). Chronological by the spec's date; numbers are permanent.
 | [0025](0025-authbridge-deployment-topology.md) | AuthBridge topology: shared LLM-egress gateway (AB1) + per-sandbox egress proxy (AB2) | Accepted |
 | [0026](0026-rc1-static-inject-plugin.md) | RC1 credential injection via a dedicated `static-inject` plugin (not a broker service) | Accepted |
 | [0027](0027-rc1-control-gate-and-hop2-realization.md) | RC1 control gate as IBAC-only; Hop-2 egress interception over plain HTTP | Accepted |
+| [0028](0028-async-prompt-dispatch.md) | Async prompt dispatch as a `kind:"prompt"` leaf sharing the `/turn` core | Proposed |
 
 ## What an ADR is (and isn't)
 
