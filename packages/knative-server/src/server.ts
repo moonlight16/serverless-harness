@@ -111,8 +111,13 @@ export function isSolveEnvelope(o: any): boolean {
     && typeof o.repoUrl === "string" && typeof o.ref === "string";
 }
 
+export function isPromptEnvelope(o: any): boolean {
+  return o && typeof o.sessionId === "string" && o.kind === "prompt"
+    && typeof o.prompt === "string";
+}
+
 export function isRunEnvelope(o: any): boolean {
-  return isLeafEnvelope(o) || isSolveEnvelope(o);
+  return isLeafEnvelope(o) || isSolveEnvelope(o) || isPromptEnvelope(o);
 }
 
 let queue: RedisWorkQueue | undefined;
@@ -261,6 +266,7 @@ async function handleLeafStatus(url: URL, res: ServerResponse): Promise<void> {
   if (record.status === "solved") { res.writeHead(200, JSON_HEADERS).end(JSON.stringify({ status: "solved", patch: record.patch })); return; }
   if (record.status === "paused") { res.writeHead(200, JSON_HEADERS).end(JSON.stringify({ status: "paused", gateId: record.gate?.gateId, gate: record.gate })); return; }
   if (record.status === "failed") { res.writeHead(200, JSON_HEADERS).end(JSON.stringify({ status: "failed", reason: record.reason ?? undefined })); return; }
+  if (record.status === "responded") { res.writeHead(200, JSON_HEADERS).end(JSON.stringify({ status: "responded", text: record.text })); return; }
   res.writeHead(200, JSON_HEADERS).end(JSON.stringify({ status: record.status }));
 }
 
