@@ -7,6 +7,10 @@ metadata:
 spec:
   jobTargetRef:
     backoffLimit: 0
+    # GC each finished Job (and its pod) 60s after completion via the K8s
+    # TTL-after-finished controller — long enough to `kubectl logs` a worker
+    # for the Act 2e reveal, short enough that the fleet clears on its own.
+    ttlSecondsAfterFinished: 60
     template:
       spec:
         restartPolicy: Never

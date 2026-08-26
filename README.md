@@ -108,13 +108,31 @@ flowchart LR
 ## Quick Start
 
 Bring up the full stack on a local [Kind](https://kind.sigs.k8s.io/) cluster and drive an agent that
-scales to zero and resumes from cold.
+scales to zero and resumes from cold — no local image build required.
 
 > **Prerequisites:** `kind`, `kubectl`, `docker`, and an Anthropic-compatible model credential.
 
-See [`serverless-harness-demo.md`](serverless-harness-demo.md) for the guided walkthrough
-(cold start → scale-to-zero → resume → sandbox command execution) and
-[`deploy/knative/README-kind.md`](deploy/knative/README-kind.md) for setup options and troubleshooting.
+```bash
+git clone --recurse-submodules https://github.com/rossoctl/serverless-harness.git
+cd serverless-harness
+
+export ANTHROPIC_API_KEY=sk-...    # ...or a gateway: ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN
+
+./deploy/knative/setup-kind.sh     # installs Knative + Kourier, Redis, the sandbox, and KEDA
+```
+
+`setup-kind.sh` **pulls the published image** (`ghcr.io/rossoctl/serverless-harness:latest`) by
+default, so a first run needs no local Docker build. The default model is `claude-haiku-4-5` (fast and
+cheap — ideal for a live demo).
+
+**Next — take the guided tour:** [`serverless-harness-demo.md`](serverless-harness-demo.md) is a
+~10-minute, two-act walkthrough where you watch the agent **cold-start from zero, drop back to zero and
+resume with full memory** (Act 1), then **fan out into a fleet of worker pods** that appear on demand
+and vanish when the queue drains (Act 2). It's the fastest way to see what a serverless agent does that
+an always-on one can't.
+
+For setup options and troubleshooting see
+[`deploy/knative/README-kind.md`](deploy/knative/README-kind.md);
 [`deploy/knative/SMOKE.md`](deploy/knative/SMOKE.md) documents the verified smoke-test claims.
 
 ---
