@@ -25,7 +25,7 @@ describe("toResultRecord", () => {
     const r: LeafResult = { status: "done", verdict: { item_id: "i1", verdict: "FLAGGED", reason: "x" } };
     expect(toResultRecord(r, "run-1/i1", "T")).toEqual({
       status: "done", verdict: { item_id: "i1", verdict: "FLAGGED", reason: "x" },
-      gate: null, reason: null, patch: null, usage: null, sessionId: "run-1/i1", ts: "T",
+      gate: null, reason: null, patch: null, text: null, usage: null, sessionId: "run-1/i1", ts: "T",
     });
   });
   it("maps paused → gate-bearing record", () => {
@@ -64,10 +64,34 @@ describe("toResultRecord — solved", () => {
   });
 });
 
+describe("toResultRecord — responded", () => {
+  it("carries the text and sets status responded, leaving other payloads null", () => {
+    const rec = toResultRecord({ status: "responded", text: "hello world" }, "run-1/i1", "T");
+    expect(rec.status).toBe("responded");
+    expect(rec.text).toBe("hello world");
+    expect(rec.verdict).toBeNull();
+    expect(rec.gate).toBeNull();
+    expect(rec.reason).toBeNull();
+    expect(rec.patch).toBeNull();
+    expect(rec.usage).toBeNull();
+    expect(rec.sessionId).toBe("run-1/i1");
+  });
+  it("carries token usage when the responded result has it", () => {
+    const rec = toResultRecord(
+      { status: "responded", text: "t", usage: { input: 10, output: 5, cacheRead: 2, cacheWrite: 1, total: 18 } },
+      "run-1", "t",
+    );
+    expect(rec.usage).toEqual({ input: 10, output: 5, cacheRead: 2, cacheWrite: 1, total: 18 });
+  });
+  it("defaults text to null for non-prompt results", () => {
+    expect(toResultRecord({ status: "aborted" }, "run-1", "t").text).toBeNull();
+  });
+});
+
 describe("writeResult / readResult", () => {
   it("round-trips a record and sets the TTL", async () => {
     const redis = fakeRedis();
-    const rec: LeafResultRecord = { status: "done", verdict: { item_id: "i1", verdict: "CLEAR", reason: "ok" }, gate: null, reason: null, patch: null, sessionId: "run-1/i1", ts: "T" };
+    const rec: LeafResultRecord = { status: "done", verdict: { item_id: "i1", verdict: "CLEAR", reason: "ok" }, gate: null, reason: null, patch: null, text: null, sessionId: "run-1/i1", ts: "T" };
     await writeResult(redis, "run-1-i1", rec, 3600);
     expect(redis.ttl.get("leaf:result:run-1-i1")).toBe(3600);
     expect(await readResult(redis, "run-1-i1")).toEqual(rec);
