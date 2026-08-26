@@ -70,8 +70,9 @@ export interface LeafEnvelope {
   maxTurns?: number;
   async?: boolean;            // when true, the HTTP layer enqueues instead of running inline
   tenant?: string;            // namespaces the session id
-  kind?: "converge" | "solve"; // absent/"converge" => existing behavior; "solve" => runSolveLeaf
+  kind?: "converge" | "solve" | "prompt"; // absent/"converge" => existing behavior; "solve" => runSolveLeaf
   problemStatement?: string;   // required when kind === "solve": the task the agent must implement
+  prompt?: string;             // required when kind === "prompt": the free-form prompt to run
   env_key?: string;            // swebench solve: triggers the contained swebench-setup path (Plan C)
 }
 
@@ -99,6 +100,7 @@ export type LeafResult =
   | { status: "paused"; gateId: number; gate: { summary: string; proposed_action: string } }
   | { status: "aborted" }
   | { status: "solved"; patch: string; usage?: LeafUsage }
+  | { status: "responded"; text: string; usage?: LeafUsage }
   | { status: "failed"; reason: "no_verdict" | "invalid_verdict" | "bad_inputs" | "error" | "saturated"; message?: string };
 
 export function buildLeafPrompt(item: LeafItem, workspaceRef?: string): string {

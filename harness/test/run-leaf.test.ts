@@ -92,6 +92,19 @@ describe("LeafEnvelope repo ref fields", () => {
   });
 });
 
+describe("LeafEnvelope prompt fields", () => {
+  it("accepts kind:prompt with a prompt string", () => {
+    const env: LeafEnvelope = {
+      sessionId: "run-a/item-1",
+      item: { item_id: "item-1", file: "a.ts", pattern: "x" },
+      kind: "prompt",
+      prompt: "Summarize the repo.",
+    };
+    expect(env.kind).toBe("prompt");
+    expect(env.prompt).toBe("Summarize the repo.");
+  });
+});
+
 describe("validateItem", () => {
   it("accepts a well-formed item", () => {
     expect(validateItem({ item_id: "i", file: "f", pattern: "p" })).toEqual({ item_id: "i", file: "f", pattern: "p", require_approval: false });
