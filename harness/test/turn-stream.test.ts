@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { sseExtension, clip, terminalFrame, type TurnStreamFrame } from "../src/turn-stream.js";
+import { describe, it, expect, afterEach } from "vitest";
+import { sseExtension, clip, previewCap, terminalFrame, type TurnStreamFrame } from "../src/turn-stream.js";
 import type { TurnResult } from "../src/run-turn.js";
 
 // A fake Pi that captures the handler registered per event NAME, plus emit() to fire one.
@@ -75,6 +75,48 @@ describe("clip / fidelity-B truncation", () => {
 
   it("coerces non-string results via JSON before clipping", () => {
     expect(clip({ a: 1 }, 2048)).toBe('{"a":1}');
+  });
+});
+
+describe("previewCap resolution (override > env > default)", () => {
+  const DEFAULT = 2048;
+  const ENV = "SH_TURN_STREAM_TOOL_RESULT_PREVIEW_BYTES";
+  afterEach(() => {
+    delete process.env[ENV]; // isolate the env-branch cases from each other and the default
+  });
+
+  it("uses a finite, non-negative override verbatim (0 is a valid cap)", () => {
+    expect(previewCap(512)).toBe(512);
+    expect(previewCap(0)).toBe(0);
+  });
+
+  it("clamps a non-finite or negative override back to the default", () => {
+    expect(previewCap(-1)).toBe(DEFAULT);
+    expect(previewCap(Number.NaN)).toBe(DEFAULT);
+    expect(previewCap(Number.POSITIVE_INFINITY)).toBe(DEFAULT);
+  });
+
+  it("falls back to the default when neither override nor env is set", () => {
+    expect(previewCap()).toBe(DEFAULT);
+  });
+
+  it("parses a valid env override when no explicit override is passed", () => {
+    process.env[ENV] = "1024";
+    expect(previewCap()).toBe(1024);
+    process.env[ENV] = "0";
+    expect(previewCap()).toBe(0);
+  });
+
+  it("clamps an unparseable or negative env value back to the default", () => {
+    process.env[ENV] = "not-a-number";
+    expect(previewCap()).toBe(DEFAULT);
+    process.env[ENV] = "-5";
+    expect(previewCap()).toBe(DEFAULT);
+  });
+
+  it("an explicit override wins over the env value", () => {
+    process.env[ENV] = "1024";
+    expect(previewCap(256)).toBe(256);
   });
 });
 

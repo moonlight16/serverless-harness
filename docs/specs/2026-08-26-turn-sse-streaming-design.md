@@ -257,8 +257,10 @@ until cutoff) rather than worse. Long-horizon work is the async path's job (#168
   - Bad `sessionId` + streaming `Accept` → real **404 JSON** (pre-first-frame regime), *not* an error
     frame.
   - Missing `prompt` + streaming `Accept` → **400** (pre-flight).
-- **Disconnect/abort:** emit `req` `"close"` mid-turn → assert `session.abort()` fired (spy) and
-  `backend.flush()` ran, proving the resume-after-abort contract.
+- **Disconnect/abort:** destroy the client socket mid-stream → assert the `AbortSignal` handed to
+  `executeTurn` transitions to `aborted`. `executeTurn` is mocked here, so this proves the server
+  propagates the disconnect into the turn core; the actual `session.abort()` → durable-checkpoint
+  resume contract is exercised end-to-end by the §5.3 live smoke's follow-up turn, not this unit.
 
 ### 5.3 Live gate — `deploy/knative/turn-stream-smoke.sh` (gated `TURN_STREAM_LIVE_SMOKE=1`)
 
@@ -273,7 +275,7 @@ parity**.
 | Criterion | Covered by |
 |---|---|
 | Default `/turn` unchanged | §5.2 golden byte-for-byte test |
-| Session persisted/resumable identically | §5.3 resume + §5.2 flush-on-abort |
+| Session persisted/resumable identically | §5.3 live-smoke follow-up turn (real engine) |
 | Client disconnect aborts the turn | §5.2 disconnect/abort |
 | `curl -N` example + smoke asserting deltas | §5.3 + a documented `curl -N` example in the endpoint docs |
 

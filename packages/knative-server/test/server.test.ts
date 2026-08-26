@@ -225,8 +225,9 @@ describe("POST /turn — back-compat & streaming", () => {
     mockedRunTurn.mockResolvedValueOnce(result as any);
     const res = await request("POST", "/turn", { prompt: "Hi" });
     expect(res.status).toBe(200);
-    // Frozen wire bytes (not JSON.stringify(result)): independent of how `result` is constructed,
-    // so an upstream key-order or serialization change is caught here (back-compat linchpin, ADR-0029).
+    // Frozen wire bytes (not JSON.stringify(result)): pins the server's own sync-response emission,
+    // so a future edit to how the JSON path serializes/orders keys fails here (back-compat, ADR-0029).
+    // runTurn is mocked, so this does NOT cover the upstream turn engine — only the server boundary.
     expect(res.body).toBe('{"sessionId":"gold-1","response":"Hi there","stopReason":"end_turn"}');
     expect(mockedExecuteTurn).not.toHaveBeenCalled(); // sync path never touches executeTurn
   });
@@ -301,6 +302,30 @@ describe("POST /turn — back-compat & streaming", () => {
     req.destroy(); // client disconnect
     await vi.waitFor(() => {
       expect(capturedSignal?.aborted).toBe(true);
+    });
+  });
+
+  it("executeTurn rejects AFTER a frame flushed → 200 + terminal error frame, not 500 JSON (regime 3)", async () => {
+    // The only net-new failure surface in ADR-0029: once ≥1 frame is on the wire the 200 status is
+    // spent, so a mid-turn failure can no longer become a 500 JSON body — it must degrade to a
+    // terminal `event: error` frame carrying the same facts (§3.4 regime 3).
+    mockedExecuteTurn.mockImplementationOnce(async (input: any) => {
+      input.onEvent?.({ type: "text", delta: "partial" });
+      throw new Error("LLM exploded mid-stream");
+    });
+    const res = await sseRequest({ Accept: "text/event-stream" }, { prompt: "hi" });
+    expect(res.status).toBe(200); // headers committed by the first frame — never rewritten to 500
+    expect(res.contentType).toBe("text/event-stream");
+    expect(res.raw).toContain('event: text\ndata: {"type":"text","delta":"partial"}');
+    const events = res.raw.split("\n\n").filter((b) => b.startsWith("event:"));
+    const last = events.at(-1)!;
+    expect(last.startsWith("event: error")).toBe(true);
+    const data = JSON.parse(last.slice(last.indexOf("data: ") + "data: ".length));
+    expect(data).toMatchObject({
+      type: "error",
+      sessionId: "", // no sessionId on a fresh turn → "" on the wire (server.ts:193)
+      stopReason: "error",
+      errorMessage: "LLM exploded mid-stream",
     });
   });
 });
