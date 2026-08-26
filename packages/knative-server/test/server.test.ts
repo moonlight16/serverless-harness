@@ -225,7 +225,9 @@ describe("POST /turn — back-compat & streaming", () => {
     mockedRunTurn.mockResolvedValueOnce(result as any);
     const res = await request("POST", "/turn", { prompt: "Hi" });
     expect(res.status).toBe(200);
-    expect(res.body).toBe(JSON.stringify(result)); // exact bytes — pins the untouched emission line
+    // Frozen wire bytes (not JSON.stringify(result)): independent of how `result` is constructed,
+    // so an upstream key-order or serialization change is caught here (back-compat linchpin, ADR-0029).
+    expect(res.body).toBe('{"sessionId":"gold-1","response":"Hi there","stopReason":"end_turn"}');
     expect(mockedExecuteTurn).not.toHaveBeenCalled(); // sync path never touches executeTurn
   });
 
