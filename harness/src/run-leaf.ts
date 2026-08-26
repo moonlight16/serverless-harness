@@ -11,7 +11,7 @@ import { k8sSandboxExtension, KubectlTransport } from "@sh/k8s-sandbox";
 import { selectPoolSandbox, SandboxPoolSaturatedError } from "./select-sandbox.js";
 import { convergeWorkspace, cleanupWorkspace, captureWorkspaceDiff } from "./converge.js";
 import { setupSwebenchWorkspace, captureSwebenchDiff, cleanupSwebench, swebenchVenvDir, buildSwebenchSolvePrompt } from "./swebench-setup.js";
-import { resolveModelSelection, requireModel, applyModelGateway, sumBranchUsage, type TurnConfig } from "./run-turn.js";
+import { executeTurn, resolveModelSelection, requireModel, applyModelGateway, sumBranchUsage, type TurnConfig, type TurnResult } from "./run-turn.js";
 import { BufferedRedisBackend } from "./buffered-redis-backend.js";
 import { flushExtension } from "./flush-extension.js";
 import { checkpointExtension } from "./checkpoint-extension.js";
@@ -182,9 +182,10 @@ export function validateItem(o: unknown): LeafItem | null {
 export async function runLeaf(
   env: LeafEnvelope,
   config?: TurnConfig,
-  deps?: { produceVerdict?: ProduceVerdict; produceSolve?: ProduceSolve },
+  deps?: { produceVerdict?: ProduceVerdict; produceSolve?: ProduceSolve; executeTurn?: typeof executeTurn },
 ): Promise<LeafResult> {
   if (env.kind === "solve") return runSolveLeaf(env, config, deps);
+  if (env.kind === "prompt") return runPromptLeaf(env, config, deps);
   const item = validateItem(env.item);
   if (!item) return { status: "failed", reason: "bad_inputs" };
 
@@ -233,6 +234,29 @@ export async function runSolveLeaf(
     return { status: "failed", reason: "error", message: err instanceof Error ? err.message : String(err) };
   }
   return { status: "solved", patch: capture.patch ?? "", usage: capture.usage };
+}
+
+async function runPromptLeaf(
+  env: LeafEnvelope,
+  config?: TurnConfig,
+  deps?: { executeTurn?: typeof executeTurn },
+): Promise<LeafResult> {
+  if (!env.prompt) return { status: "failed", reason: "bad_inputs" };
+  const selection = resolveModelSelection({
+    model: env.model ?? config?.model,
+    provider: env.provider ?? config?.provider,
+  });
+  const exec = deps?.executeTurn ?? executeTurn;
+  const r: TurnResult = await exec({
+    prompt: env.prompt,
+    sessionId: env.sessionId,
+    config,
+    createIfAbsent: true,
+    selection,
+  });
+  if (r.stopReason === "aborted") return { status: "aborted" };
+  if (r.stopReason === "error") return { status: "failed", reason: "error", message: r.errorMessage };
+  return { status: "responded", text: r.response, usage: r.usage };
 }
 
 // Real solve runner: lease a sandbox, converge the per-leaf worktree, run the agent with ONLY the

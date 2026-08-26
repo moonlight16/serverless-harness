@@ -330,6 +330,44 @@ describe("runLeaf — solve routing", () => {
   });
 });
 
+describe("runLeaf — prompt routing", () => {
+  const base: LeafEnvelope = {
+    sessionId: "run-1/i1", item: { item_id: "x", file: "f", pattern: "p" },
+    kind: "prompt", prompt: "Summarize the repo.",
+  };
+
+  it("maps end_turn → responded with the assistant text and usage", async () => {
+    const executeTurn = vi.fn(async () => ({
+      sessionId: "run-1-i1", response: "here is a summary", stopReason: "end_turn",
+      usage: { input: 3, output: 7, cacheRead: 0, cacheWrite: 0, total: 10 },
+    }));
+    const r = await runLeaf(base, undefined, { executeTurn });
+    expect(r).toEqual({ status: "responded", text: "here is a summary", usage: { input: 3, output: 7, cacheRead: 0, cacheWrite: 0, total: 10 } });
+    expect(executeTurn).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: "Summarize the repo.", sessionId: "run-1/i1", createIfAbsent: true,
+    }));
+  });
+
+  it("maps stopReason error → failed/error carrying the message", async () => {
+    const executeTurn = vi.fn(async () => ({
+      sessionId: "run-1-i1", response: "", stopReason: "error", errorMessage: "model exploded",
+    }));
+    const r = await runLeaf(base, undefined, { executeTurn });
+    expect(r).toEqual({ status: "failed", reason: "error", message: "model exploded" });
+  });
+
+  it("maps stopReason aborted → aborted", async () => {
+    const executeTurn = vi.fn(async () => ({ sessionId: "run-1-i1", response: "", stopReason: "aborted" }));
+    const r = await runLeaf(base, undefined, { executeTurn });
+    expect(r).toEqual({ status: "aborted" });
+  });
+
+  it("fails bad_inputs when prompt is missing", async () => {
+    const r = await runLeaf({ sessionId: "s", item: base.item, kind: "prompt" }, undefined, { executeTurn: vi.fn() });
+    expect(r).toEqual({ status: "failed", reason: "bad_inputs" });
+  });
+});
+
 it("solve without env_key uses convergeWorkspace, not swebench setup", async () => {
   // produceSolve is injectable; assert the swebench branch is NOT taken when env_key is absent.
   // (Structural: import isSwebenchEnvelope and check the predicate.)
