@@ -1,7 +1,7 @@
 import { describe, it, expect, afterAll } from "vitest";
 import { RedisSessionBackend } from "@sh/session-backend";
 import type { FileEntry } from "@earendil-works/pi-coding-agent";
-import { runTurn, executeTurn } from "../src/run-turn.js";
+import { runTurn, executeTurn, wireAbort } from "../src/run-turn.js";
 
 const REDIS = process.env.REDIS_URL ?? "redis://127.0.0.1:6379";
 const store = new RedisSessionBackend<FileEntry>(REDIS);
@@ -69,5 +69,26 @@ describe("executeTurn / runTurn 404 contract", () => {
         createIfAbsent: false,
       }),
     ).rejects.toThrow("no session in backend");
+  });
+});
+
+describe("wireAbort", () => {
+  it("calls session.abort() immediately when the signal is already aborted", () => {
+    let aborted = 0;
+    const ac = new AbortController();
+    ac.abort();
+    wireAbort(ac.signal, { abort: () => { aborted++; } });
+    expect(aborted).toBe(1);
+  });
+
+  it("calls session.abort() once when the signal fires later, and is idempotent", () => {
+    let aborted = 0;
+    const ac = new AbortController();
+    wireAbort(ac.signal, { abort: () => { aborted++; } });
+    expect(aborted).toBe(0);
+    ac.abort();
+    expect(aborted).toBe(1);
+    ac.abort(); // listener registered { once: true } — no second call
+    expect(aborted).toBe(1);
   });
 });
