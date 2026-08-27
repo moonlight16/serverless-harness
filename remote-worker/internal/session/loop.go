@@ -283,7 +283,7 @@ func (s *Session) accept(
 	e *pb.Exec,
 ) {
 	reqID := e.GetReqId()
-	fp := Fingerprint(e.GetCommand(), e.GetStdin())
+	fp := Fingerprint(e.GetCommand(), e.GetStdin(), e.GetTimeoutS(), e.GetStreaming())
 
 	slotCtx, cancel := context.WithCancel(ctx)
 	mu.Lock()
@@ -411,7 +411,7 @@ func (s *Session) runOne(ctx context.Context, send func(*pb.WorkerFrame), e *pb.
 	// exit, would make every later redelivery of that req_id answer -1 forever
 	// (spec §6.2: dedup protects completed execs only).
 	if cacheable {
-		s.cache.Put(reqID, Fingerprint(e.GetCommand(), e.GetStdin()), frame)
+		s.cache.Put(reqID, Fingerprint(e.GetCommand(), e.GetStdin(), e.GetTimeoutS(), e.GetStreaming()), frame)
 	}
 	send(frame)
 }

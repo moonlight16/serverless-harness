@@ -347,6 +347,48 @@ func countLines(t *testing.T, path string) int {
 	return strings.Count(string(b), "\n")
 }
 
+// reconnect → dedup must not survive a LARGER timeout_s: req_id is not unique
+// per worker (spec §3.1), so a redelivery of the same id and command with more
+// budget is exactly the cross-replica shape the fingerprint guard exists for. If
+// timeout_s is not part of the fingerprint, delivery 2 below hits delivery 1's
+// cache entry and is failed off it with the STALE "timeout:1" ExecError in well
+// under a millisecond — never running, despite having ten times the budget it
+// needed. The fingerprint must treat the two deliveries as different execs so the
+// second one runs fresh.
+func TestContractReconnectDedupHonorsLargerTimeout(t *testing.T) {
+	h := newHarness(t)
+	first := h.attach(t)
+
+	first.SendExec(t, &pb.Exec{ReqId: 8, Command: "sleep 3", TimeoutS: 1, Streaming: true})
+	_, _, terminal := first.Collect(t, 8)
+	if got := terminal.GetError(); got == nil || got.GetMessage() != "timeout:1" {
+		t.Fatalf("first terminal = %+v, want ExecError{\"timeout:1\"}", terminal)
+	}
+
+	// Drop the parked stream; the same Session (and cache) reattaches.
+	first.Drop()
+	second := h.attach(t)
+
+	start := time.Now()
+	second.SendExec(t, &pb.Exec{ReqId: 8, Command: "sleep 3", TimeoutS: 10, Streaming: true})
+	_, _, redelivered := second.Collect(t, 8)
+	elapsed := time.Since(start)
+
+	if e := redelivered.GetError(); e != nil {
+		t.Fatalf("redelivered terminal = ExecError{%q}, want it to run fresh and succeed: "+
+			"timeout_s must be part of the fingerprint", e.GetMessage())
+	}
+	if got := redelivered.GetEnd(); got == nil || got.GetExitCode() != 0 {
+		t.Errorf("redelivered terminal = %+v, want End{0}", redelivered)
+	}
+	// The assertion that matters: it must have actually RUN the 3s sleep, not
+	// been answered from delivery 1's cache entry in microseconds.
+	if elapsed < 2*time.Second {
+		t.Errorf("redelivery answered in %v, want ~3s: it was served from the stale "+
+			"timeout_s=1 cache entry instead of running fresh with its own timeout_s=10", elapsed)
+	}
+}
+
 // streaming: false end to end. This is the PROTO3 DEFAULT, so any relay that
 // omits the field takes this path: the worker buffers everything (up to
 // exec.BufferCap per stream — the memory budget noted on that constant) and emits
