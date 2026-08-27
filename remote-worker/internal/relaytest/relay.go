@@ -120,7 +120,15 @@ func (r *Relay) WaitAttach(t *testing.T) *Conn {
 
 func (c *Conn) Hello() *pb.Hello { return c.hello }
 
-// Token is the raw authorization metadata the worker sent (spec §7 item 1).
+// Token is the authorization metadata as the relay received it.
+//
+// Read this narrowly: the bearer header is attached by the TEST's dial code, not
+// by the session — the worker package does not implement auth at all (the real
+// entrypoint attaches the token). So this proves grpc-go propagated the header and
+// that this test double extracts it; it is NOT coverage of anything that ships, and
+// it says nothing about the production relay's own (TypeScript) extraction. Its
+// value is catching a broken test harness locally instead of as a confusing
+// live-test failure.
 func (c *Conn) Token() string { return c.token }
 
 func (c *Conn) SendExec(t *testing.T, e *pb.Exec) {

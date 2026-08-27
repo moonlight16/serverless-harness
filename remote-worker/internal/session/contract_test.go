@@ -110,6 +110,9 @@ func TestContractRead(t *testing.T) {
 	if got := string(stdout); got != "hello contract\n" {
 		t.Errorf("stdout = %q, want %q", got, "hello contract\n")
 	}
+	if e := terminal.GetError(); e != nil {
+		t.Fatalf("ExecError: %s", e.GetMessage())
+	}
 	if terminal.GetEnd().GetExitCode() != 0 {
 		t.Errorf("terminal = %+v, want End{0}", terminal)
 	}
@@ -133,6 +136,9 @@ func TestContractWrite(t *testing.T) {
 	})
 	_, _, terminal := conn.Collect(t, 2)
 
+	if e := terminal.GetError(); e != nil {
+		t.Fatalf("ExecError: %s", e.GetMessage())
+	}
 	if terminal.GetEnd().GetExitCode() != 0 {
 		t.Fatalf("terminal = %+v, want End{0}", terminal)
 	}
@@ -164,6 +170,9 @@ func TestContractBash(t *testing.T) {
 	if got := string(stderr); got != "oops\n" {
 		t.Errorf("stderr = %q, want %q", got, "oops\n")
 	}
+	if e := terminal.GetError(); e != nil {
+		t.Fatalf("ExecError: %s", e.GetMessage())
+	}
 	if terminal.GetEnd().GetExitCode() != 7 {
 		t.Errorf("terminal = %+v, want End{7}", terminal)
 	}
@@ -177,7 +186,7 @@ func TestContractGrepStreamsMultipleChunks(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/haystack.txt"
 	var b strings.Builder
-	for i := 0; i < 3000; i++ { // ~60 KiB of matching lines
+	for i := 0; i < 3000; i++ { // ~149 KiB of matching lines, well over 4x the 32 KiB cap
 		b.WriteString("needle in line with padding to make it wide enough\n")
 	}
 	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
@@ -215,9 +224,9 @@ func TestContractGrepStreamsMultipleChunks(t *testing.T) {
 		}
 	}
 	if chunks < 2 {
-		t.Errorf("chunks = %d, want >=2 for ~60 KiB of output", chunks)
+		t.Errorf("chunks = %d, want >=2 for ~149 KiB of output", chunks)
 	}
-	if total < 60*1024 {
-		t.Errorf("total output = %d bytes, want >=60 KiB", total)
+	if total < 100*1024 {
+		t.Errorf("total output = %d bytes, want >=100 KiB", total)
 	}
 }
