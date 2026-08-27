@@ -53,8 +53,12 @@ Meanwhile the hazard dedup was written for does not exist yet: the relay never r
 **Resolution:** keep the `req_id` key but guard it with a fingerprint of
 `command` + `stdin` (§6.3). A genuine redelivery is byte-identical and still re-emits the
 cached frame, satisfying the acceptance; a cross-replica collision has a different
-fingerprint, runs fresh, and logs a warning. The real fix — globally unique `req_id` — is
-proposed upstream on ST1/ST3; this guard is defense-in-depth, not a substitute.
+fingerprint and is handled by whether the original is still running. If the original has
+already completed, the collider runs fresh and logs a warning. If the original is still
+in flight, running the collider would mean two concurrent execs under one id, so it is
+refused instead — an `ExecError`, also logged — rather than run. The real fix — globally
+unique `req_id` — is proposed upstream on ST1/ST3; this guard is defense-in-depth, not a
+substitute.
 
 ### 3.2 §7's non-streaming shape is not expressible in `sandbox/v1`
 
@@ -216,9 +220,13 @@ queued behind it in the stream could never be read — and that abort is what wo
 queue. Deadlock. So the queue is bounded (64) and overflow replies
 `ExecError{"busy: queue full"}` immediately instead of blocking.
 
-**The cache is consulted in the recv loop, before enqueue.** A redelivery must not
-consume a queue slot or a pool goroutine, so a fingerprint hit re-emits the cached
-terminal frame inline and never reaches the pool.
+**The cache is consulted in the recv loop, before enqueue — but the in-flight map is
+checked first.** A redelivery must not consume a queue slot or a pool goroutine, so a
+fingerprint hit re-emits the cached terminal frame inline and never reaches the pool. The
+in-flight check that precedes it is deliberate, not redundant: it is what stops a
+duplicate that arrives in the window between `cache.Put` and the slot's release from being
+answered twice — once by the original's own terminal frame, once by the cache, which the
+completed-only lookup below cannot see while that window is still open.
 
 **Abort reaches queued execs.** An `inflight` map `req_id → cancel` is populated at
 *enqueue*, not at start, so aborting a not-yet-started exec cancels its context and the
@@ -243,7 +251,8 @@ SHA-256 over `command` + `stdin`.
 |---|---|
 | unknown `req_id` | run it |
 | known `req_id`, fingerprint matches | re-emit cached terminal frame, do **not** run |
-| known `req_id`, fingerprint differs | run it, log a warning (§3.1 collision) |
+| known `req_id`, fingerprint differs, original completed | run it fresh, log a warning (§3.1 collision) |
+| known `req_id`, fingerprint differs, original still in flight | refuse it with `ExecError`, log a warning — running it would mean two concurrent execs under one id |
 
 ### 6.4 `cmd/worker` — wiring
 
