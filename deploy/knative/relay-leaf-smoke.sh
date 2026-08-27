@@ -59,11 +59,14 @@ restore_harness_env() {
   [ "$HARNESS_FLIPPED" = 1 ] || return 0
   [ -n "$HARNESS_ENV_SNAPSHOT" ] || return 0
   echo "restoring harness env to pre-flip snapshot..."
-  kubectl patch ksvc "$KSVC" -n "$NS" --type=json \
-    -p "[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/env\",\"value\":$HARNESS_ENV_SNAPSHOT}]" \
-    >/dev/null 2>&1 || echo "WARN: restore patch failed (see kubectl get ksvc/$KSVC -o json manually)" >&2
-  wait_ksvc_ready
-  HARNESS_FLIPPED=0
+  if kubectl patch ksvc "$KSVC" -n "$NS" --type=json \
+       -p "[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/env\",\"value\":$HARNESS_ENV_SNAPSHOT}]" \
+       >/dev/null 2>&1; then
+    wait_ksvc_ready
+    HARNESS_FLIPPED=0
+  else
+    echo "WARN: restore patch failed; leaving HARNESS_FLIPPED set so the EXIT trap retries (see kubectl get ksvc/$KSVC -o json manually)" >&2
+  fi
 }
 
 # Wait until the ksvc's latest-created revision is also its latest-ready revision (or
