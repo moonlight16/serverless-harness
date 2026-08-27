@@ -19,6 +19,9 @@ type fakeStream struct {
 	out []*pb.WorkerFrame
 	// closed once Recv should report the stream is gone.
 	done chan struct{}
+	// failAfter, when > 0, makes Send fail once sendCalls exceeds it.
+	failAfter int
+	sendCalls int
 }
 
 func newFakeStream() *fakeStream {
@@ -28,6 +31,10 @@ func newFakeStream() *fakeStream {
 func (f *fakeStream) Send(fr *pb.WorkerFrame) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.sendCalls++
+	if f.failAfter > 0 && f.sendCalls > f.failAfter {
+		return errors.New("stream gone")
+	}
 	f.out = append(f.out, fr)
 	return nil
 }
@@ -274,6 +281,262 @@ func TestCollidingReqIDRunsFresh(t *testing.T) {
 	r.mu.Unlock()
 	if second != "cat /a" {
 		t.Errorf("second run command = %q, want %q", second, "cat /a")
+	}
+	st.close()
+}
+
+// pending reports how many frames the session has not yet received. Used to order
+// a queued abort ahead of the pool being unblocked.
+func (f *fakeStream) pending() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.in)
+}
+
+// failSendAfter makes Send succeed n times and fail afterwards, so Hello can get
+// through and the failure lands on the dedicated sender goroutine rather than on
+// Serve's synchronous Hello send.
+func (f *fakeStream) failSendAfter(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failAfter = n
+	f.sendCalls = 0
+}
+
+func (f *fakeStream) abort(reqID uint64) {
+	f.in <- &pb.ServerFrame{Msg: &pb.ServerFrame_Abort{Abort: &pb.Abort{ReqId: reqID}}}
+}
+
+// Abort must reach a RUNNING exec: the runner's ctx is cancelled, and the
+// terminal frame is a signalled End.
+func TestAbortCancelsRunningExec(t *testing.T) {
+	st := newFakeStream()
+	r := &scriptedRunner{block: make(chan struct{})} // blocks until ctx is cancelled
+	s := session.New(testConfig(), r)
+	go func() { _ = s.Serve(context.Background(), st) }()
+	waitFor(t, "hello", func() bool { return len(st.sent()) >= 1 })
+
+	st.exec(&pb.Exec{ReqId: 1, Command: "sleep 30", Streaming: true})
+	waitFor(t, "the runner to start", func() bool { return r.count() == 1 })
+
+	st.abort(1)
+	waitFor(t, "terminal frame", func() bool { return terminalFor(st.sent(), 1) != nil })
+	if got := terminalFor(st.sent(), 1).GetEnd(); got == nil || got.GetExitCode() != -1 {
+		t.Errorf("terminal = %+v, want End{exit_code:-1}", terminalFor(st.sent(), 1))
+	}
+	st.close()
+}
+
+// Abort while an exec is still QUEUED must still produce a terminal frame, and
+// must not spawn bash. This is the path that silently vanishes if the abort
+// handler removes the slot instead of only cancelling it.
+func TestAbortWhileQueuedStillEmitsTerminal(t *testing.T) {
+	st := newFakeStream()
+	r := &scriptedRunner{block: make(chan struct{})}
+	cfg := testConfig()
+	cfg.MaxConcurrent = 1 // one slot, so the second exec is forced to queue
+	s := session.New(cfg, r)
+	go func() { _ = s.Serve(context.Background(), st) }()
+	waitFor(t, "hello", func() bool { return len(st.sent()) >= 1 })
+
+	st.exec(&pb.Exec{ReqId: 1, Command: "sleep 30", Streaming: true})
+	waitFor(t, "the first exec to occupy the pool", func() bool { return r.count() == 1 })
+	st.exec(&pb.Exec{ReqId: 2, Command: "echo queued", Streaming: true})
+
+	st.abort(2) // abort the queued one
+
+	// Establish the ordering before unblocking the pool. st.abort only BUFFERS the
+	// frame, so releasing the worker straight away lets it dequeue exec 2 and pass
+	// runOne's ctx.Err() check before recvLoop has processed the abort at all —
+	// after which both <-r.block and <-ctx.Done() are ready inside the runner and
+	// select picks at random. That is a defect in this test's sequencing, not in the
+	// session: in production an abort landing as an exec starts legitimately yields
+	// "started, then killed" (End{-1} via ErrAborted), which the wire contract
+	// permits. "Never spawned" is only guaranteed when the abort provably precedes
+	// the dequeue, which is what these two lines establish.
+	waitFor(t, "the abort frame to be delivered", func() bool { return st.pending() == 0 })
+	time.Sleep(50 * time.Millisecond) // let recvLoop's abortReq land before the pool frees up
+	close(r.block)
+
+	waitFor(t, "a terminal frame for the queued exec", func() bool {
+		return terminalFor(st.sent(), 2) != nil
+	})
+	if got := terminalFor(st.sent(), 2).GetEnd(); got == nil || got.GetExitCode() != -1 {
+		t.Errorf("terminal for req_id 2 = %+v, want End{exit_code:-1}", terminalFor(st.sent(), 2))
+	}
+	// It must never have run: only the first exec should have reached the runner.
+	r.mu.Lock()
+	ran := len(r.specs)
+	r.mu.Unlock()
+	if ran != 1 {
+		t.Errorf("runner saw %d execs, want 1: the aborted-while-queued exec was spawned", ran)
+	}
+	st.close()
+}
+
+// Abort for a req_id the worker never saw is a no-op — no frame at all (spec §8).
+func TestAbortUnknownReqIDIsNoOp(t *testing.T) {
+	st := newFakeStream()
+	s := session.New(testConfig(), &scriptedRunner{})
+	go func() { _ = s.Serve(context.Background(), st) }()
+	waitFor(t, "hello", func() bool { return len(st.sent()) >= 1 })
+
+	st.abort(999)
+	// Give the loop room to (incorrectly) emit something.
+	time.Sleep(100 * time.Millisecond)
+	if got := terminalFor(st.sent(), 999); got != nil {
+		t.Errorf("sent %+v for an unknown req_id, want nothing", got)
+	}
+	st.close()
+}
+
+// Overflow must be refused immediately rather than blocking the recv loop: a
+// blocked dispatch would deadlock, since the Abort that frees the queue sits
+// behind it in the same stream.
+func TestQueueOverflowIsRefusedNotBlocking(t *testing.T) {
+	st := newFakeStream()
+	r := &scriptedRunner{block: make(chan struct{})}
+	cfg := testConfig()
+	cfg.MaxConcurrent = 1
+	s := session.New(cfg, r)
+	go func() { _ = s.Serve(context.Background(), st) }()
+	waitFor(t, "hello", func() bool { return len(st.sent()) >= 1 })
+
+	// 1 running + QueueCap queued + 1 too many.
+	total := uint64(session.QueueCap + 2)
+	for i := uint64(1); i <= total; i++ {
+		st.exec(&pb.Exec{ReqId: i, Command: "sleep 30", Streaming: true})
+	}
+
+	waitFor(t, "a busy refusal", func() bool {
+		for _, f := range st.sent() {
+			if e := f.GetError(); e != nil && e.GetMessage() == "busy: queue full" {
+				return true
+			}
+		}
+		return false
+	})
+
+	// The recv loop must still be alive: an abort for the running exec lands.
+	st.abort(1)
+	waitFor(t, "the aborted exec's terminal frame", func() bool {
+		return terminalFor(st.sent(), 1) != nil
+	})
+	close(r.block)
+	st.close()
+}
+
+// When the stream dies, Serve returns the recv error and stops cleanly rather
+// than leaking its pool or heartbeat goroutines.
+func TestServeReturnsOnStreamError(t *testing.T) {
+	st := newFakeStream()
+	r := &scriptedRunner{block: make(chan struct{})}
+	s := session.New(testConfig(), r)
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Serve(context.Background(), st) }()
+	waitFor(t, "hello", func() bool { return len(st.sent()) >= 1 })
+
+	st.exec(&pb.Exec{ReqId: 1, Command: "sleep 30", Streaming: true})
+	waitFor(t, "the runner to start", func() bool { return r.count() == 1 })
+
+	st.close() // the stream is gone
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Error("Serve returned nil, want the recv error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not return: an in-flight exec was not cancelled on disconnect")
+	}
+}
+
+// The cache outlives a connection, which is what makes reconnect → dedup work
+// at all (spec §5, §6.2).
+func TestCacheSurvivesReconnect(t *testing.T) {
+	r := &scriptedRunner{code: 0}
+	s := session.New(testConfig(), r)
+
+	first := newFakeStream()
+	go func() { _ = s.Serve(context.Background(), first) }()
+	waitFor(t, "hello", func() bool { return len(first.sent()) >= 1 })
+	st1exec := &pb.Exec{ReqId: 4, Command: "echo x >> log", Streaming: true}
+	first.exec(st1exec)
+	waitFor(t, "first terminal", func() bool { return terminalFor(first.sent(), 4) != nil })
+	first.close()
+
+	second := newFakeStream()
+	go func() { _ = s.Serve(context.Background(), second) }()
+	waitFor(t, "second hello", func() bool { return len(second.sent()) >= 1 })
+	second.exec(&pb.Exec{ReqId: 4, Command: "echo x >> log", Streaming: true})
+	waitFor(t, "re-emitted terminal", func() bool { return terminalFor(second.sent(), 4) != nil })
+
+	if r.count() != 1 {
+		t.Errorf("runner calls = %d across both connections, want 1", r.count())
+	}
+	second.close()
+}
+
+// The sender goroutine's failure path: fakeStream.Send otherwise always succeeds,
+// so nothing else in the suite reaches `failed`/cancelConn. Teardown must still
+// complete rather than wedging on a channel nobody drains.
+func TestSendFailureDoesNotWedgeTeardown(t *testing.T) {
+	st := newFakeStream()
+	st.failSendAfter(1) // Hello succeeds; the next frame fails inside the sender
+	r := &scriptedRunner{block: make(chan struct{})}
+	s := session.New(testConfig(), r)
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Serve(context.Background(), st) }()
+	waitFor(t, "hello", func() bool { return len(st.sent()) >= 1 })
+
+	st.exec(&pb.Exec{ReqId: 1, Command: "sleep 30", Streaming: true})
+	waitFor(t, "the runner to start", func() bool { return r.count() == 1 })
+
+	st.close() // the stream dies; teardown must finish despite a failing sender
+	select {
+	case <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return within 5s: teardown wedged with a failing sender")
+	}
+	close(r.block)
+}
+
+// A duplicate delivery of a req_id whose original is still RUNNING must be
+// silently coalesced: exactly one terminal frame for that id, carrying the real
+// result. A refusal frame here would race the original's own terminal frame, and
+// a caller keyed on req_id would settle it as failed and then discard the result
+// of a command that actually ran.
+func TestDuplicateInFlightIsCoalesced(t *testing.T) {
+	st := newFakeStream()
+	r := &scriptedRunner{block: make(chan struct{}), code: 3}
+	s := session.New(testConfig(), r)
+	go func() { _ = s.Serve(context.Background(), st) }()
+	waitFor(t, "hello", func() bool { return len(st.sent()) >= 1 })
+
+	st.exec(&pb.Exec{ReqId: 5, Command: "sleep 1", Streaming: true})
+	waitFor(t, "the runner to start", func() bool { return r.count() == 1 })
+	st.exec(&pb.Exec{ReqId: 5, Command: "sleep 1", Streaming: true}) // duplicate, still in flight
+
+	time.Sleep(200 * time.Millisecond) // let the duplicate be (incorrectly) refused
+	close(r.block)
+
+	waitFor(t, "the original's terminal frame", func() bool { return terminalFor(st.sent(), 5) != nil })
+	n := 0
+	for _, f := range st.sent() {
+		if e := f.GetEnd(); e != nil && e.GetReqId() == 5 {
+			n++
+		}
+		if e := f.GetError(); e != nil && e.GetReqId() == 5 {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("terminal frames for req_id 5 = %d, want exactly 1", n)
+	}
+	if got := terminalFor(st.sent(), 5).GetEnd(); got == nil || got.GetExitCode() != 3 {
+		t.Errorf("terminal = %+v, want End{exit_code:3} from the original run", terminalFor(st.sent(), 5))
+	}
+	if r.count() != 1 {
+		t.Errorf("runner calls = %d, want 1: the duplicate re-ran the command", r.count())
 	}
 	st.close()
 }
