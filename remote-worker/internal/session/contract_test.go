@@ -230,3 +230,107 @@ func TestContractGrepStreamsMultipleChunks(t *testing.T) {
 		t.Errorf("total output = %d bytes, want >=100 KiB", total)
 	}
 }
+
+// abort mid-stream: kill an emitter after its first chunk and get a signalled End.
+func TestContractAbortMidStream(t *testing.T) {
+	h := newHarness(t)
+	conn := h.attach(t)
+
+	dir := t.TempDir()
+	sentinel := dir + "/ticks"
+	conn.SendExec(t, &pb.Exec{
+		ReqId: 5,
+		// Emits forever on stdout AND records ticks on disk, so the test can prove
+		// the process group actually died rather than merely stopped being read.
+		Command:   "while true; do echo streaming; echo tick >> " + sentinel + "; sleep 0.05; done",
+		TimeoutS:  60,
+		Streaming: true,
+	})
+
+	// Wait for real output before aborting, so this is genuinely mid-stream.
+	first := conn.Next(t)
+	if ch := first.GetChunk(); ch == nil || ch.GetReqId() != 5 {
+		t.Fatalf("first frame = %+v, want a Chunk for req_id 5", first)
+	}
+
+	conn.SendAbort(t, 5)
+	_, _, terminal := conn.Collect(t, 5)
+	if got := terminal.GetEnd(); got == nil || got.GetExitCode() != -1 {
+		t.Fatalf("terminal = %+v, want End{exit_code:-1}", terminal)
+	}
+
+	// The whole group must be gone: the sentinel stops growing.
+	before := countLines(t, sentinel)
+	time.Sleep(time.Second)
+	if after := countLines(t, sentinel); after != before {
+		t.Errorf("sentinel grew %d → %d after abort: the process group survived", before, after)
+	}
+}
+
+// timeout: the worker kills its own child at timeout_s and reports the exact
+// string every other harness transport rejects with (spec §4 D2).
+func TestContractTimeout(t *testing.T) {
+	h := newHarness(t)
+	conn := h.attach(t)
+
+	start := time.Now()
+	conn.SendExec(t, &pb.Exec{ReqId: 6, Command: "sleep 30", TimeoutS: 1, Streaming: true})
+	_, _, terminal := conn.Collect(t, 6)
+
+	got := terminal.GetError()
+	if got == nil {
+		t.Fatalf("terminal = %+v, want ExecError", terminal)
+	}
+	if got.GetMessage() != "timeout:1" {
+		t.Errorf("message = %q, want %q", got.GetMessage(), "timeout:1")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("took %v: the child was not killed at timeout_s", elapsed)
+	}
+}
+
+// reconnect → dedup: a redelivered req_id re-emits the cached End, and the marker
+// file proves the command did not run twice (spec §8).
+func TestContractReconnectDedup(t *testing.T) {
+	h := newHarness(t)
+	first := h.attach(t)
+
+	dir := t.TempDir()
+	marker := dir + "/log"
+	cmd := "echo x >> " + marker
+
+	first.SendExec(t, &pb.Exec{ReqId: 7, Command: cmd, TimeoutS: 10, Streaming: true})
+	_, _, terminal := first.Collect(t, 7)
+	if e := terminal.GetError(); e != nil {
+		t.Fatalf("first terminal was ExecError: %s", e.GetMessage())
+	}
+	if terminal.GetEnd().GetExitCode() != 0 {
+		t.Fatalf("first terminal = %+v, want End{0}", terminal)
+	}
+	if n := countLines(t, marker); n != 1 {
+		t.Fatalf("marker has %d lines after one exec, want 1", n)
+	}
+
+	// Drop the parked stream; the same Session (and cache) reattaches.
+	first.Drop()
+	second := h.attach(t)
+
+	second.SendExec(t, &pb.Exec{ReqId: 7, Command: cmd, TimeoutS: 10, Streaming: true})
+	_, _, redelivered := second.Collect(t, 7)
+	if got := redelivered.GetEnd(); got == nil || got.GetExitCode() != 0 {
+		t.Errorf("redelivered terminal = %+v, want the cached End{0}", redelivered)
+	}
+	// The assertion that matters: same frame is not enough, it must not have re-run.
+	if n := countLines(t, marker); n != 1 {
+		t.Errorf("marker has %d lines, want 1: the redelivered req_id re-ran the command", n)
+	}
+}
+
+func countLines(t *testing.T, path string) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	return strings.Count(string(b), "\n")
+}
