@@ -4,6 +4,8 @@ import { dirname, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parse, parseAllDocuments } from "yaml";
 
+type EnvVar = { name: string; value?: string };
+
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const DEPLOY = resolve(REPO_ROOT, "deploy/knative");
 const docs = () => parseAllDocuments(readFileSync(resolve(DEPLOY, "relay-deployment.yaml"), "utf8")).map((d) => d.toJS());
@@ -41,13 +43,14 @@ describe("relay-deployment.yaml", () => {
 
   it("sets SH_RELAY_TOKEN matching the worker example (relay auth is fail-closed)", () => {
     const c = docs().find((o) => o.kind === "Deployment").spec.template.spec.containers[0];
-    const token = c.env.find((e) => e.name === "SH_RELAY_TOKEN");
+    const env: EnvVar[] = c.env;
+    const token = env.find((e) => e.name === "SH_RELAY_TOKEN");
     expect(token?.value, "relay auth is fail-closed (main.ts's makeDefaultValidateToken): with no SH_RELAY_TOKEN set, every worker Attach is rejected").toBeTruthy();
     const worker = parse(readFileSync(resolve(DEPLOY, "worker-example.yaml"), "utf8"));
-    const wEnv = worker.spec.template.spec.containers[0].env;
+    const wEnv: EnvVar[] = worker.spec.template.spec.containers[0].env;
     expect(
-      token.value,
+      token!.value,
       "SH_RELAY_TOKEN must equal worker-example.yaml's SANDBOX_TOKEN, or the relay rejects every Attach from a worker deployed off that example",
-    ).toBe(wEnv.find((e) => e.name === "SANDBOX_TOKEN").value);
+    ).toBe(wEnv.find((e) => e.name === "SANDBOX_TOKEN")!.value);
   });
 });
