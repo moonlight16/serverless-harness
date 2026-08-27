@@ -2,3 +2,7 @@
 /dist/
 /.rw-bin
 *.log
+# `go build ./...` drops the cmd/worker binary at the module root as ./worker.
+# (It was ./remote-worker before the entrypoint moved to cmd/worker.)
+/worker
+/remote-worker

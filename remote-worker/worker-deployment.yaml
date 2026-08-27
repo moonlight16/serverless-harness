@@ -32,12 +32,20 @@ spec:
               value: __TOKEN__
           securityContext:
             runAsNonRoot: true
-            runAsUser: 65532          # explicit non-root UID (image declares none); nonroot-v2 SCC allows it
+            runAsUser: 1001           # matches the image's USER 1001; nonroot-v2 SCC allows it
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
             seccompProfile:
               type: RuntimeDefault
+          # Memory must cover the worker's own buffering, not just its idle size.
+          # A non-streaming exec (Exec.streaming = false — the proto3 DEFAULT, and
+          # relay-supplied, so a buggy relay reaches it with no privilege) buffers
+          # up to exec.BufferCap per stream:
+          #   2 streams (stdout+stderr) x MaxConcurrent (4) x BufferCap (8 MiB)
+          #   = 64 MiB, plus ~1.5-2x transiently while bytes.Buffer doubles.
+          # A 64Mi limit was therefore an OOMKill the relay could trigger at will.
+          # Keep this in sync with BufferCap in internal/exec/runner.go.
           resources:
-            requests: { cpu: "10m", memory: "32Mi" }
-            limits: { memory: "64Mi" }
+            requests: { cpu: "10m", memory: "64Mi" }
+            limits: { memory: "256Mi" }

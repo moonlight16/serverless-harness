@@ -1,12 +1,14 @@
-# remote-worker — minimal HELLO WORLD SandboxTransport worker
+# remote-worker — SandboxTransport reference worker (Go)
 
-A tiny Go worker that connects to the serverless-harness **relay** and, for every
-`Exec` it receives, streams back `HELLO WORLD` (plus an echo of the input) as a
-continuous stdout stream. It runs no shell and holds no secrets — it exists to
-prove the worker↔relay↔harness path end to end, especially **from a laptop
-against the harness running in ykt1**.
+A thin Go static binary that connects to the serverless-harness **relay** and runs
+the commands it receives in a local `bash -c`, streaming stdout and stderr back as
+`Chunk` frames and terminating every exec with `End` or `ExecError`.
 
-## How a worker connects (review of README-worker.md + sandbox.proto)
+It holds **no LLM key and no orchestration** — it only executes commands and returns
+bytes, which is the property that makes the "central brain" trust model correct
+(spec §7). Design: [`docs/specs/2026-08-26-st4-go-reference-worker-design.md`](../docs/specs/2026-08-26-st4-go-reference-worker-design.md).
+
+## How a worker connects (wire contract per sandbox.proto)
 
 The worker **dials out** to the relay and keeps ONE full-duplex gRPC stream open
 (`SandboxWorker.Attach`, `proto/sandbox/v1/sandbox.proto`):
@@ -34,24 +36,38 @@ The worker **dials out** to the relay and keeps ONE full-duplex gRPC stream open
 
 | Rule | This worker |
 |------|-------------|
-| `Hello` first, with `sandbox_id` | ✅ sends it before anything else |
-| stdout → `Chunk{stream: STREAM_STDOUT}`, stderr → `STREAM_STDERR` | ✅ emits stdout chunks |
-| terminate each exec with `End{req_id, exit_code}` | ✅ `End{exit_code: 0}` |
-| failures → `ExecError{req_id, message}` | ✅ (not used by the happy path) |
-| `Abort` → terminal frame for that `req_id` | ✅ emits `End{exit_code: -1}` (signalled) |
-| dedup / at-least-once: cache `req_id → End`, re-emit on redelivery | ✅ in-memory cache |
+| `Hello` first, with `sandbox_id` | ✅ before anything else; capabilities probed from PATH |
+| stdout → `Chunk{STREAM_STDOUT}`, stderr → `STREAM_STDERR` | ✅ separate pipes, separate frames |
+| `Chunk` capped so one frame stays small | ✅ 32 KiB, which is also the pipe read size |
+| terminate each exec with `End{req_id, exit_code}` | ✅ real child exit code; `-1` when signalled |
+| failures → `ExecError{req_id, message}` | ✅ spawn failures, and `timeout:<n>` on expiry |
+| `Abort` → SIGKILL the in-flight child | ✅ kills the whole process group (`Setpgid`) |
+| worker-side `timeout_s` | ✅ SIGKILL at expiry → `ExecError{"timeout:<n>"}` |
+| dedup / at-least-once: cache `req_id →` terminal frame (`End`, or a timeout `ExecError`) | ✅ bounded LRU (256), guarded by a command+stdin fingerprint |
 | `Heartbeat` for liveness | ✅ every 15s |
 
-## The HELLO WORLD behavior (intentionally trivial)
+## What it does on each Exec
 
-On each `Exec{req_id, command, stdin, …}` the worker:
-1. streams stdout chunks `"HELLO "`, `"WORLD\n"` (150ms apart, to show *streaming*),
-2. echoes the input to prove input→output: `"you asked: <command>\n"` and, if
-   present, `"stdin: <bytes>"`,
-3. sends `End{req_id, exit_code: 0}`.
+1. Checks whether that `req_id` is still **in flight**, before the cache. Same
+   command+stdin → the duplicate is coalesced silently, because the original
+   already owes exactly one terminal frame. Different command+stdin → it is a
+   `req_id` collision rather than a redelivery, so it is refused with an
+   `ExecError` instead of being swallowed (see the `req_id` bullet below).
+2. Then checks the dedup cache: a redelivered `req_id` with the same command+stdin
+   re-emits its cached terminal frame and does **not** re-run (spec §8).
+3. Otherwise queues it for the dispatch pool (`WORKER_MAX_CONCURRENT`, default 4).
+4. Runs `bash -c <command>` as a new process group, feeding `stdin` and closing it —
+   `base64 -d > file` only terminates at EOF.
+5. Streams stdout and stderr back as 32 KiB `Chunk` frames tagged with their stream.
+   With `streaming: false` it buffers output and emits it at exit in the same
+   32 KiB-capped `Chunk` frames — one burst rather than incremental delivery. The
+   guarantee is *when* output is sent, not that it is a single frame: the cap
+   still applies, since an 8 MiB frame would exceed gRPC's default receive limit.
+6. Terminates with `End{exit_code}`, or `ExecError{"timeout:<n>"}` if `timeout_s`
+   expired, or `End{-1}` if aborted.
 
-It ignores the actual command — there is no shell. That's the point: a minimal,
-safe, any-language-shaped worker.
+There is no persistent shell: every command the harness sends is self-contained
+(`cd 'cwd' && …`), and a shared shell could not give each exec its own stdin EOF.
 
 ## Running locally on this laptop, against ykt1  ← the interesting part
 
@@ -86,7 +102,7 @@ oc port-forward svc/sandbox-relay 8443:8443 -n default &
 # 4. Run the worker on the laptop, dialing the tunnel (plaintext h2c).
 cd remote-worker
 RELAY_ADDR=localhost:8443 SANDBOX_ID=sbx-laptop-1 SANDBOX_TOKEN=dev-token \
-  go run .
+  go run ./cmd/worker
 ```
 
 Verify:
@@ -98,9 +114,9 @@ oc exec deploy/redis -n default -- redis-cli HGETALL sh:sandbox:records
 
 # Drive an exec straight through the relay (separate terminal; reuse the port-forward):
 grpcurl -plaintext -proto proto/sandbox/v1/sandbox.proto \
-  -d '{"sandbox_id":"sbx-laptop-1","exec":{"req_id":1,"command":"anything","timeout_s":10,"streaming":true}}' \
+  -d '{"sandbox_id":"sbx-laptop-1","exec":{"req_id":1,"command":"echo hi; echo oops >&2; exit 7","timeout_s":10,"streaming":true}}' \
   localhost:8443 sandbox.v1.SandboxExec/Exec
-#   → streams: HELLO / WORLD / you asked: anything, then End{exit_code:0}
+#   → Chunk{stdout:"hi\n"}, Chunk{stderr:"oops\n"}, End{exit_code:7}
 
 # End to end: POST /turn to the harness Route so a leaf leases sbx-laptop-1.
 # (NOTE: /turn's LLM step needs LiteLLM egress, currently blocked from ykt1 —
@@ -123,10 +139,12 @@ curl -sk -H 'Content-Type: application/json' \
   https://serverless-harness-default.<domain>/runs
 ```
 
-Verified on ykt1: the leaf's file tools ran on the worker —
-`test -r …`, `file --mime-type …`, `cat …` all hit the worker and returned
-`HELLO WORLD`; the leaf verdict came back `FLAGGED` ("pattern hello present as
-HELLO WORLD"). Worker pod log showed the three `exec req_id=…` frames.
+The leaf's file tools (`test -r …`, `file --mime-type …`, `cat …`) now run for real
+on the worker pod — the worker executes them via `bash -c` and streams back the
+actual file content, so the leaf verdict reflects what is really in
+`/workspace/README.md` rather than a fabricated string. Confirm the worker side
+directly with the `grpcurl` exec above; the worker pod log shows the matching
+`exec req_id=…` frames.
 
 > **Required egress rule (upstream gap).** The harness `serverless-harness-egress`
 > NetworkPolicy is default-deny egress. As shipped it allows DNS, Redis, and
@@ -146,8 +164,10 @@ where the worker runs.
 
 For a worker on *other* infrastructure (not this cluster), expose the relay via an
 OpenShift Route on :443 with TLS + HTTP/2 and point `RELAY_ADDR` at the Route
-host (see README-worker.md "Running the worker outside the cluster"); the worker
-then dials with TLS (`RELAY_TLS=1`) instead of `insecure`.
+host; the worker then dials with TLS (`RELAY_TLS=1`) instead of `insecure`. No
+code or binary changes are needed — the same worker image and the env vars in
+the table below cover both the in-cluster (`RELAY_TLS=0`, ClusterIP address) and
+outside-the-cluster (`RELAY_TLS=1`, Route host) cases.
 
 ## Environment variables
 
@@ -156,11 +176,17 @@ then dials with TLS (`RELAY_TLS=1`) instead of `insecure`.
 | `RELAY_ADDR` | `localhost:8443` | relay address (tunnel, ClusterIP, or Route host) |
 | `SANDBOX_ID` | `sbx-laptop-1` | stable id; one live Attach per id |
 | `SANDBOX_TOKEN` | `dev-token` | Bearer token; must match the relay |
-| `RELAY_TLS` | `0` | `1` to dial with TLS (for a Route :443); `0` = plaintext h2c |
+| `RELAY_TLS` | `0` | `1`/`true` to dial with TLS (for a Route :443); `0`/`false` = plaintext h2c. Anything else is **fatal** — it gates whether the bearer token crosses the wire in cleartext, so the worker refuses to guess |
+| `WORKER_MAX_CONCURRENT` | `4` | dispatch pool size; also advertised as `Hello.capacity_max` |
+| `SANDBOX_IMAGE` | (empty) | advertised in `Hello`; informational, not enforced by the worker |
+| `SANDBOX_TRUST` | `untrusted` | advertised in `Hello`; informational, not enforced by the worker |
 
 ## Files
 
-- `main.go` — the worker (~150 lines, stdlib + grpc only).
+- `cmd/worker/main.go` — env, dial, signals, reconnect loop.
+- `internal/exec/` — the `bash -c` child: pipes, chunk cap, timeout, process-group kill.
+- `internal/session/` — frame loop, dispatch pool, dedup cache.
+- `internal/relaytest/` — test-only in-process relay (not built into the binary).
 - `go.mod` — module; uses the in-repo stubs via `replace … => ../gen/go`.
 - `run-local.sh` — laptop setup (relay token, enable path, port-forward, run).
 - `build-image.sh` — cross-compile linux/amd64 + package via OpenShift internal-registry
@@ -170,8 +196,32 @@ then dials with TLS (`RELAY_TLS=1`) instead of `insecure`.
 - `Dockerfile` — multi-stage build from repo root (builds Go in-cluster).
 - `Dockerfile.runtime` — packages the prebuilt binary (used by `build-image.sh`).
 
-## Limitations (by design)
+## Known properties and limits
 
-Stub only: no real command execution, no per-exec timeout enforcement (it always
-finishes in ~0.3s), no TLS-client-cert, minimal dedup (in-memory). It demonstrates
-the transport, not a production sandbox.
+- **stdout/stderr interleaving is not preserved.** They are independent pipes, so
+  their relative order across frames is not guaranteed. The harness does not depend
+  on it — it collects stdout and replays both to `onData`.
+- **Dedup covers completed execs only.** A real exit status and a timeout are
+  cached; an abort, a signalled exit (`End{-1}` from an OOM-kill or an external
+  `SIGKILL`), and a dead-stream failure are not. An exec killed mid-flight by a
+  disconnect leaves no cached frame, so a redelivery re-runs it — at-least-once, as
+  specified. Caching a signal would poison the `req_id`: every later redelivery
+  would answer `-1` without ever re-running.
+- **A cache hit re-emits ONLY the terminal frame — no `Chunk`s.** A redelivered
+  `req_id` gets the cached `End`/`ExecError` and nothing else, so a redelivered
+  `cat file` answers `End{0}` with EMPTY output. This is the right trade for the
+  harness — re-running a mutating command is worse than an empty read, and its
+  redelivery paths are retries of writes — but a consumer that needs output
+  alongside the terminal frame must not redeliver a completed `req_id`.
+- **`req_id` is not unique across harness replicas.** The harness's counter is
+  module-scoped per process while sandboxes are shared, so the cache also compares a
+  command+stdin fingerprint and re-runs on a mismatch rather than returning another
+  exec's output. While the original is still in flight the cache cannot see it at
+  all, so the same fingerprint is carried on the in-flight slot and a mismatch there
+  is refused with an `ExecError` — coalescing it would drop another replica's command
+  silently, with no frame ever emitted. The real fix is a globally unique `req_id`
+  upstream (spec §3.1).
+- **Bearer token only.** mTLS/SPIFFE slots into the same `Attach` endpoint later
+  (spec §9); there is no client certificate today.
+- **The demo image is not a sandbox image.** It carries `bash`, `base64`, and `file`
+  so the standalone demo runs; production drops the binary into a real sandbox image.
