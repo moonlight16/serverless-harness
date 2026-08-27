@@ -3,6 +3,7 @@ package exec_test
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"os"
 	osexec "os/exec"
 	"strings"
@@ -221,13 +222,23 @@ func TestStdinRoundTripsThroughBase64(t *testing.T) {
 	content := "hello from stdin\n"
 	payload := base64.StdEncoding.EncodeToString([]byte(content))
 
+	// Bound the run. If stdin is ever written-but-not-closed, `base64 -d` never
+	// sees EOF — the exact regression this test exists to catch — and without a
+	// deadline that hangs the whole test binary until `go test`'s 10-minute
+	// timeout instead of failing here in seconds.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
 	var r recorder
-	code, err := wexec.BashRunner{}.Run(context.Background(), wexec.Spec{
+	code, err := wexec.BashRunner{}.Run(ctx, wexec.Spec{
 		ReqID:     10,
 		Command:   "base64 -d > " + path,
 		Stdin:     []byte(payload),
 		Streaming: true,
 	}, &r)
+	if errors.Is(err, wexec.ErrTimeout) || errors.Is(err, wexec.ErrAborted) {
+		t.Fatalf("run did not finish (%v): stdin was written but never closed, so base64 -d never saw EOF", err)
+	}
 	if err != nil || code != 0 {
 		t.Fatalf("got code=%d err=%v, want 0/nil", code, err)
 	}
@@ -243,20 +254,37 @@ func TestStdinRoundTripsThroughBase64(t *testing.T) {
 // A command that reads stdin but is given none must still terminate, or every
 // such exec hangs until the harness deadline.
 func TestNoStdinStillTerminates(t *testing.T) {
-	done := make(chan struct{})
+	// Two deliberate choices. The context bounds Run so a regression cannot leak
+	// this goroutine (or its `cat` child) past the test. And the result comes back
+	// over a buffered channel rather than via t.Errorf from inside the goroutine:
+	// calling t after the test has completed panics the entire test binary, which
+	// destroys every other result in the run.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	type result struct {
+		code int32
+		err  error
+	}
+	done := make(chan result, 1) // buffered: the goroutine never blocks on send
 	go func() {
-		defer close(done)
 		var r recorder
-		if _, err := (wexec.BashRunner{}).Run(context.Background(), wexec.Spec{
+		code, err := wexec.BashRunner{}.Run(ctx, wexec.Spec{
 			ReqID: 11, Command: "cat", Streaming: true,
-		}, &r); err != nil {
-			t.Errorf("Run: %v", err)
-		}
+		}, &r)
+		done <- result{code: code, err: err}
 	}()
+
 	select {
-	case <-done:
+	case got := <-done:
+		if errors.Is(got.err, wexec.ErrTimeout) || errors.Is(got.err, wexec.ErrAborted) {
+			t.Fatalf("`cat` with no stdin did not terminate on its own (%v): stdin was not closed", got.err)
+		}
+		if got.err != nil {
+			t.Fatalf("Run: %v", got.err)
+		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("`cat` with no stdin did not terminate: stdin was not closed")
+		t.Fatal("`cat` with no stdin did not terminate within 5s: stdin was not closed")
 	}
 }
 
