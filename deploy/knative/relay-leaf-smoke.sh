@@ -231,8 +231,11 @@ dispatch_pattern() {
   body=$(jq -nc --arg s "$sid" --arg m "$MODEL" --arg p "$pat" \
     '{sessionId:$s, model:$m, item:{item_id:"i1", file:"/etc/os-release", pattern:$p}}')
   # shellcheck disable=SC2086  # CURL_OPTS is intentionally word-split
+  # `|| true`: a connection-level failure (timeout, connection refused) must not exit
+  # the script under set -e here -- it should instead yield an empty body so
+  # assert_verdict's "model endpoint unreachable" hint is reached instead of bypassed.
   curl -s $CURL_OPTS --max-time 120 ${CURL_HDR[@]+"${CURL_HDR[@]}"} \
-    -H "Content-Type: application/json" -d "$body" "$BASE/runs"
+    -H "Content-Type: application/json" -d "$body" "$BASE/runs" || true
 }
 
 # assert_verdict <label> <response-json> <want CLEAR|FLAGGED> <hint-if-wrong>
