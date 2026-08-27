@@ -5,6 +5,18 @@ OpenShift. This picks up where [`README-ocp.md`](README-ocp.md) leaves off:
 `setup-ocp.sh` already deployed the harness, Redis, and the **relay** — this
 guide covers the three steps that make a worker reachable, plus how to verify it.
 
+> **The pool-selection trap:** setting `SH_REMOTE_SANDBOX=1` does **not**, by
+> itself, route execs to your worker. The worker joins the shared sandbox pool
+> as a peer — `select-sandbox` leases whichever candidate (pod or worker) is
+> least loaded, and an idle in-cluster sandbox pod wins by default. A leaf can
+> succeed against a pod while looking exactly like a successful remote run. To
+> actually target your worker, narrow `KAGENTI_SANDBOX_POOL_SELECTOR` so it
+> matches no local pods, or run against a pool with none. See
+> [`relay-leaf-smoke.sh`](relay-leaf-smoke.sh) for a live gate that proves the
+> distinction using an OS-fingerprint discriminator (sandbox pods run Alpine,
+> the reference worker image runs RHEL) — a green leaf alone proves nothing
+> about which backend served it.
+
 ## Background
 
 A worker executes commands inside a sandbox and returns bytes. It holds **no LLM
