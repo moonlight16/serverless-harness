@@ -77,12 +77,20 @@ type scriptedRunner struct {
 	err   error
 	// block, when non-nil, holds Run until closed.
 	block chan struct{}
+	// chunks, when > 0, makes Run emit that many stdout chunks via sink before
+	// any block/ctx handling — used to drive more Sends than outbound can buffer.
+	chunks int
 }
 
 func (r *scriptedRunner) Run(ctx context.Context, s wexec.Spec, sink wexec.Sink) (int32, error) {
 	r.mu.Lock()
 	r.specs = append(r.specs, s)
 	r.mu.Unlock()
+	for i := 0; i < r.chunks; i++ {
+		if err := sink.Chunk(pb.Stream_STREAM_STDOUT, []byte("x")); err != nil {
+			return -1, err
+		}
+	}
 	if r.block != nil {
 		select {
 		case <-r.block:
@@ -285,6 +293,14 @@ func TestCollidingReqIDRunsFresh(t *testing.T) {
 	st.close()
 }
 
+// sendAttempts reports how many times Send has been called, including calls that
+// failed — the only way a test can prove the sender's failure path was entered.
+func (f *fakeStream) sendAttempts() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sendCalls
+}
+
 // pending reports how many frames the session has not yet received. Used to order
 // a queued abort ahead of the pool being unblocked.
 func (f *fakeStream) pending() int {
@@ -476,28 +492,39 @@ func TestCacheSurvivesReconnect(t *testing.T) {
 	second.close()
 }
 
-// The sender goroutine's failure path: fakeStream.Send otherwise always succeeds,
-// so nothing else in the suite reaches `failed`/cancelConn. Teardown must still
-// complete rather than wedging on a channel nobody drains.
+// The sender goroutine's failure path. Two things make this test real rather than
+// an accidental duplicate of TestServeReturnsOnStreamError:
+//
+//   - Heartbeats are pushed out of the way and the close is gated on an observed
+//     second Send attempt, so the test cannot pass without the sender having
+//     actually failed. (Gated on the attempt count, since a failing Send still
+//     counts as an attempt.)
+//   - The runner emits far more frames than outbound can buffer. A sender that
+//     returned on its first error instead of continuing to drain would block the
+//     producer forever, so Serve would never return and this test would time out
+//     rather than quietly pass.
 func TestSendFailureDoesNotWedgeTeardown(t *testing.T) {
 	st := newFakeStream()
-	st.failSendAfter(1) // Hello succeeds; the next frame fails inside the sender
-	r := &scriptedRunner{block: make(chan struct{})}
-	s := session.New(testConfig(), r)
+	st.failSendAfter(1) // Hello succeeds; every later frame fails inside the sender
+	r := &scriptedRunner{chunks: 3 * session.QueueCap}
+	cfg := testConfig()
+	cfg.Heartbeat = time.Hour // the chunks drive the failure, not a heartbeat race
+	s := session.New(cfg, r)
 	errCh := make(chan error, 1)
 	go func() { errCh <- s.Serve(context.Background(), st) }()
 	waitFor(t, "hello", func() bool { return len(st.sent()) >= 1 })
 
-	st.exec(&pb.Exec{ReqId: 1, Command: "sleep 30", Streaming: true})
-	waitFor(t, "the runner to start", func() bool { return r.count() == 1 })
+	st.exec(&pb.Exec{ReqId: 1, Command: "echo hi", Streaming: true})
+	waitFor(t, "the sender to attempt a post-Hello frame (and fail it)", func() bool {
+		return st.sendAttempts() >= 2
+	})
 
 	st.close() // the stream dies; teardown must finish despite a failing sender
 	select {
 	case <-errCh:
 	case <-time.After(5 * time.Second):
-		t.Fatal("Serve did not return within 5s: teardown wedged with a failing sender")
+		t.Fatal("Serve did not return within 5s: the sender stopped draining and a producer wedged")
 	}
-	close(r.block)
 }
 
 // A duplicate delivery of a req_id whose original is still RUNNING must be
