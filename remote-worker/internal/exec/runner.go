@@ -46,9 +46,26 @@ type Spec struct {
 	Streaming bool
 }
 
-// Sink receives output as it is produced. data is owned by the callee.
+// Sink receives output as it is produced. data is owned by the callee. Chunk is
+// never called concurrently: Run drains stdout and stderr on separate
+// goroutines but serializes all calls to the caller's Sink through a single
+// lock, so implementations need not synchronize internally.
 type Sink interface {
 	Chunk(stream pb.Stream, data []byte) error
+}
+
+// lockedSink serializes Chunk calls. Run drains stdout and stderr in two
+// goroutines, and the runner owns the concurrency it creates rather than
+// pushing a thread-safety requirement onto every Sink implementation.
+type lockedSink struct {
+	mu    sync.Mutex
+	inner Sink
+}
+
+func (l *lockedSink) Chunk(stream pb.Stream, data []byte) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.Chunk(stream, data)
 }
 
 // Runner runs one command. ctx cancellation means Abort: kill the process group.
@@ -63,6 +80,10 @@ type Runner interface {
 type BashRunner struct{}
 
 func (BashRunner) Run(ctx context.Context, s Spec, sink Sink) (int32, error) {
+	// One lock serializes every call to the caller's Sink: the two pump
+	// goroutines below (and the non-streaming emission at exit) must not race
+	// on it.
+	sink = &lockedSink{inner: sink}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if s.TimeoutS > 0 {
