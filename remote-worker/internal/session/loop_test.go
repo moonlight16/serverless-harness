@@ -191,7 +191,7 @@ func TestTimeoutBecomesExecError(t *testing.T) {
 	st.close()
 }
 
-func TestAbortedRunBecomesSignalledEnd(t *testing.T) {
+func TestErrAbortedMapsToSignalledEnd(t *testing.T) {
 	st := newFakeStream()
 	s := session.New(testConfig(), &scriptedRunner{err: wexec.ErrAborted})
 	go func() { _ = s.Serve(context.Background(), st) }()
