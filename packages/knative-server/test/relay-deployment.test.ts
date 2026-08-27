@@ -38,4 +38,16 @@ describe("relay-deployment.yaml", () => {
     expect(base.resources).toContain("relay-deployment.yaml");
     expect(ocp.resources).toContain("../../relay-deployment.yaml");
   });
+
+  it("sets SH_RELAY_TOKEN matching the worker example (relay auth is fail-closed)", () => {
+    const c = docs().find((o) => o.kind === "Deployment").spec.template.spec.containers[0];
+    const token = c.env.find((e) => e.name === "SH_RELAY_TOKEN");
+    expect(token?.value, "relay auth is fail-closed (main.ts's makeDefaultValidateToken): with no SH_RELAY_TOKEN set, every worker Attach is rejected").toBeTruthy();
+    const worker = parse(readFileSync(resolve(DEPLOY, "worker-example.yaml"), "utf8"));
+    const wEnv = worker.spec.template.spec.containers[0].env;
+    expect(
+      token.value,
+      "SH_RELAY_TOKEN must equal worker-example.yaml's SANDBOX_TOKEN, or the relay rejects every Attach from a worker deployed off that example",
+    ).toBe(wEnv.find((e) => e.name === "SANDBOX_TOKEN").value);
+  });
 });
