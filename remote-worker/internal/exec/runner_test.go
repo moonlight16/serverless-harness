@@ -1,6 +1,7 @@
 package exec_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -294,3 +295,83 @@ func TestNoStdinStillTerminates(t *testing.T) {
 // TestNonStreamingSmallOutputIsOneChunkPerStream. Do NOT re-add it here —
 // duplicate coverage of the same behavior is a review defect. This task adds the
 // stdin tests only.
+
+func TestTimeoutKillsChild(t *testing.T) {
+	start := time.Now()
+	var r recorder
+	code, err := wexec.BashRunner{}.Run(context.Background(), wexec.Spec{
+		ReqID: 20, Command: "sleep 30", TimeoutS: 1, Streaming: true,
+	}, &r)
+	if !errors.Is(err, wexec.ErrTimeout) {
+		t.Fatalf("err = %v, want ErrTimeout", err)
+	}
+	if code != -1 {
+		t.Errorf("code = %d, want -1", code)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("took %v, want ~1s: the child was not killed at timeout_s", elapsed)
+	}
+}
+
+func TestAbortViaContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var r recorder
+	go func() { time.Sleep(200 * time.Millisecond); cancel() }()
+	_, err := wexec.BashRunner{}.Run(ctx, wexec.Spec{
+		ReqID: 21, Command: "sleep 30", Streaming: true,
+	}, &r)
+	if !errors.Is(err, wexec.ErrAborted) {
+		t.Fatalf("err = %v, want ErrAborted", err)
+	}
+}
+
+// THE test that fails without Setpgid: the killed command's grandchild must die
+// too. A backgrounded subshell appends to a sentinel file; after the kill the
+// file must stop growing.
+func TestAbortKillsGrandchild(t *testing.T) {
+	dir := t.TempDir()
+	sentinel := dir + "/ticks"
+	ctx, cancel := context.WithCancel(context.Background())
+	var r recorder
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = (wexec.BashRunner{}).Run(ctx, wexec.Spec{
+			ReqID: 22,
+			// The subshell outlives `bash -c` unless the whole group is killed.
+			Command:   "( while true; do echo tick >> " + sentinel + "; sleep 0.05; done ) & sleep 30",
+			Streaming: true,
+		}, &r)
+	}()
+
+	// Let it tick, then abort.
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+	// Bounded: if Run ever wedges, fail with a clear message rather than hanging
+	// the test binary until go test's global timeout.
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Run did not return within 15s of the abort: the drain was not bounded")
+	}
+
+	// Give any survivor a generous window to keep writing.
+	first := lineCount(t, sentinel)
+	time.Sleep(1 * time.Second)
+	second := lineCount(t, sentinel)
+	if second != first {
+		t.Fatalf("sentinel grew from %d to %d lines after abort: grandchild survived (Setpgid missing?)", first, second)
+	}
+	if first == 0 {
+		t.Fatal("sentinel never written: the test command did not run")
+	}
+}
+
+func lineCount(t *testing.T, path string) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	return bytes.Count(b, []byte("\n"))
+}
