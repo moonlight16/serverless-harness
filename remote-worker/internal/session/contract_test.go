@@ -395,6 +395,17 @@ func TestContractReconnectDedupHonorsLargerTimeout(t *testing.T) {
 // it only at child exit, still split into ChunkSize-capped Chunk frames because
 // the wire cap applies regardless (spec §8). Nothing else in this file drives
 // emitBuffered over a real stream.
+//
+// Chunk count, per-frame cap, byte-exact completeness, and the terminal frame
+// (asserted below) all hold just as well for incremental streaming — none of them
+// pin what actually distinguishes non-streaming: nothing leaves before the child
+// exits. So the command produces its full output immediately and then sleeps
+// before exiting, and the timing assertion at the bottom checks that the first
+// Chunk does not arrive until close to the end of that sleep. A worker that
+// ignored streaming:false and streamed incrementally would emit cat's output
+// within milliseconds — long before the sleep is up — and that assertion is what
+// would catch it; the margin is kept well short of the sleep so this stays robust
+// on a loaded CI box without being a tight timing window.
 func TestContractNonStreamingBuffersThenChunksAtExit(t *testing.T) {
 	h := newHarness(t)
 	conn := h.attach(t)
@@ -410,14 +421,24 @@ func TestContractNonStreamingBuffersThenChunksAtExit(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
+	// The output is written well before the process exits, so if the worker were
+	// (wrongly) streaming incrementally the first Chunk would arrive almost
+	// immediately after SendExec instead of after the sleep below.
+	const sleepFor = 1 * time.Second
+
 	// Streaming is deliberately left unset — the zero value is the point.
-	conn.SendExec(t, &pb.Exec{ReqId: 10, Command: "cat " + path, TimeoutS: 30})
+	start := time.Now()
+	conn.SendExec(t, &pb.Exec{ReqId: 10, Command: "cat " + path + "; sleep 1", TimeoutS: 30})
 
 	var chunks int
 	var stdout []byte
+	var firstChunkAt time.Time
 	for {
 		f := conn.Next(t)
 		if ch := f.GetChunk(); ch != nil && ch.GetReqId() == 10 {
+			if chunks == 0 {
+				firstChunkAt = time.Now()
+			}
 			chunks++
 			if n := len(ch.GetData()); n > wexec.ChunkSize {
 				t.Errorf("chunk of %d bytes exceeds the per-frame cap %d", n, wexec.ChunkSize)
@@ -442,6 +463,17 @@ func TestContractNonStreamingBuffersThenChunksAtExit(t *testing.T) {
 	// Buffering must not lose or reorder anything: the bytes are the whole file.
 	if len(stdout) != len(want) || string(stdout) != want {
 		t.Errorf("stdout = %d bytes, want the complete %d", len(stdout), len(want))
+	}
+	// The assertion that actually pins non-streaming: nothing left before the
+	// child exited. cat's output was ready almost immediately; the command then
+	// spent sleepFor still running before its exit. If the worker held everything
+	// until exit as it must, the first Chunk cannot arrive much before sleepFor
+	// elapses. The margin below sleepFor is generous for a loaded CI box; it is
+	// still tight enough that "streamed as produced" (near-zero latency) cannot
+	// pass it.
+	if elapsed := firstChunkAt.Sub(start); elapsed < sleepFor-300*time.Millisecond {
+		t.Errorf("first chunk arrived after %v, want it withheld until close to the %v sleep: "+
+			"streaming:false is not actually buffering until child exit", elapsed, sleepFor)
 	}
 }
 
