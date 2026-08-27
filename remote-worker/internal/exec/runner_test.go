@@ -2,6 +2,8 @@ package exec_test
 
 import (
 	"context"
+	"encoding/base64"
+	"os"
 	osexec "os/exec"
 	"strings"
 	"testing"
@@ -209,3 +211,58 @@ func TestSlowSinkDoesNotTurnSuccessIntoTimeout(t *testing.T) {
 		t.Errorf("code = %d, want 0", code)
 	}
 }
+
+// The harness writes files as `base64 -d > 'path'` with the payload on stdin.
+// base64 only terminates at EOF, so this is the test that catches a regression
+// where stdin is written but never closed.
+func TestStdinRoundTripsThroughBase64(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/out.txt"
+	content := "hello from stdin\n"
+	payload := base64.StdEncoding.EncodeToString([]byte(content))
+
+	var r recorder
+	code, err := wexec.BashRunner{}.Run(context.Background(), wexec.Spec{
+		ReqID:     10,
+		Command:   "base64 -d > " + path,
+		Stdin:     []byte(payload),
+		Streaming: true,
+	}, &r)
+	if err != nil || code != 0 {
+		t.Fatalf("got code=%d err=%v, want 0/nil", code, err)
+	}
+	got, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatalf("ReadFile: %v", readErr)
+	}
+	if string(got) != content {
+		t.Errorf("file = %q, want %q", got, content)
+	}
+}
+
+// A command that reads stdin but is given none must still terminate, or every
+// such exec hangs until the harness deadline.
+func TestNoStdinStillTerminates(t *testing.T) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var r recorder
+		if _, err := (wexec.BashRunner{}).Run(context.Background(), wexec.Spec{
+			ReqID: 11, Command: "cat", Streaming: true,
+		}, &r); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("`cat` with no stdin did not terminate: stdin was not closed")
+	}
+}
+
+// NOTE: the non-streaming coverage originally planned here (small output -> one
+// Chunk per stream; 40 KiB -> chunked at ChunkSize) already landed in Task 2's
+// fix round as TestNonStreamingChunksAtExit and
+// TestNonStreamingSmallOutputIsOneChunkPerStream. Do NOT re-add it here —
+// duplicate coverage of the same behavior is a review defect. This task adds the
+// stdin tests only.
