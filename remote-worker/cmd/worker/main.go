@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"log"
 	"math/rand/v2"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 
 	pb "github.com/kagenti/serverless-harness/gen/go/sandbox/v1"
@@ -56,6 +58,22 @@ func envInt(k string, def int) int {
 	return v
 }
 
+// envBool parses a boolean env var and, unlike envInt, does NOT fall back on
+// garbage. RELAY_TLS decides whether the bearer token crosses the wire in
+// cleartext, so silently reading "true", "yes", "TLS" or "1 " as "plaintext" is
+// the wrong failure: the caller log.Fatalf's instead.
+func envBool(k string, def bool) (bool, error) {
+	v := os.Getenv(k)
+	if v == "" {
+		return def, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("%s=%q is not a boolean (use 1/0 or true/false)", k, v)
+	}
+	return b, nil
+}
+
 func capabilities() []string {
 	var out []string
 	for _, c := range probed {
@@ -76,7 +94,12 @@ func jitter(d time.Duration) time.Duration {
 func main() {
 	relayAddr := env("RELAY_ADDR", "localhost:8443")
 	token := env("SANDBOX_TOKEN", "dev-token")
-	useTLS := env("RELAY_TLS", "0") == "1"
+	useTLS, tlsErr := envBool("RELAY_TLS", false)
+	if tlsErr != nil {
+		// Fail loudly rather than guessing: guessing wrong here ships the bearer
+		// token in cleartext.
+		log.Fatalf("%v", tlsErr)
+	}
 
 	cfg := session.Config{
 		SandboxID:     env("SANDBOX_ID", "sbx-laptop-1"),
@@ -95,7 +118,27 @@ func main() {
 		creds = insecure.NewCredentials()
 	}
 
-	conn, err := grpc.NewClient(relayAddr, grpc.WithTransportCredentials(creds))
+	// Keepalive is what bounds a half-open connection. recvLoop blocks in
+	// st.Recv() with no ctx select, so without HTTP/2 pings a dead-but-unclosed
+	// TCP connection wedges the worker permanently: Serve never returns, the
+	// reconnect loop below never runs, and once outbound fills behind a Send that
+	// will never complete every pool goroutine parks in enqueue — the worker stays
+	// alive and registered while answering nothing. These params bound that to
+	// ~40s (Time + Timeout) instead of TCP retransmit exhaustion.
+	//
+	// PermitWithoutStream: false is deliberate and safe here. The Attach stream is
+	// open for the entire time liveness matters, so pinging only while a stream is
+	// active loses nothing — and the relay (packages/sandbox-relay) configures no
+	// keepalive enforcement policy at all, so this cannot trip a server-side
+	// GOAWAY ENHANCE_YOUR_CALM.
+	conn, err := grpc.NewClient(relayAddr,
+		grpc.WithTransportCredentials(creds),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                30 * time.Second,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: false,
+		}),
+	)
 	if err != nil {
 		log.Fatalf("dial %s: %v", relayAddr, err)
 	}
@@ -119,9 +162,24 @@ func main() {
 		attachCtx := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
 		stream, err := client.Attach(attachCtx)
 		if err == nil {
-			backoff = backoffMin
 			log.Printf("worker: attached, serving execs")
+			// Serve gets attachCtx — the very context this stream was created from,
+			// which is its documented precondition: recvLoop blocks in Recv() and is
+			// unblocked only by the stream being torn down. attachCtx derives from
+			// ctx, so the SIGTERM cancel above reaches it.
+			start := time.Now()
 			err = sess.Serve(attachCtx, stream)
+			// Reset on a session that actually LASTED, not merely on Attach
+			// returning a stream. Attach succeeds before the relay has authorized
+			// anything: with a wrong SANDBOX_TOKEN the stream opens, Hello goes out,
+			// and Recv then fails with Unauthenticated. Resetting on the stream
+			// alone pinned backoff at its ~500-750ms floor forever, so a
+			// misconfigured worker hammered the relay ~2x/second with no escalating
+			// signal. A session that survives 30s was doing real work; anything
+			// shorter keeps escalating toward backoffMax.
+			if time.Since(start) > 30*time.Second {
+				backoff = backoffMin
+			}
 		}
 		if ctx.Err() != nil {
 			break

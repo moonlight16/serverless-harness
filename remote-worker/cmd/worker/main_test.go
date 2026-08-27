@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"testing"
 	"time"
 )
@@ -29,12 +30,48 @@ func TestCapabilitiesProbesRealBinaries(t *testing.T) {
 		if c == "bash" {
 			found = true
 		}
-		if c == "definitely-not-installed-xyz" {
-			t.Errorf("capabilities included %q, which was never probed", c)
-		}
 	}
 	if !found {
 		t.Error("capabilities did not include bash, which the runner requires")
+	}
+	// And nothing outside the probed list may appear: capabilities is a PATH probe,
+	// not a hardcoded advertisement. (The check this replaces looked for a literal
+	// that was never in probed, so no code path could have produced it.)
+	inProbed := func(c string) bool {
+		for _, p := range probed {
+			if p == c {
+				return true
+			}
+		}
+		return false
+	}
+	for _, c := range caps {
+		if !inProbed(c) {
+			t.Errorf("capabilities included %q, which is not in the probed list %v", c, probed)
+		}
+	}
+}
+
+// RELAY_TLS decides whether the bearer token crosses the wire in cleartext, so an
+// unparseable value must be an error the caller can fail on — never a silent
+// fallback to plaintext.
+func TestEnvBoolRejectsGarbageRatherThanFailingOpen(t *testing.T) {
+	for _, v := range []string{"yes", "TLS", "1 ", "on"} {
+		t.Setenv("RELAY_TLS", v)
+		if got, err := envBool("RELAY_TLS", false); err == nil {
+			t.Errorf("envBool(%q) = %v, nil; want an error rather than a silent plaintext default", v, got)
+		}
+	}
+	for v, want := range map[string]bool{"1": true, "true": true, "TRUE": true, "0": false, "false": false} {
+		t.Setenv("RELAY_TLS", v)
+		got, err := envBool("RELAY_TLS", false)
+		if err != nil || got != want {
+			t.Errorf("envBool(%q) = %v, %v; want %v, nil", v, got, err, want)
+		}
+	}
+	os.Unsetenv("RELAY_TLS")
+	if got, err := envBool("RELAY_TLS", true); err != nil || !got {
+		t.Errorf("envBool(unset) = %v, %v; want the default true, nil", got, err)
 	}
 }
 

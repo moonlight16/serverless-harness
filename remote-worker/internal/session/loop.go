@@ -63,6 +63,11 @@ func New(cfg Config, r wexec.Runner) *Session {
 type slot struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+	// fp fingerprints the exec occupying this slot. accept needs it to tell a
+	// genuine redelivery of THIS exec (same command+stdin, terminal frame already
+	// owed) from a req_id collision between harness replicas carrying different
+	// work under the same id (spec §3.1) — the two demand opposite handling.
+	fp [32]byte
 }
 
 // Serve runs one connection to exhaustion and returns why it ended. The caller
@@ -77,6 +82,18 @@ type slot struct {
 // through a channel instead makes "send" a non-blocking enqueue for the recv
 // goroutine and a bounded-blocking enqueue (correct backpressure) for everyone
 // else.
+//
+// PRECONDITION on ctx: it MUST be the context the Attach stream was created from
+// (in production, the same attachCtx handed to client.Attach). recvLoop blocks in
+// st.Recv() and has NO select on ctx, so cancelling ctx does not by itself stop
+// Serve: the only thing that ever unblocks the receive is gRPC tearing the stream
+// down, which happens when the STREAM's context is cancelled. Break that identity
+// in either direction — hand Serve a context unrelated to the stream's, or create
+// the stream from a context nothing cancels — and shutdown silently stops working:
+// the cancel returns at once while Serve stays blocked in Recv until the
+// connection happens to die on its own. It compiles, it vets, and it passes every
+// test that ends a session by closing the stream instead of cancelling. Do not
+// "clean that up".
 func (s *Session) Serve(ctx context.Context, st Stream) error {
 	connCtx, cancelConn := context.WithCancel(ctx)
 	// Cancelling the connection context kills every in-flight child: their output
@@ -126,13 +143,25 @@ func (s *Session) Serve(ctx context.Context, st Stream) error {
 	enqueue := func(f *pb.WorkerFrame) { outbound <- f }
 	// trySend is the non-blocking sender used by the recv goroutine (via accept).
 	// It must never block: the recv goroutine has to stay free to read the next
-	// Abort, so an advisory frame is dropped rather than stalling the stream.
+	// Abort, so a frame is dropped rather than stalling the stream.
+	//
+	// Be honest about the cost — the dropped frame is not advisory. Every frame
+	// accept routes through trySend is TERMINAL: a cache-hit replay, or a refusal
+	// ("busy: queue full", or a req_id collision). Dropping a replay loses a
+	// duplicate of a frame already delivered once. Dropping a refusal loses it
+	// outright, since refusals are never cached — and the drop correlates with the
+	// exact overload that produced the refusal, so under load the caller gets
+	// nothing and waits out its own deadline. That is survivable only because the
+	// harness timeout is dual-ended. Giving terminal frames a priority path is the
+	// real fix and is deliberately out of scope here; the warning below is what
+	// makes the loss diagnosable in the field instead of invisible.
 	trySend := func(f *pb.WorkerFrame) bool {
 		select {
 		case outbound <- f:
 			return true
 		default:
-			log.Printf("session: outbound full, dropping frame for req_id %d", reqIDOf(f))
+			log.Printf("session: WARNING outbound full, DROPPED the terminal frame for req_id %d; "+
+				"that exec is now unanswered and its caller will wait out its own timeout", reqIDOf(f))
 			return false
 		}
 	}
@@ -256,33 +285,62 @@ func (s *Session) accept(
 	reqID := e.GetReqId()
 	fp := Fingerprint(e.GetCommand(), e.GetStdin())
 
-	// Consulted before enqueue: a redelivery must not consume a queue slot or a
-	// pool goroutine.
-	if frame, hit, collision := s.cache.Lookup(reqID, fp); hit {
+	slotCtx, cancel := context.WithCancel(ctx)
+	mu.Lock()
+	// IN-FLIGHT IS CHECKED FIRST, AHEAD OF THE CACHE — the order is load-bearing.
+	// runOne calls cache.Put BEFORE sending its terminal frame, and the slot is
+	// only released (by finish) after runOne returns. Consulting the cache first
+	// let a duplicate arriving in that window hit the cache and replay a terminal
+	// frame while the original's own terminal frame was still in flight: two
+	// terminal frames for one exec, against the invariant this file asserts. The
+	// window widens under backpressure — exactly when duplicates are likeliest.
+	// With the slot consulted first, such a duplicate is coalesced instead. The
+	// completed-redelivery path is unaffected: once finish has deleted the slot,
+	// inflight misses and the cache lookup below answers it.
+	if sl, running := inflight[reqID]; running {
+		same := sl.fp == fp
+		mu.Unlock()
+		cancel()
+		if same {
+			// A genuine redelivery of a still-running exec. The original's terminal
+			// frame for this req_id is already owed and on its way. Sending a refusal
+			// here would be a SECOND terminal frame for one id: a caller keyed on
+			// req_id would settle it as failed on this refusal, then receive the real
+			// (possibly successful, possibly filesystem-mutating) result and have
+			// nowhere to put it. Silently coalesce instead — the exec already owes
+			// exactly one terminal frame, and it is coming.
+			log.Printf("session: req_id %d already in flight; coalescing duplicate delivery", reqID)
+			return
+		}
+		// NOT a redelivery: different command+stdin under an id already in flight,
+		// which req_id's non-uniqueness across harness replicas makes reachable
+		// today (spec §3.1) — and the in-flight window is where it is widest, since
+		// the cache cannot catch it while the original is incomplete. Coalescing
+		// here would swallow genuinely different work: it would never run and never
+		// get a frame at all. Refuse it instead. That cannot be a second terminal
+		// frame for the same logical exec, precisely because it is a different one.
+		log.Printf("session: req_id %d reused for a different command while the original is still "+
+			"in flight; refusing it (req_id is not unique across harness replicas — see spec §3.1)", reqID)
+		trySend(errFrame(reqID, "req_id collision: a different command is already in flight for this id"))
+		return
+	}
+	// Consulted before enqueue: a redelivery of a COMPLETED exec must not consume
+	// a queue slot or a pool goroutine. Held under mu so accept's decision is
+	// atomic with respect to the slot map (Cache takes its own lock; nothing ever
+	// acquires mu while holding it, so the nesting cannot deadlock).
+	frame, hit, collision := s.cache.Lookup(reqID, fp)
+	if hit {
+		mu.Unlock()
+		cancel()
 		trySend(frame)
 		return
-	} else if collision {
+	}
+	inflight[reqID] = &slot{ctx: slotCtx, cancel: cancel, fp: fp}
+	mu.Unlock()
+	if collision {
 		log.Printf("session: req_id %d reused for a different command; running it fresh "+
 			"(req_id is not unique across harness replicas — see spec §3.1)", reqID)
 	}
-
-	slotCtx, cancel := context.WithCancel(ctx)
-	mu.Lock()
-	if _, running := inflight[reqID]; running {
-		mu.Unlock()
-		cancel()
-		// The original's terminal frame for this req_id is already owed and on
-		// its way. Sending a refusal here would be a SECOND terminal frame for
-		// one id: a caller keyed on req_id would settle it as failed on this
-		// refusal, then receive the real (possibly successful, possibly
-		// filesystem-mutating) result and have nowhere to put it. Silently
-		// coalesce instead — the exec already owes exactly one terminal frame,
-		// and it is coming.
-		log.Printf("session: req_id %d already in flight; coalescing duplicate delivery", reqID)
-		return
-	}
-	inflight[reqID] = &slot{ctx: slotCtx, cancel: cancel}
-	mu.Unlock()
 
 	select {
 	case queue <- e:
@@ -334,7 +392,12 @@ func (s *Session) runOne(ctx context.Context, send func(*pb.WorkerFrame), e *pb.
 	cacheable := false
 	switch {
 	case err == nil:
-		frame, cacheable = endFrame(reqID, code), true
+		// code < 0 means the child was SIGNALLED while the run context was still
+		// live — an OOM-kill, or an external SIGKILL — which the runner reports as
+		// End{-1} with no error. Emit it, but never cache it: a signal is not a
+		// determination the worker would reproduce, and caching it would poison the
+		// req_id so every later redelivery answered -1 without re-running.
+		frame, cacheable = endFrame(reqID, code), code >= 0
 	case errors.Is(err, wexec.ErrTimeout):
 		frame, cacheable = errFrame(reqID, fmt.Sprintf("timeout:%d", e.GetTimeoutS())), true
 	case errors.Is(err, wexec.ErrAborted):
@@ -343,10 +406,10 @@ func (s *Session) runOne(ctx context.Context, send func(*pb.WorkerFrame), e *pb.
 		frame = errFrame(reqID, err.Error())
 	}
 
-	// Only completed determinations are cached — a normal exit or a timeout, both
-	// of which the worker would reproduce. Caching an abort would make every later
-	// redelivery of that req_id answer -1 forever (spec §6.2: dedup protects
-	// completed execs only).
+	// Only completed determinations are cached — a real exit status or a timeout,
+	// both of which the worker would reproduce. Caching an abort, or a signalled
+	// exit, would make every later redelivery of that req_id answer -1 forever
+	// (spec §6.2: dedup protects completed execs only).
 	if cacheable {
 		s.cache.Put(reqID, Fingerprint(e.GetCommand(), e.GetStdin()), frame)
 	}

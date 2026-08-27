@@ -2,6 +2,7 @@ package session
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"sync"
 
 	pb "github.com/kagenti/serverless-harness/gen/go/sandbox/v1"
@@ -10,12 +11,21 @@ import (
 // CacheSize bounds the dedup cache (spec §6.3).
 const CacheSize = 256
 
-// Fingerprint hashes what makes an exec the same exec. The zero-byte separator
-// keeps ("a","b") from colliding with ("ab","").
+// Fingerprint hashes what makes an exec the same exec: the command and stdin,
+// each LENGTH-PREFIXED. A bare separator byte is not injective — with only a NUL
+// between the two fields, ("a\x00b", nil) and ("a", "b\x00") hash alike. That is
+// not exploitable here (a NUL-bearing command cannot survive cmd.Start(), so it
+// can never be the source of a cached entry), but this scheme is the reference
+// other language ports will copy, and a length prefix makes the encoding
+// unambiguous for any input rather than only for the inputs bash accepts.
 func Fingerprint(command string, stdin []byte) [32]byte {
 	h := sha256.New()
+	var n [8]byte
+	binary.BigEndian.PutUint64(n[:], uint64(len(command)))
+	h.Write(n[:])
 	h.Write([]byte(command))
-	h.Write([]byte{0})
+	binary.BigEndian.PutUint64(n[:], uint64(len(stdin)))
+	h.Write(n[:])
 	h.Write(stdin)
 	var out [32]byte
 	copy(out[:], h.Sum(nil))

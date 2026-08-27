@@ -48,17 +48,22 @@ The worker **dials out** to the relay and keeps ONE full-duplex gRPC stream open
 
 ## What it does on each Exec
 
-1. Checks the dedup cache: a redelivered `req_id` with the same command+stdin
+1. Checks whether that `req_id` is still **in flight**, before the cache. Same
+   command+stdin → the duplicate is coalesced silently, because the original
+   already owes exactly one terminal frame. Different command+stdin → it is a
+   `req_id` collision rather than a redelivery, so it is refused with an
+   `ExecError` instead of being swallowed (see the `req_id` bullet below).
+2. Then checks the dedup cache: a redelivered `req_id` with the same command+stdin
    re-emits its cached terminal frame and does **not** re-run (spec §8).
-2. Otherwise queues it for the dispatch pool (`WORKER_MAX_CONCURRENT`, default 4).
-3. Runs `bash -c <command>` as a new process group, feeding `stdin` and closing it —
+3. Otherwise queues it for the dispatch pool (`WORKER_MAX_CONCURRENT`, default 4).
+4. Runs `bash -c <command>` as a new process group, feeding `stdin` and closing it —
    `base64 -d > file` only terminates at EOF.
-4. Streams stdout and stderr back as 32 KiB `Chunk` frames tagged with their stream.
+5. Streams stdout and stderr back as 32 KiB `Chunk` frames tagged with their stream.
    With `streaming: false` it buffers output and emits it at exit in the same
    32 KiB-capped `Chunk` frames — one burst rather than incremental delivery. The
    guarantee is *when* output is sent, not that it is a single frame: the cap
    still applies, since an 8 MiB frame would exceed gRPC's default receive limit.
-5. Terminates with `End{exit_code}`, or `ExecError{"timeout:<n>"}` if `timeout_s`
+6. Terminates with `End{exit_code}`, or `ExecError{"timeout:<n>"}` if `timeout_s`
    expired, or `End{-1}` if aborted.
 
 There is no persistent shell: every command the harness sends is self-contained
@@ -171,7 +176,7 @@ outside-the-cluster (`RELAY_TLS=1`, Route host) cases.
 | `RELAY_ADDR` | `localhost:8443` | relay address (tunnel, ClusterIP, or Route host) |
 | `SANDBOX_ID` | `sbx-laptop-1` | stable id; one live Attach per id |
 | `SANDBOX_TOKEN` | `dev-token` | Bearer token; must match the relay |
-| `RELAY_TLS` | `0` | `1` to dial with TLS (for a Route :443); `0` = plaintext h2c |
+| `RELAY_TLS` | `0` | `1`/`true` to dial with TLS (for a Route :443); `0`/`false` = plaintext h2c. Anything else is **fatal** — it gates whether the bearer token crosses the wire in cleartext, so the worker refuses to guess |
 | `WORKER_MAX_CONCURRENT` | `4` | dispatch pool size; also advertised as `Hello.capacity_max` |
 | `SANDBOX_IMAGE` | (empty) | advertised in `Hello`; informational, not enforced by the worker |
 | `SANDBOX_TRUST` | `untrusted` | advertised in `Hello`; informational, not enforced by the worker |
@@ -196,13 +201,26 @@ outside-the-cluster (`RELAY_TLS=1`, Route host) cases.
 - **stdout/stderr interleaving is not preserved.** They are independent pipes, so
   their relative order across frames is not guaranteed. The harness does not depend
   on it — it collects stdout and replays both to `onData`.
-- **Dedup covers completed execs only.** A normal exit and a timeout are cached; an
-  abort and a dead-stream failure are not. An exec killed mid-flight by a disconnect
-  leaves no cached frame, so a redelivery re-runs it — at-least-once, as specified.
+- **Dedup covers completed execs only.** A real exit status and a timeout are
+  cached; an abort, a signalled exit (`End{-1}` from an OOM-kill or an external
+  `SIGKILL`), and a dead-stream failure are not. An exec killed mid-flight by a
+  disconnect leaves no cached frame, so a redelivery re-runs it — at-least-once, as
+  specified. Caching a signal would poison the `req_id`: every later redelivery
+  would answer `-1` without ever re-running.
+- **A cache hit re-emits ONLY the terminal frame — no `Chunk`s.** A redelivered
+  `req_id` gets the cached `End`/`ExecError` and nothing else, so a redelivered
+  `cat file` answers `End{0}` with EMPTY output. This is the right trade for the
+  harness — re-running a mutating command is worse than an empty read, and its
+  redelivery paths are retries of writes — but a consumer that needs output
+  alongside the terminal frame must not redeliver a completed `req_id`.
 - **`req_id` is not unique across harness replicas.** The harness's counter is
   module-scoped per process while sandboxes are shared, so the cache also compares a
   command+stdin fingerprint and re-runs on a mismatch rather than returning another
-  exec's output. The real fix is a globally unique `req_id` upstream (spec §3.1).
+  exec's output. While the original is still in flight the cache cannot see it at
+  all, so the same fingerprint is carried on the in-flight slot and a mismatch there
+  is refused with an `ExecError` — coalescing it would drop another replica's command
+  silently, with no frame ever emitted. The real fix is a globally unique `req_id`
+  upstream (spec §3.1).
 - **Bearer token only.** mTLS/SPIFFE slots into the same `Attach` endpoint later
   (spec §9); there is no client certificate today.
 - **The demo image is not a sandbox image.** It carries `bash`, `base64`, and `file`

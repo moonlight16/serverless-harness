@@ -26,6 +26,18 @@ const ChunkSize = 32 * 1024
 // BufferCap bounds buffered output for non-streaming execs, matching the
 // harness's DEFAULT_OUTPUT_CAP (grpc-relay-transport.ts:30). Output past it is
 // dropped — the harness applies its own cap and truncation marker anyway.
+//
+// MEMORY BUDGET — this is a PER-STREAM cap, so it sets the worker's worst-case
+// resident size:
+//
+//	2 streams (stdout+stderr) × session.MaxConcurrent × BufferCap
+//	= 2 × 4 × 8 MiB = 64 MiB at the default concurrency
+//
+// plus ~1.5-2x transiently while each bytes.Buffer doubles. Nothing the worker
+// controls gates it: Exec.streaming is relay-supplied and false is the proto3
+// default, so a buggy or hostile relay reaches this with no privilege at all.
+// worker-deployment.yaml's memory limit MUST cover the product above — change
+// either side and change the other.
 const BufferCap = 8 * 1024 * 1024
 
 // drainGrace is how long the drain watchdog waits, after runCtx ends, before
@@ -59,6 +71,13 @@ type Spec struct {
 // never called concurrently: Run drains stdout and stderr on separate
 // goroutines but serializes all calls to the caller's Sink through a single
 // lock, so implementations need not synchronize internally.
+//
+// Chunk must also never be called AFTER Run has returned. Implementations are
+// entitled to tear their destination down when Run ends — the session's
+// frameSink writes to a channel Serve closes, so a late Chunk would panic the
+// process rather than return an error. BashRunner honors this: both pumps have
+// finished (wg.Wait) and the non-streaming emission has completed before any
+// return path.
 type Sink interface {
 	Chunk(stream pb.Stream, data []byte) error
 }

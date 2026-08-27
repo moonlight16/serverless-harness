@@ -63,6 +63,13 @@ func TestFingerprintSeparatesCommandFromStdin(t *testing.T) {
 	if session.Fingerprint("cat f", []byte("x")) == session.Fingerprint("cat f", []byte("y")) {
 		t.Error("fingerprint ignores stdin")
 	}
+	// A bare separator byte is not injective once the command itself can contain
+	// that byte: with only a NUL between the fields, ("a\x00b", nil) and
+	// ("a", "b\x00") hash alike. Length prefixes are what make the encoding
+	// unambiguous for ANY input, not just the inputs bash would accept.
+	if session.Fingerprint("a\x00b", nil) == session.Fingerprint("a", []byte("b\x00")) {
+		t.Error("fingerprint collides on a NUL-bearing command: the encoding is not injective")
+	}
 }
 
 func TestCacheEvictsOldestBeyondMax(t *testing.T) {

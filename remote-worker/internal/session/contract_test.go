@@ -49,6 +49,17 @@ func newHarness(t *testing.T) *harness {
 // attach dials the relay, opens Attach, and serves the SAME session over it.
 func (h *harness) attach(t *testing.T) *relaytest.Conn {
 	t.Helper()
+	conn, _, _ := h.attachCancellable(t)
+	return conn
+}
+
+// attachCancellable is attach plus the two handles a shutdown test needs: the
+// cancel for the context the Attach stream was created from, and a channel
+// carrying Serve's return. Serve is handed exactly that context, which is its
+// documented precondition — recvLoop blocks in Recv() and unblocks only when the
+// stream's own context is cancelled.
+func (h *harness) attachCancellable(t *testing.T) (*relaytest.Conn, context.CancelFunc, <-chan error) {
+	t.Helper()
 	cc, err := grpc.NewClient(h.relay.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("dial %s: %v", h.relay.Addr, err)
@@ -60,9 +71,10 @@ func (h *harness) attach(t *testing.T) *relaytest.Conn {
 		cancel()
 		t.Fatalf("attach: %v", err)
 	}
-	go func() { _ = h.sess.Serve(ctx, stream) }()
+	served := make(chan error, 1)
+	go func() { served <- h.sess.Serve(ctx, stream) }()
 	t.Cleanup(func() { cancel(); _ = cc.Close() })
-	return h.relay.WaitAttach(t)
+	return h.relay.WaitAttach(t), cancel, served
 }
 
 // grepCmd prefers rg (what the harness's find ops use) and falls back to grep,
@@ -333,4 +345,79 @@ func countLines(t *testing.T, path string) int {
 		return 0
 	}
 	return strings.Count(string(b), "\n")
+}
+
+// streaming: false end to end. This is the PROTO3 DEFAULT, so any relay that
+// omits the field takes this path: the worker buffers everything (up to
+// exec.BufferCap per stream — the memory budget noted on that constant) and emits
+// it only at child exit, still split into ChunkSize-capped Chunk frames because
+// the wire cap applies regardless (spec §8). Nothing else in this file drives
+// emitBuffered over a real stream.
+func TestContractNonStreamingBuffersThenChunksAtExit(t *testing.T) {
+	h := newHarness(t)
+	conn := h.attach(t)
+
+	dir := t.TempDir()
+	path := dir + "/buffered.txt"
+	var b strings.Builder
+	for i := 0; i < 3000; i++ { // ~150 KiB: several chunks past the 32 KiB cap
+		b.WriteString("buffered line with padding to make it wide enough\n")
+	}
+	want := b.String()
+	if err := os.WriteFile(path, []byte(want), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Streaming is deliberately left unset — the zero value is the point.
+	conn.SendExec(t, &pb.Exec{ReqId: 10, Command: "cat " + path, TimeoutS: 30})
+
+	var chunks int
+	var stdout []byte
+	for {
+		f := conn.Next(t)
+		if ch := f.GetChunk(); ch != nil && ch.GetReqId() == 10 {
+			chunks++
+			if n := len(ch.GetData()); n > wexec.ChunkSize {
+				t.Errorf("chunk of %d bytes exceeds the per-frame cap %d", n, wexec.ChunkSize)
+			}
+			stdout = append(stdout, ch.GetData()...)
+			continue
+		}
+		if e := f.GetError(); e != nil && e.GetReqId() == 10 {
+			t.Fatalf("ExecError: %s", e.GetMessage())
+		}
+		if e := f.GetEnd(); e != nil && e.GetReqId() == 10 {
+			if e.GetExitCode() != 0 {
+				t.Errorf("exit code = %d, want 0", e.GetExitCode())
+			}
+			break
+		}
+	}
+	if chunks < 2 {
+		t.Errorf("chunks = %d, want >=2: %d KiB of buffered output was not split at the cap",
+			chunks, len(want)/1024)
+	}
+	// Buffering must not lose or reorder anything: the bytes are the whole file.
+	if len(stdout) != len(want) || string(stdout) != want {
+		t.Errorf("stdout = %d bytes, want the complete %d", len(stdout), len(want))
+	}
+}
+
+// Serve must RETURN when the context that created the Attach stream is cancelled:
+// the shutdown path main.go depends on, where SIGTERM cancels attachCtx. Note what
+// actually does the work — recvLoop has no select on ctx, so cancellation reaches
+// it only by tearing the stream down. That identity between "Serve's ctx" and "the
+// stream's ctx" is the precondition documented on Serve, and it is what this test
+// pins: create the stream from a context nothing cancels and this hangs for its
+// full 5s, which is precisely how the production shutdown hang would present.
+func TestContractServeReturnsOnContextCancel(t *testing.T) {
+	h := newHarness(t)
+	_, cancel, served := h.attachCancellable(t)
+
+	cancel()
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return within 5s of cancelling the stream's context: shutdown hangs")
+	}
 }

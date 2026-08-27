@@ -26,7 +26,11 @@ result.
 `command`+`stdin` as well as `req_id` (`Fingerprint`, `cache.go:15`). A
 genuine redelivery is byte-identical and re-emits the cached frame; a
 collision has a different fingerprint, runs fresh, and logs a warning
-(`internal/session/loop.go`'s `accept`, the `collision` branch).
+(`internal/session/loop.go`'s `accept`, the `collision` branch). The same
+fingerprint is also carried on the in-flight slot, which is where the collision
+window is widest: while the original is still running the cache cannot see it at
+all, so a matching fingerprint is coalesced as a redelivery and a mismatching one
+is refused with an `ExecError` rather than silently swallowed.
 
 **Proposed real fix:** make `req_id` globally unique — a random 64-bit seed
 per transport instance, or a replica-scoped prefix. The worker guard is

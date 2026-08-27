@@ -3,6 +3,7 @@ package session_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -68,6 +69,17 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }
+
+// settle gives a pool goroutine room to release its in-flight slot after its
+// terminal frame has already been observed on the wire. runOne enqueues that frame
+// on the buffered outbound channel BEFORE it returns, and only then does finish()
+// delete the slot — so seeing the frame does not by itself prove the slot is gone.
+// accept deliberately consults in-flight AHEAD of the cache (that ordering is what
+// stops a duplicate arriving mid-send from being answered twice), which means a
+// redelivery sent the instant the frame appears could be coalesced instead of
+// reaching the cache. The real work in between is a map delete under a mutex;
+// 50ms is a very wide margin for it.
+func settle() { time.Sleep(50 * time.Millisecond) }
 
 // scriptedRunner returns a fixed outcome and records the specs it received.
 type scriptedRunner struct {
@@ -252,6 +264,7 @@ func TestRedeliveredReqIDReEmitsWithoutRerunning(t *testing.T) {
 	if r.count() != 1 {
 		t.Fatalf("runner calls = %d, want 1", r.count())
 	}
+	settle() // the redelivery must reach the cache, not the in-flight slot
 
 	st.exec(&pb.Exec{ReqId: 9, Command: "echo x >> log", Streaming: true})
 	waitFor(t, "second terminal", func() bool {
@@ -280,6 +293,7 @@ func TestCollidingReqIDRunsFresh(t *testing.T) {
 
 	st.exec(&pb.Exec{ReqId: 5, Command: "rm -rf /b", Streaming: true})
 	waitFor(t, "first terminal", func() bool { return terminalFor(st.sent(), 5) != nil })
+	settle() // the colliding id must reach the cache, not the in-flight slot
 
 	st.exec(&pb.Exec{ReqId: 5, Command: "cat /a", Streaming: true})
 	waitFor(t, "second run", func() bool { return r.count() >= 2 })
@@ -564,6 +578,76 @@ func TestDuplicateInFlightIsCoalesced(t *testing.T) {
 	}
 	if r.count() != 1 {
 		t.Errorf("runner calls = %d, want 1: the duplicate re-ran the command", r.count())
+	}
+	st.close()
+}
+
+// A req_id already IN FLIGHT, redelivered with a DIFFERENT command, is a collision
+// rather than a redelivery: req_id is not unique across harness replicas (spec
+// §3.1), and while the original is incomplete the cache cannot catch it, so the
+// in-flight slot's fingerprint is the only guard. Coalescing it would swallow the
+// other replica's command outright — it would never run and never get a frame.
+// Refusing it cannot be a second terminal frame for the same logical exec,
+// precisely because it is a different one.
+func TestCollidingDuplicateWhileInFlightIsRefused(t *testing.T) {
+	st := newFakeStream()
+	r := &scriptedRunner{block: make(chan struct{}), code: 0}
+	s := session.New(testConfig(), r)
+	go func() { _ = s.Serve(context.Background(), st) }()
+	waitFor(t, "hello", func() bool { return len(st.sent()) >= 1 })
+
+	st.exec(&pb.Exec{ReqId: 5, Command: "cat /a", Streaming: true})
+	waitFor(t, "the runner to start", func() bool { return r.count() == 1 })
+
+	// Same id, different command, original still running.
+	st.exec(&pb.Exec{ReqId: 5, Command: "rm -rf /b", Streaming: true})
+	waitFor(t, "the collision refusal", func() bool {
+		f := terminalFor(st.sent(), 5)
+		return f != nil && f.GetError() != nil
+	})
+	if got := terminalFor(st.sent(), 5).GetError().GetMessage(); !strings.Contains(got, "collision") {
+		t.Errorf("refusal message = %q, want it to name the req_id collision", got)
+	}
+	// The colliding command must not have been run behind the original, and the
+	// original must not have been disturbed.
+	if n := r.count(); n != 1 {
+		t.Errorf("runner calls = %d, want 1: the refused command must not run", n)
+	}
+	r.mu.Lock()
+	firstCmd := r.specs[0].Command
+	r.mu.Unlock()
+	if firstCmd != "cat /a" {
+		t.Errorf("running exec = %q, want the original %q", firstCmd, "cat /a")
+	}
+
+	close(r.block)
+	st.close()
+}
+
+// A signalled exit — End{-1} with NO error, which is what the runner reports when
+// the child is SIGKILLed while the run context is still live (an OOM-kill, or an
+// external kill) — must be emitted but never cached. Caching it would poison the
+// req_id: every later redelivery would answer -1 without re-running a command whose
+// real outcome was never determined.
+func TestSignalledExitIsNotCached(t *testing.T) {
+	st := newFakeStream()
+	r := &scriptedRunner{code: -1} // signalled: code < 0, err == nil
+	s := session.New(testConfig(), r)
+	go func() { _ = s.Serve(context.Background(), st) }()
+	waitFor(t, "hello", func() bool { return len(st.sent()) >= 1 })
+
+	oomed := func() *pb.Exec { return &pb.Exec{ReqId: 11, Command: "big-alloc", Streaming: true} }
+	st.exec(oomed())
+	waitFor(t, "first terminal", func() bool { return terminalFor(st.sent(), 11) != nil })
+	if got := terminalFor(st.sent(), 11).GetEnd(); got == nil || got.GetExitCode() != -1 {
+		t.Fatalf("terminal = %+v, want End{exit_code:-1}", terminalFor(st.sent(), 11))
+	}
+	settle() // the redelivery must reach the cache lookup, not the in-flight slot
+
+	st.exec(oomed())
+	waitFor(t, "the redelivery to re-run", func() bool { return r.count() >= 2 })
+	if n := r.count(); n != 2 {
+		t.Errorf("runner calls = %d, want 2: the signalled exit was cached", n)
 	}
 	st.close()
 }
