@@ -43,7 +43,7 @@ The worker **dials out** to the relay and keeps ONE full-duplex gRPC stream open
 | failures → `ExecError{req_id, message}` | ✅ spawn failures, and `timeout:<n>` on expiry |
 | `Abort` → SIGKILL the in-flight child | ✅ kills the whole process group (`Setpgid`) |
 | worker-side `timeout_s` | ✅ SIGKILL at expiry → `ExecError{"timeout:<n>"}` |
-| dedup / at-least-once: cache `req_id → End` | ✅ bounded LRU (256), guarded by a command+stdin fingerprint |
+| dedup / at-least-once: cache `req_id →` terminal frame (`End`, or a timeout `ExecError`) | ✅ bounded LRU (256), guarded by a command+stdin fingerprint |
 | `Heartbeat` for liveness | ✅ every 15s |
 
 ## What it does on each Exec
@@ -54,7 +54,10 @@ The worker **dials out** to the relay and keeps ONE full-duplex gRPC stream open
 3. Runs `bash -c <command>` as a new process group, feeding `stdin` and closing it —
    `base64 -d > file` only terminates at EOF.
 4. Streams stdout and stderr back as 32 KiB `Chunk` frames tagged with their stream.
-   With `streaming: false` it buffers and emits one `Chunk` per stream at exit.
+   With `streaming: false` it buffers output and emits it at exit in the same
+   32 KiB-capped `Chunk` frames — one burst rather than incremental delivery. The
+   guarantee is *when* output is sent, not that it is a single frame: the cap
+   still applies, since an 8 MiB frame would exceed gRPC's default receive limit.
 5. Terminates with `End{exit_code}`, or `ExecError{"timeout:<n>"}` if `timeout_s`
    expired, or `End{-1}` if aborted.
 
