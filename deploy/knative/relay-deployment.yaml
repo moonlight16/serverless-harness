@@ -38,8 +38,10 @@ spec:
             # Relay auth is fail-closed (see main.ts's makeDefaultValidateToken): with
             # no token set, every worker Attach is rejected before the stream is parked.
             # MUST equal the worker's SANDBOX_TOKEN (see worker-example.yaml). This
-            # hardcoded dev value is fine for kind/local dev; production wants a
-            # secretKeyRef instead of a literal value here (tracked in issue #173).
+            # hardcoded dev value is fine for Kind/local dev, but this file is also
+            # included, unpatched, by the OCP overlay (overlays/ocp/kustomization.yaml),
+            # so it is a valid credential on any OCP-deployed relay too. secretKeyRef
+            # (issue #173) is a prerequisite for any non-dev OCP worker use.
             - name: SH_RELAY_TOKEN
               value: dev-token
           ports:
