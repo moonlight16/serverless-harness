@@ -97,3 +97,10 @@ jobs:
 
       - name: Build and test Go stubs
         run: cd gen/go && go build ./... && go test ./...
+
+      - name: Build and test remote-worker
+        working-directory: remote-worker
+        run: |
+          test -z "$(gofmt -l .)" || { echo "::error::gofmt needs running:"; gofmt -l .; exit 1; }
+          go vet ./...
+          go test ./...

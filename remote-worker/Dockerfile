@@ -11,8 +11,7 @@ WORKDIR /src
 COPY gen/go/ ./gen/go/
 COPY remote-worker/ ./remote-worker/
 WORKDIR /src/remote-worker
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/remote-worker .
-
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/remote-worker ./cmd/worker
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/remote-worker /remote-worker
 ENTRYPOINT ["/remote-worker"]

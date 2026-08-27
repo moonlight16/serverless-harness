@@ -33,4 +33,4 @@ exec 3>&- 2>/dev/null || true
 echo "4) run worker (sandbox_id=${SANDBOX_ID}); Ctrl+C to stop"
 cd "$(dirname "$0")"
 RELAY_ADDR="localhost:${PORT}" SANDBOX_ID="${SANDBOX_ID}" SANDBOX_TOKEN="${TOKEN}" \
-  go run .
+  go run ./cmd/worker

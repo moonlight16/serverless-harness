@@ -8,6 +8,7 @@ fmt:
 
 test:
 	pnpm -r test
+	cd remote-worker && go test ./...
 
 typecheck:
 	cd harness && pnpm exec tsc --noEmit

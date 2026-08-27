@@ -27,7 +27,7 @@ done
 
 echo "==> cross-compiling linux/amd64 static binary (dist/remote-worker)"
 mkdir -p dist
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/remote-worker .
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/remote-worker ./cmd/worker
 cp Dockerfile.runtime dist/Dockerfile
 
 if [ -n "$PUSH" ]; then

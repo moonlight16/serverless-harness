@@ -2,3 +2,4 @@
 /dist/
 /.rw-bin
 *.log
+/remote-worker
