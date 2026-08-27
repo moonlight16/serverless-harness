@@ -87,13 +87,14 @@ type slot struct {
 // (in production, the same attachCtx handed to client.Attach). recvLoop blocks in
 // st.Recv() and has NO select on ctx, so cancelling ctx does not by itself stop
 // Serve: the only thing that ever unblocks the receive is gRPC tearing the stream
-// down, which happens when the STREAM's context is cancelled. Break that identity
-// in either direction — hand Serve a context unrelated to the stream's, or create
-// the stream from a context nothing cancels — and shutdown silently stops working:
-// the cancel returns at once while Serve stays blocked in Recv until the
-// connection happens to die on its own. It compiles, it vets, and it passes every
-// test that ends a session by closing the stream instead of cancelling. Do not
-// "clean that up".
+// down, which happens when the STREAM's context is cancelled. The requirement is
+// on the STREAM's context, not on the ctx argument itself: as long as the stream
+// was created from a context that does get cancelled, handing Serve a different,
+// unrelated ctx is harmless and shutdown still works. What actually wedges is
+// creating the stream from a context nothing ever cancels — then Serve hangs in
+// Recv until the connection happens to die on its own, no matter what ctx it was
+// given. It compiles, it vets, and it passes every test that ends a session by
+// closing the stream instead of cancelling. Do not "clean that up".
 func (s *Session) Serve(ctx context.Context, st Stream) error {
 	connCtx, cancelConn := context.WithCancel(ctx)
 	// Cancelling the connection context kills every in-flight child: their output
