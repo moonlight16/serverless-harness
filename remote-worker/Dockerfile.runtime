@@ -4,7 +4,13 @@
 #
 # The base must provide bash + coreutils: the worker runs `bash -c <command>` and
 # the harness's ops call base64 and file (spec §3.3).
+#
+# This is a standalone demo image that tracks the current UBI 9 minor; a pinned
+# digest would go stale silently, and microdnf package pinning breaks on minor
+# bumps for the same reason .hadolint.yaml already ignores DL3018 for Alpine.
+# hadolint ignore=DL3007
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+# hadolint ignore=DL3041
 RUN microdnf install -y --nodocs bash coreutils-single findutils file \
     && microdnf clean all
 COPY remote-worker /usr/local/bin/remote-worker

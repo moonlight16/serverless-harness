@@ -8,7 +8,7 @@ It holds **no LLM key and no orchestration** — it only executes commands and r
 bytes, which is the property that makes the "central brain" trust model correct
 (spec §7). Design: [`docs/specs/2026-08-26-st4-go-reference-worker-design.md`](../docs/specs/2026-08-26-st4-go-reference-worker-design.md).
 
-## How a worker connects (review of README-worker.md + sandbox.proto)
+## How a worker connects (wire contract per sandbox.proto)
 
 The worker **dials out** to the relay and keeps ONE full-duplex gRPC stream open
 (`SandboxWorker.Attach`, `proto/sandbox/v1/sandbox.proto`):
@@ -156,8 +156,10 @@ where the worker runs.
 
 For a worker on *other* infrastructure (not this cluster), expose the relay via an
 OpenShift Route on :443 with TLS + HTTP/2 and point `RELAY_ADDR` at the Route
-host (see README-worker.md "Running the worker outside the cluster"); the worker
-then dials with TLS (`RELAY_TLS=1`) instead of `insecure`.
+host; the worker then dials with TLS (`RELAY_TLS=1`) instead of `insecure`. No
+code or binary changes are needed — the same worker image and the env vars in
+the table below cover both the in-cluster (`RELAY_TLS=0`, ClusterIP address) and
+outside-the-cluster (`RELAY_TLS=1`, Route host) cases.
 
 ## Environment variables
 

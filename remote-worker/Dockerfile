@@ -17,7 +17,13 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/remote-worker ./cm
 # distroless/static ships none of them — every exec would fail with ENOENT.
 # In production the binary drops into a real sandbox image instead; this stage
 # exists so the standalone demo image works on its own.
+#
+# These are standalone demo images that track the current UBI 9 minor; a pinned
+# digest would go stale silently, and microdnf package pinning breaks on minor
+# bumps for the same reason .hadolint.yaml already ignores DL3018 for Alpine.
+# hadolint ignore=DL3007
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+# hadolint ignore=DL3041
 RUN microdnf install -y --nodocs bash coreutils-single findutils file \
     && microdnf clean all
 COPY --from=build /out/remote-worker /usr/local/bin/remote-worker
