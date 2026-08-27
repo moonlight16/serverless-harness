@@ -2,8 +2,10 @@ package exec_test
 
 import (
 	"context"
+	osexec "os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	pb "github.com/kagenti/serverless-harness/gen/go/sandbox/v1"
 	wexec "github.com/kagenti/serverless-harness/remote-worker/internal/exec"
@@ -115,3 +117,95 @@ func TestSinkErrorPropagates(t *testing.T) {
 type sinkFunc func(pb.Stream, []byte) error
 
 func (f sinkFunc) Chunk(s pb.Stream, d []byte) error { return f(s, d) }
+
+// A pipe holder that escapes the process group survives the SIGKILL, so only
+// the drain watchdog can unblock Run. Without it, this test hangs.
+func TestRunReturnsWhenPipeHolderEscapesGroup(t *testing.T) {
+	if _, err := osexec.LookPath("setsid"); err != nil {
+		t.Skip("no setsid: cannot detach a pipe holder from the process group")
+	}
+	start := time.Now()
+	var r recorder
+	_, err := wexec.BashRunner{}.Run(context.Background(), wexec.Spec{
+		ReqID: 30, Command: "setsid sleep 30 & exit 0", TimeoutS: 1, Streaming: true,
+	}, &r)
+	if err == nil {
+		t.Log("Run returned nil; the point of this test is that it RETURNS")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("Run took %v: the drain was not bounded", elapsed)
+	}
+}
+
+// streaming:false means no incremental delivery, not "exactly one frame":
+// buffered output at exit still has to respect the wire's ChunkSize cap.
+func TestNonStreamingChunksAtExit(t *testing.T) {
+	var sizes []int
+	sink := sinkFunc(func(_ pb.Stream, data []byte) error {
+		sizes = append(sizes, len(data))
+		return nil
+	})
+	want := 40 * 1024
+	code, err := wexec.BashRunner{}.Run(context.Background(), wexec.Spec{
+		ReqID:     32,
+		Command:   "head -c 40960 /dev/zero | tr '\\0' 'a'",
+		Streaming: false,
+	}, sink)
+	if err != nil || code != 0 {
+		t.Fatalf("got code=%d err=%v", code, err)
+	}
+	total := 0
+	for _, n := range sizes {
+		if n > wexec.ChunkSize {
+			t.Errorf("chunk of %d bytes exceeds cap %d", n, wexec.ChunkSize)
+		}
+		total += n
+	}
+	if total != want {
+		t.Errorf("total bytes = %d, want %d", total, want)
+	}
+	if len(sizes) < 2 {
+		t.Errorf("got %d chunk(s), want >=2 for %d bytes", len(sizes), want)
+	}
+}
+
+// A small non-streaming exec still yields exactly one Chunk per stream: the
+// slicing in emitBuffered must not fragment output that already fits.
+func TestNonStreamingSmallOutputIsOneChunkPerStream(t *testing.T) {
+	var r recorder
+	code, err := wexec.BashRunner{}.Run(context.Background(), wexec.Spec{
+		ReqID:     33,
+		Command:   "echo hi; echo oops >&2",
+		Streaming: false,
+	}, &r)
+	if err != nil || code != 0 {
+		t.Fatalf("got code=%d err=%v", code, err)
+	}
+	if got := string(r.stdout); got != "hi\n" {
+		t.Errorf("stdout = %q, want %q", got, "hi\n")
+	}
+	if got := string(r.stderr); got != "oops\n" {
+		t.Errorf("stderr = %q, want %q", got, "oops\n")
+	}
+	if r.calls != 2 {
+		t.Errorf("calls = %d, want 2 (one Chunk per stream)", r.calls)
+	}
+}
+
+// The child exits 0 immediately; the sink is slow enough that the deadline
+// fires mid-drain. The exit code must win over the expired context.
+func TestSlowSinkDoesNotTurnSuccessIntoTimeout(t *testing.T) {
+	slow := sinkFunc(func(pb.Stream, []byte) error {
+		time.Sleep(1500 * time.Millisecond)
+		return nil
+	})
+	code, err := wexec.BashRunner{}.Run(context.Background(), wexec.Spec{
+		ReqID: 31, Command: "echo hi", TimeoutS: 1, Streaming: true,
+	}, slow)
+	if err != nil {
+		t.Fatalf("err = %v, want nil: the command exited 0 before the deadline", err)
+	}
+	if code != 0 {
+		t.Errorf("code = %d, want 0", code)
+	}
+}
