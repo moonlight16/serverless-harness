@@ -32,7 +32,7 @@ spec:
               value: __TOKEN__
           securityContext:
             runAsNonRoot: true
-            runAsUser: 65532          # explicit non-root UID (image declares none); nonroot-v2 SCC allows it
+            runAsUser: 1001           # matches the image's USER 1001; nonroot-v2 SCC allows it
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]

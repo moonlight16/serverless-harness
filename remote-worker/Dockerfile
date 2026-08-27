@@ -12,6 +12,15 @@ COPY gen/go/ ./gen/go/
 COPY remote-worker/ ./remote-worker/
 WORKDIR /src/remote-worker
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/remote-worker ./cmd/worker
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/remote-worker /remote-worker
-ENTRYPOINT ["/remote-worker"]
+# The worker execs `bash -c <command>`, so the runtime image needs a shell and the
+# coreutils the harness's ops call: base64 (writeFile), file (image mime sniffing).
+# distroless/static ships none of them — every exec would fail with ENOENT.
+# In production the binary drops into a real sandbox image instead; this stage
+# exists so the standalone demo image works on its own.
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+RUN microdnf install -y --nodocs bash coreutils-single findutils file \
+    && microdnf clean all
+COPY --from=build /out/remote-worker /usr/local/bin/remote-worker
+# Matches the nonroot-v2 SCC deploy-incluster.sh applies.
+USER 1001
+ENTRYPOINT ["/usr/local/bin/remote-worker"]

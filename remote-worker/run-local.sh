@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the HELLO WORLD remote worker on THIS laptop, connected to the harness in ykt1.
+# Run the remote worker on THIS laptop, connected to the harness in ykt1.
 #
 # It (1) sets the relay token, (2) enables the remote-sandbox path on the harness,
 # (3) port-forwards the relay to localhost, then (4) runs the worker dialing the

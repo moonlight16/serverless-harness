@@ -17,7 +17,7 @@ IMAGE="${IMAGE:-image-registry.openshift-image-registry.svc:5000/$NS/remote-work
 echo "==> ensure relay token (fail-closed auth)"
 oc set env deploy/sandbox-relay "SH_RELAY_TOKEN=$TOKEN" -n "$NS" >/dev/null
 
-echo "==> ServiceAccount + nonroot-v2 SCC (image declares no USER; runs as UID 65532)"
+echo "==> ServiceAccount + nonroot-v2 SCC (image declares USER 1001)"
 oc create serviceaccount remote-worker -n "$NS" --dry-run=client -o yaml | oc apply -f - >/dev/null
 oc adm policy add-scc-to-user nonroot-v2 -z remote-worker -n "$NS" >/dev/null
 
