@@ -130,6 +130,64 @@ grpcurl -plaintext -proto proto/sandbox/v1/sandbox.proto \
 work lands a leaf on the sandbox; the leaf executes through your worker. See the
 smoke test in [`README-ocp.md`](README-ocp.md#smoke-test).
 
+## Live transport cases (no cluster required)
+
+[`packages/k8s-sandbox/test/live-relay.test.ts`](../../packages/k8s-sandbox/test/live-relay.test.ts)
+drives the real `GrpcRelayTransport` against a real relay and a real Go worker
+on your laptop — no cluster, no kind. This is the only independent check on the
+hermetic conformance battery (`grpc-relay-transport.test.ts`,
+`transport-conformance.test.ts`): those tests script fakes authored by the same
+person who wrote the transport, so their agreement is not independent evidence.
+It also covers three cases the OS-fingerprint leaf smoke above cannot reach,
+because a leaf's request shape is a grep verdict — it cannot ask for a sleep, a
+flood, or a mid-exec disconnect:
+
+- the **dual-ended timeout** actually cuts a real `sleep 30` short at `timeout:2`
+  rather than running it to completion;
+- a real multi-chunk flood through real 32 KiB `Chunk` frames is truncated at
+  `outputCapBytes` and marked, not just a scripted single frame pretending to be
+  one;
+- an in-flight exec **rejects** — rather than hanging — when the relay's Attach
+  teardown pushes `worker disconnected` into every live sink for that sandbox.
+
+Gated on `SH_LIVE_RELAY=1`, following the Go worker's own `SH_LIVE_RELAY`
+convention (`remote-worker/internal/session/live_test.go`) and the harness's
+`M3_LIVE_SMOKE` convention. With the gate off, the suite skips cleanly — it adds
+no cost to `make test`. Start a relay and a worker, then run it:
+
+```bash
+# Redis — pick a free port; something else on this machine may already hold 6379.
+docker run --rm -d -p 6380:6379 --name sh-live-relay-redis redis:7
+
+# Relay
+SH_RELAY_TOKEN=dev-token SH_RELAY_PORT=8443 REDIS_URL=redis://127.0.0.1:6380 \
+  pnpm --filter @sh/sandbox-relay start &
+
+# Reference worker, under the default SANDBOX_ID the test expects
+cd remote-worker && SANDBOX_ID=sbx-dev-1 RELAY_ADDR=localhost:8443 \
+  SANDBOX_TOKEN=dev-token go run ./cmd/worker &
+cd ..
+
+# The live cases
+SH_LIVE_RELAY=1 pnpm --filter @sh/k8s-sandbox test live-relay
+
+# Teardown
+kill %1 %2   # relay, worker (job numbers from your shell)
+docker stop sh-live-relay-redis   # started with --rm; stop also removes it
+```
+
+`RELAY_ADDR`, `SANDBOX_ID`, and `SANDBOX_TOKEN` are all overridable env vars if
+you want to point the first two cases at a relay/worker running elsewhere.
+
+The third case (worker disconnect) does **not** use the worker started above —
+it builds the worker binary itself in a `beforeAll` (`go build -o <tmp> ./cmd/worker`)
+and spawns/kills its own copy under a distinct `<SANDBOX_ID>-disconnect` id, so
+the case is fully automated and safe to re-run rather than needing a manual
+`kill -9` on the shared worker mid-test. (`go run` itself isn't killed directly for
+this: it forks the compiled binary as its own child, and `SIGKILL` on the `go run`
+wrapper doesn't reliably propagate to that child — so the case spawns the
+already-built binary directly, where `SIGKILL` is unambiguous.)
+
 ## Running the live gate on a real cluster
 
 [`relay-leaf-smoke.sh`](relay-leaf-smoke.sh) automates the verification above: it
