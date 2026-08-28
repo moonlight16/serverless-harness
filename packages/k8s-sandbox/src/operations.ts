@@ -19,7 +19,25 @@ function mapper(cfg: K8sSandboxConfig) {
 export function createPodReadOps(exec: ExecInPod, cfg: K8sSandboxConfig): ReadOperations {
   const q = mapper(cfg);
   return {
-    readFile: async (p) => (await exec(`cat ${q(p)}`)).stdout,
+    readFile: async (p) => {
+      const r = await exec(`cat ${q(p)}`);
+      // Never hand back bytes we cannot vouch for. Pi's Edit tool is
+      // read-whole-file → replace → write-whole-file, so returning a partial read
+      // would write the truncation — marker text included — back over the real
+      // file. A null exit code means the exec produced no status: the seam's
+      // output cap tripped and the reader was cut off mid-file (spec §8), or the
+      // `cat` was signalled. Non-zero means the `cat` itself failed. Neither can
+      // yield file contents, so both throw, exactly as `access` does below.
+      if (r.exitCode === null) {
+        throw new Error(
+          `Read truncated in pod (output cap tripped or cat signalled; no exit status): ${p}`,
+        );
+      }
+      if (r.exitCode !== 0) {
+        throw new Error(`Read failed in pod (cat exited ${r.exitCode}): ${p}`);
+      }
+      return r.stdout;
+    },
     access: async (p) => {
       const r = await exec(`test -r ${q(p)}`);
       if (r.exitCode !== 0) throw new Error(`File not readable in pod: ${p}`);
