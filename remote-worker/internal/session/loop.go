@@ -314,14 +314,14 @@ func (s *Session) accept(
 			return
 		}
 		// NOT a redelivery: different command+stdin under an id already in flight,
-		// which req_id's non-uniqueness across harness replicas makes reachable
-		// today (spec §3.1) — and the in-flight window is where it is widest, since
+		// which a req_id salt collision across harness replicas still makes reachable
+		// (spec §3.1) — and the in-flight window is where it is widest, since
 		// the cache cannot catch it while the original is incomplete. Coalescing
 		// here would swallow genuinely different work: it would never run and never
 		// get a frame at all. Refuse it instead. That cannot be a second terminal
 		// frame for the same logical exec, precisely because it is a different one.
 		log.Printf("session: req_id %d reused for a different command while the original is still "+
-			"in flight; refusing it (req_id is not unique across harness replicas — see spec §3.1)", reqID)
+			"in flight; refusing it (req_id is only probabilistically unique across replicas — see spec §3.1)", reqID)
 		trySend(errFrame(reqID, "req_id collision: a different command is already in flight for this id"))
 		return
 	}
@@ -340,7 +340,7 @@ func (s *Session) accept(
 	mu.Unlock()
 	if collision {
 		log.Printf("session: req_id %d reused for a different command; running it fresh "+
-			"(req_id is not unique across harness replicas — see spec §3.1)", reqID)
+			"(req_id is only probabilistically unique across replicas — see spec §3.1)", reqID)
 	}
 
 	select {

@@ -35,9 +35,11 @@ func TestCacheHitOnMatchingFingerprint(t *testing.T) {
 	}
 }
 
-// req_id is NOT unique per worker: the harness counter is module-scoped per
-// process and sandboxes are shared across replicas (spec §3.1). A reused id with
-// a different command must run fresh, never return the other command's output.
+// req_id is only probabilistically unique per worker: the harness salts its ids per
+// process, so two replicas sharing a sandbox collide only when they draw the same
+// 21-bit salt (≈4.8e-6 across five replicas, spec §3.1). Unlikely is not never, so a
+// reused id with a different command must run fresh, never return the other
+// command's output.
 func TestCacheCollisionOnDifferentFingerprint(t *testing.T) {
 	c := session.NewCache(4)
 	c.Put(1, session.Fingerprint("rm -rf /b", nil, 10, false), endFrame(1, 0))

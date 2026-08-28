@@ -213,14 +213,16 @@ outside-the-cluster (`RELAY_TLS=1`, Route host) cases.
   harness — re-running a mutating command is worse than an empty read, and its
   redelivery paths are retries of writes — but a consumer that needs output
   alongside the terminal frame must not redeliver a completed `req_id`.
-- **`req_id` is not unique across harness replicas.** The harness's counter is
-  module-scoped per process while sandboxes are shared, so the cache also compares a
-  command+stdin fingerprint and re-runs on a mismatch rather than returning another
-  exec's output. While the original is still in flight the cache cannot see it at
-  all, so the same fingerprint is carried on the in-flight slot and a mismatch there
-  is refused with an `ExecError` — coalescing it would drop another replica's command
-  silently, with no frame ever emitted. The real fix is a globally unique `req_id`
-  upstream (spec §3.1).
+- **`req_id` is only probabilistically unique across harness replicas.** The harness
+  salts its ids per process (21-bit crypto salt in the high bits, 32-bit counter in the
+  low bits — spec §3.1), so two replicas sharing a sandbox no longer collide by
+  construction; they collide only on drawing the same salt, ≈4.8e-6 across five
+  replicas. The worker keeps its fingerprint guard for exactly that residual case: the
+  cache also compares a command+stdin fingerprint and re-runs on a mismatch rather than
+  returning another exec's output. While the original is still in flight the cache
+  cannot see it at all, so the same fingerprint is carried on the in-flight slot and a
+  mismatch there is refused with an `ExecError` — coalescing it would drop another
+  replica's command silently, with no frame ever emitted.
 - **Bearer token only.** mTLS/SPIFFE slots into the same `Attach` endpoint later
   (spec §9); there is no client certificate today.
 - **The demo image is not a sandbox image.** It carries `bash`, `base64`, and `file`

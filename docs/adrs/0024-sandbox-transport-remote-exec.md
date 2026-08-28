@@ -54,15 +54,25 @@ keyed on a non-unique id.
 **Consequence:** the relay now rejects a duplicate in-flight `req_id` rather than
 overwriting the live sink, converting a silent misroute into a loud error.
 
-### 2026-08-28 — the output cap is a seam guarantee, not a transport detail
+### 2026-08-28 — the output cap moves onto the seam, but covers two of three transports
 
 §8 always worded the cap as a harness-level property, but only `GrpcRelayTransport`
 implemented it; `KubectlTransport` buffered without bound behind a `TODO(M3)`.
 
-**Decided:** both transports enforce it, the constant and marker live on the seam
-(`transport.ts`), and the shared conformance battery asserts it for both — because a cap
-on one implementation makes the transports distinguishable to Pi, which contradicts the
+**Decided:** both **per-call** transports enforce it, the constant and marker live on the
+seam (`transport.ts`), and the shared conformance battery asserts it for both — because a
+cap on one implementation makes the transports distinguishable to Pi, which contradicts the
 swappability the epic's driver #2 claims.
+
+**Still not a seam-wide guarantee.** There is a third `SandboxTransport`,
+`persistentExecInPod`, and it remains uncapped; `extension.ts` gives it
+Read/Write/Edit/Ls/Find, so the file-reading tools are exactly the ones running without a
+cap. The battery therefore covers two of three implementations, and Pi can still tell the
+backends apart on output volume. Capping the Read path is a production behaviour change and is tracked
+separately. What *is* closed here is the damaging consequence: because that transport falls
+back to the capped `KubectlTransport` on channel death, a truncated read could reach Pi's
+Edit tool and be written back over the file, so `createPodReadOps.readFile` now throws
+instead of returning bytes it cannot vouch for.
 
 ---
 

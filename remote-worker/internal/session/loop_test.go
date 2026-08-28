@@ -583,9 +583,10 @@ func TestDuplicateInFlightIsCoalesced(t *testing.T) {
 }
 
 // A req_id already IN FLIGHT, redelivered with a DIFFERENT command, is a collision
-// rather than a redelivery: req_id is not unique across harness replicas (spec
-// §3.1), and while the original is incomplete the cache cannot catch it, so the
-// in-flight slot's fingerprint is the only guard. Coalescing it would swallow the
+// rather than a redelivery: req_id is only probabilistically unique across harness
+// replicas — two replicas collide on drawing the same salt (spec §3.1) — and while
+// the original is incomplete the cache cannot catch it, so the in-flight slot's
+// fingerprint is the only guard. Coalescing it would swallow the
 // other replica's command outright — it would never run and never get a frame.
 // Refusing it cannot be a second terminal frame for the same logical exec,
 // precisely because it is a different one.

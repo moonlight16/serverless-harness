@@ -187,7 +187,7 @@ message Hello {
 message Heartbeat {}                   // liveness/keepalive only; harness owns lease counts
 
 message Exec {
-  uint64 req_id    = 1;                // monotonic; correlation + dedup key
+  uint64 req_id    = 1;                // salt+counter, unique across processes; correlation + dedup key
   string command   = 2;
   bytes  stdin     = 3;                // raw bytes (protobuf is binary — no base64)
   uint32 timeout_s = 4;
@@ -336,15 +336,47 @@ The frame *semantics* are carried from the superseded design verbatim — only t
 - **Dual-ended timeout.** The worker kills its local child at `timeout_s`; the harness has
   its own deadline and synthesizes a timeout `error` if no `End` arrives — it never hangs
   on a silent or malicious worker.
-- **Poisoned-output defense.** **Every** `SandboxTransport` enforces a total-output cap per
-  exec — this is a seam-level guarantee, so Pi cannot tell which backend served a flood.
-  `GrpcRelayTransport` issues `Abort`; `KubectlTransport` SIGKILLs its `kubectl exec` child.
-  Both truncate, append `[output truncated]`, and return a null exit code. The shared
-  conformance battery asserts it for both, so neither can regress alone. This is the
-  concrete mitigation for the driver-#1 threat of a malicious sandbox flooding the model's
-  context. `Chunk` size is capped so a single frame stays small (backpressure).
+- **Poisoned-output defense.** Both **per-call** transports enforce a total-output cap per
+  exec: `GrpcRelayTransport` issues `Abort`, `KubectlTransport` SIGKILLs its `kubectl exec`
+  child. Both truncate, append `[output truncated]`, and return a null exit code, and the
+  shared conformance battery asserts all of it — including that the producer was actually
+  stopped — for both, so neither can regress alone. This is the concrete mitigation for the
+  driver-#1 threat of a malicious sandbox flooding the model's context. `Chunk` size is
+  capped so a single frame stays small (backpressure). **Known exception:**
+  `persistentExecInPod` is a third `SandboxTransport` implementation and is **uncapped**.
+  It is not a corner case — `extension.ts` wires it to Read/Write/Edit/Ls/Find, i.e. every
+  file-reading tool — so the cap is a property of two of the three implementations, not of
+  the seam, and Pi genuinely can tell the backends apart on output volume today. Capping it
+  changes production behaviour on the Read path and is tracked separately, not in this epic.
+  One consequence is closed regardless: a dead persistent channel retries the op through the
+  capped `KubectlTransport`, so a read *can* come back truncated, and
+  `createPodReadOps.readFile` therefore throws on a null or non-zero exit code rather than
+  return bytes it cannot vouch for — a truncated read can no longer be written back over the
+  file by Pi's Edit tool.
 - **Abort/end races.** A late `End` for an aborted `req_id` is dropped; an `Abort` for an
   already-ended `req_id` is a no-op.
+
+### Accepted divergences (known, not fixed here)
+
+Both are deliberate: recording them beats leaving them implicit, and changing either is a
+production-behaviour decision outside this epic.
+
+- **No default deadline on the kubectl path.** `KubectlTransport` arms a timer only when
+  `opts.timeout > 0`; `GrpcRelayTransport` always applies `DEFAULT_DEADLINE_MS` (120 s).
+  Pi's bash tool documents no default timeout, so *the same* model-issued `bash` with no
+  timeout runs unbounded on the pod path and dies at 120 s on the remote path — an
+  unbounded pod-side exec on one backend, a surprise 120 s failure on the other. The
+  conformance battery cannot see this: its timeout case always passes an explicit
+  `timeout`.
+- **A capped `bash` flood is killed but reported as success.** `createPodBashOps` returns
+  only `{ exitCode }` — the buffer is discarded — and Pi's bash tool treats
+  `exitCode: null` as non-failing (`exitCode !== 0 && exitCode !== null`). So a `bash`
+  whose stdout crosses the cap is SIGKILLed mid-flight and presented to the model as
+  having completed normally, with no signal that its output was cut short; the cap
+  protects nothing on this path, because the bytes are thrown away and Pi clips
+  model-visible output separately anyway. Fixing it means either changing the spec'd
+  truncation semantics on both transports or adding a `truncated` flag to `ExecInPod`'s
+  return type.
 
 ## 9. Security & reachability
 

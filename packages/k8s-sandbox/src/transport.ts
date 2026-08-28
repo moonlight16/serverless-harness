@@ -2,7 +2,8 @@
  * The exec seam Pi sees (spec §3). Everything above `select-sandbox`
  * (`run-leaf`, `run-turn`, `converge`) depends only on `SandboxTransport` and
  * never learns how bytes reach the sandbox. Implementations: `KubectlTransport`
- * (per-call kubectl exec) and — added in ST3 — `GrpcRelayTransport`.
+ * (per-call kubectl exec), `GrpcRelayTransport` (added in ST3), and
+ * `persistentExecInPod` (one long-lived channel, serving the file tools).
  */
 
 /**
@@ -29,10 +30,19 @@ export interface SandboxTransport {
 }
 
 /**
- * Total returned-stdout cap per exec (spec §8, "poisoned-output defense"). This is a
- * property of the SEAM, not of one transport: Pi must not be able to tell which
- * backend served a flood. The Go worker's BufferCap (remote-worker/internal/exec/
- * runner.go) is pinned to this value — change one and change the other.
+ * Total returned-stdout cap per exec (spec §8, "poisoned-output defense"). Enforced by
+ * both PER-CALL transports — `KubectlTransport` and `GrpcRelayTransport` — each of which
+ * also stops the producer (SIGKILL / `Abort`); test/conformance.ts holds both to that.
+ *
+ * NOT yet a property of the whole seam: `persistentExecInPod` is uncapped, and
+ * extension.ts gives it Read/Write/Edit/Ls/Find, so Pi can still tell the backends apart
+ * on output volume. Capping the Read path is a production behaviour change, tracked
+ * separately (spec §8, "Accepted divergences"). The damaging consequence is closed:
+ * `createPodReadOps.readFile` throws on a truncated read rather than let Pi's Edit tool
+ * write the truncation back over the file.
+ *
+ * The Go worker's BufferCap (remote-worker/internal/exec/runner.go) is pinned to this
+ * value — change one and change the other; test/output-cap-coupling.test.ts enforces it.
  */
 export const DEFAULT_OUTPUT_CAP = 8 * 1024 * 1024; // 8 MiB
 

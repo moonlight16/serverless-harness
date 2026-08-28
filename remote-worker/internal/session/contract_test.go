@@ -347,9 +347,10 @@ func countLines(t *testing.T, path string) int {
 	return strings.Count(string(b), "\n")
 }
 
-// reconnect → dedup must not survive a LARGER timeout_s: req_id is not unique
-// per worker (spec §3.1), so a redelivery of the same id and command with more
-// budget is exactly the cross-replica shape the fingerprint guard exists for. If
+// reconnect → dedup must not survive a LARGER timeout_s: req_id is only
+// probabilistically unique per worker (spec §3.1), so a redelivery of the same id
+// and command with more budget is exactly the cross-replica shape the fingerprint
+// guard exists for. If
 // timeout_s is not part of the fingerprint, delivery 2 below hits delivery 1's
 // cache entry and is failed off it with the STALE "timeout:1" ExecError in well
 // under a millisecond — never running, despite having ten times the budget it

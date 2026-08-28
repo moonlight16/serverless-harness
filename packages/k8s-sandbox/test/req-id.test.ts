@@ -11,8 +11,12 @@ describe("makeReqIdSource", () => {
 
   it("yields disjoint id spaces across sources (the multi-replica property)", () => {
     // Two independently-seeded sources stand in for two harness replicas sharing one
-    // worker. Today both emit 1,2,3... and the relay keys sinks by req_id alone, so a
-    // collision silently swaps one caller's stream for another's (#179).
+    // worker. This is the property that fixed #179: bare per-process counters both
+    // emitted 1,2,3..., and because the relay keys its sinks by req_id alone, the
+    // collision silently swapped one caller's stream for another's. Disjointness here
+    // is probabilistic, not guaranteed — for these TWO sources the flake rate is one
+    // shared salt in 2^21 ≈ 4.8e-7. (The 4.8e-6 quoted in req-id.ts and ADR 0024 is
+    // the five-replica birthday bound C(5,2)/2^21, a different number.)
     const a = makeReqIdSource(), b = makeReqIdSource();
     const setA = new Set(Array.from({ length: 500 }, a));
     const setB = new Set(Array.from({ length: 500 }, b));
