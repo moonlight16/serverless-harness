@@ -227,7 +227,9 @@ WORKER_IMAGE=image-registry.openshift-image-registry.svc:5000/default/remote-wor
 RELAY_LIVE_SMOKE=1 bash deploy/knative/relay-leaf-smoke.sh
 ```
 
-Expect `Results: 6 passed, 0 failed`. Verified on OpenShift 4.20.8 (AWS): all six
+Expect `Results: 8 passed, 0 failed`. Verified 8/8 on kind (twice consecutively) and
+8/8 on OpenShift at `api.rosso1.kubestellar.org`, with the worker image built into
+that cluster's internal registry. Also verified on OpenShift 4.20.8 (AWS): all
 assertions pass, including both fingerprint directions and the post-teardown presence
 check.
 

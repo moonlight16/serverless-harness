@@ -110,7 +110,12 @@ async function spawnSelfManagedWorker(sandboxId: string): Promise<ChildProcess> 
       SANDBOX_TOKEN,
     },
   });
-  await waitForLine(child, /attached, serving execs/, 10_000);
+  try {
+    await waitForLine(child, /attached, serving execs/, 10_000);
+  } catch (err) {
+    child.kill("SIGKILL");
+    throw err;
+  }
   return child;
 }
 
@@ -123,20 +128,26 @@ describe.skipIf(!LIVE)("GrpcRelayTransport against a live relay + worker", () =>
     // ignored — a `sleep 30` that merely ran to completion would also "reject" eventually
     // via the transport's own 120s default deadline, but it would blow past this bound.
     const started = Date.now();
-    await expect(t.exec("sleep 30", { timeout: 2 })).rejects.toThrow("timeout:2");
-    expect(Date.now() - started).toBeLessThan(10_000);
-    await t.close();
+    try {
+      await expect(t.exec("sleep 30", { timeout: 2 })).rejects.toThrow("timeout:2");
+      expect(Date.now() - started).toBeLessThan(10_000);
+    } finally {
+      await t.close();
+    }
   }, 30_000);
 
   it("truncates a real flood at the cap and marks it", async () => {
     const t = makeLiveTransport({ outputCapBytes: 64 * 1024 });
     // yes | head -c is a genuine multi-chunk flood through real 32 KiB Chunk frames,
     // which is the path the hermetic test's scripted frames only imitate.
-    const r = await t.exec("yes AAAAAAAA | head -c 1000000");
-    expect(r.stdout.toString()).toContain(OUTPUT_TRUNCATED_MARKER);
-    // Near the 64 KiB cap, not the full ~1MB the command produced.
-    expect(r.stdout.length).toBeLessThan(200 * 1024);
-    await t.close();
+    try {
+      const r = await t.exec("yes AAAAAAAA | head -c 1000000");
+      expect(r.stdout.toString()).toContain(OUTPUT_TRUNCATED_MARKER);
+      // Near the 64 KiB cap, not the full ~1MB the command produced.
+      expect(r.stdout.length).toBeLessThan(200 * 1024);
+    } finally {
+      await t.close();
+    }
   }, 30_000);
 
   it("fails an in-flight exec when the worker disconnects, rather than hanging", async () => {
