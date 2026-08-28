@@ -57,10 +57,10 @@ runConformance("GrpcRelayTransport", grpcFactory);
 
 function manualClient() {
   let stream!: EventEmitter & { cancel: () => void };
-  // The transport assigns reqId from its own module-scoped counter (shared with
-  // every other exec() call made earlier in this test file, e.g. the
-  // runConformance battery above), so the id it actually uses is whatever that
-  // counter is at, not a literal we can predict. Capture it from the request
+  // The transport draws reqId from a salted per-process source (shared with every
+  // other exec() call made earlier in this test file, e.g. the runConformance
+  // battery above), so the id it actually uses is an unpredictable salt-plus-counter
+  // value, not a literal we can predict. Capture it from the request
   // GrpcRelayTransport hands to exec() so assertions can compare against the
   // real id instead of guessing it.
   let lastReqId: number | undefined;

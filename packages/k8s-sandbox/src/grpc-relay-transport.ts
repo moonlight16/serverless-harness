@@ -1,4 +1,5 @@
 import { DEFAULT_OUTPUT_CAP, OUTPUT_TRUNCATED_MARKER, type SandboxTransport } from "./transport.js";
+import { makeReqIdSource } from "./req-id.js";
 import {
   Stream,
   type AbortRequest,
@@ -19,22 +20,22 @@ export interface ExecClientLike {
   close?(): void;
 }
 
-let reqCounter = 0;
-/** Monotonic request id (correlation + dedup key, spec §8). */
-function nextReqId(): number {
-  reqCounter += 1;
-  return reqCounter;
-}
+/**
+ * One source per process, so every transport instance in this replica draws from the
+ * same salted space. Injectable via opts.reqIdSource for tests.
+ */
+const defaultReqIdSource = makeReqIdSource();
 
 const DEFAULT_DEADLINE_MS = 120_000;
 
 export function GrpcRelayTransport(
   sandboxId: string,
   client: ExecClientLike,
-  opts: { deadlineMs?: number; outputCapBytes?: number } = {},
+  opts: { deadlineMs?: number; outputCapBytes?: number; reqIdSource?: () => number } = {},
 ): SandboxTransport {
   const deadlineMs = opts.deadlineMs ?? DEFAULT_DEADLINE_MS;
   const outputCap = opts.outputCapBytes ?? DEFAULT_OUTPUT_CAP;
+  const nextReqId = opts.reqIdSource ?? defaultReqIdSource;
   let closed = false;
 
   const exec: SandboxTransport["exec"] = (command, execOpts = {}) =>
