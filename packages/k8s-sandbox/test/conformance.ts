@@ -21,6 +21,15 @@ export interface FakeHandle {
   transport: SandboxTransport;
   /** the stdin the transport forwarded to the backend, once exec has run */
   stdinSeen: () => Buffer | undefined;
+  /**
+   * Did the transport stop the PRODUCER for the exec it just ran? The cap is only
+   * a defense if the flood is halted at its source, and each transport halts it
+   * differently (spec §8): KubectlTransport SIGKILLs its `kubectl exec` child,
+   * GrpcRelayTransport sends `Abort` for that exec's `req_id`. Each factory
+   * reduces its own mechanism to this one boolean so the battery can hold both
+   * implementations to the requirement without knowing either wire.
+   */
+  producerStopped: () => boolean;
 }
 
 export type TransportFactory = (
@@ -69,12 +78,19 @@ export function runConformance(label: string, make: TransportFactory): void {
       // Both transports advertise a total-output-per-exec cap (spec §8): the concrete
       // mitigation for a hostile sandbox flooding the model's context. A cap on one
       // transport only is a divergence in the seam, not an implementation detail.
-      const { transport } = make({ stdout: ["aaaa", "bbbb", "cccc"], exitCode: 0 }, { outputCapBytes: 6 });
+      const { transport, producerStopped } = make(
+        { stdout: ["aaaa", "bbbb", "cccc"], exitCode: 0 },
+        { outputCapBytes: 6 },
+      );
       const r = await transport.exec("cat big");
       const s = r.stdout.toString();
       expect(s).toContain(OUTPUT_TRUNCATED_MARKER);
       expect(s).not.toContain("cccc"); // collection stopped at the cap
       expect(r.exitCode).toBeNull(); // the exec was cut short, so there is no real exit code
+      // Dropping bytes on the floor is not the defense — the producer must be stopped,
+      // or a hostile sandbox keeps burning the pod's CPU and the relay's bandwidth
+      // after we have stopped reading (spec §8: Abort / SIGKILL).
+      expect(producerStopped()).toBe(true);
     });
 
     it("rejects with timeout:<n> when the command exceeds the timeout", async () => {
