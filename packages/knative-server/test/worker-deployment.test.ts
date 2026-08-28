@@ -15,6 +15,29 @@ const template = () => parse(readFileSync(resolve(WORKER, "worker-deployment.yam
 const envOf = (dep: any): EnvVar[] => dep.spec.template.spec.containers[0].env;
 const get = (dep: any, name: string) => envOf(dep).find((e) => e.name === name)?.value;
 
+// Loud-throw readers for the memory/BufferCap coupling: a reformatted Go constant or a
+// malformed manifest value must fail the extraction itself, never limp through as NaN.
+const readBufferCapMiB = () => {
+  const runnerGo = readFileSync(resolve(WORKER, "internal/exec/runner.go"), "utf8");
+  const match = /BufferCap = (\d+) \* 1024 \* 1024/.exec(runnerGo);
+  if (!match) throw new Error("could not find `BufferCap = N * 1024 * 1024` in runner.go — constant reformatted?");
+  return Number(match[1]);
+};
+
+const readDefaultConcurrency = () => {
+  const loopGo = readFileSync(resolve(WORKER, "internal/session/loop.go"), "utf8");
+  const match = /DefaultConcurrency = (\d+)/.exec(loopGo);
+  if (!match) throw new Error("could not find `DefaultConcurrency = N` in loop.go — constant reformatted?");
+  return Number(match[1]);
+};
+
+const readLimitMiB = () => {
+  const limit = template().spec.template.spec.containers[0].resources.limits.memory;
+  const match = /^(\d+)Mi$/.exec(limit);
+  if (!match) throw new Error(`resources.limits.memory "${limit}" is not in the expected "<N>Mi" form`);
+  return Number(match[1]);
+};
+
 describe("worker-example.yaml (the third-party copy-and-edit surface)", () => {
   it("is a single-replica Deployment with matching selector and labels", () => {
     const dep = example();
@@ -62,45 +85,39 @@ describe("remote-worker/worker-deployment.yaml (the sed-filled gate template)", 
     }
   });
 
-  it("sets a memory limit that covers the worker's worst-case buffering", () => {
+  it("sets a memory limit that covers the worst-case buffering of whichever concurrency actually runs", () => {
     // runner.go's BufferCap is a PER-STREAM cap on non-streaming execs, and
     // Exec.streaming=false is the proto3 default (relay-supplied), so a buggy relay
     // reaches the worst case with no privilege. Both files carry this arithmetic in a
     // comment and say "change either side and change the other" — this is the check
     // that makes that true (#173 item 7).
-    const runnerGo = readFileSync(resolve(WORKER, "internal/exec/runner.go"), "utf8");
-    const loopGo = readFileSync(resolve(WORKER, "internal/session/loop.go"), "utf8");
-    const bufferCapMatch = /BufferCap = (\d+) \* 1024 \* 1024/.exec(runnerGo);
-    const concurrencyMatch = /DefaultConcurrency = (\d+)/.exec(loopGo);
-    if (!bufferCapMatch) throw new Error("could not find `BufferCap = N * 1024 * 1024` in runner.go — constant reformatted?");
-    if (!concurrencyMatch) throw new Error("could not find `DefaultConcurrency = N` in loop.go — constant reformatted?");
-    const bufferCapMiB = Number(bufferCapMatch[1]);
-    const concurrency = Number(concurrencyMatch[1]);
-    const worstCaseMiB = 2 * concurrency * bufferCapMiB; // stdout + stderr per exec
+    //
+    // Concurrency is whatever actually runs: the manifest's WORKER_MAX_CONCURRENT
+    // override if it sets one (today it does not), otherwise loop.go's
+    // DefaultConcurrency. This keeps the coupling live the moment someone adds the
+    // override, instead of relying on a separate test that only fires once that
+    // env var exists.
+    const bufferCapMiB = readBufferCapMiB();
+    const limitMiB = readLimitMiB();
+    const override = get(template(), "WORKER_MAX_CONCURRENT");
 
-    const limit = template().spec.template.spec.containers[0].resources.limits.memory;
-    const limitMatch = /^(\d+)Mi$/.exec(limit);
-    if (!limitMatch) throw new Error(`resources.limits.memory "${limit}" is not in the expected "<N>Mi" form`);
-    const limitMiB = Number(limitMatch[1]);
+    let concurrency: number;
+    let source: string;
+    if (override === undefined) {
+      concurrency = readDefaultConcurrency();
+      source = `loop.go's DefaultConcurrency (${concurrency})`;
+    } else {
+      if (!/^\d+$/.test(override)) {
+        throw new Error(`WORKER_MAX_CONCURRENT="${override}" is not a plain non-negative integer`);
+      }
+      concurrency = Number(override);
+      source = `the manifest's WORKER_MAX_CONCURRENT override (${concurrency})`;
+    }
+
+    const worstCaseMiB = 2 * concurrency * bufferCapMiB; // stdout + stderr per exec
     expect(
       limitMiB,
-      `limit ${limit} must cover 2 x ${concurrency} x ${bufferCapMiB}MiB = ${worstCaseMiB}MiB of buffering; a smaller limit is an OOMKill the relay can trigger at will`,
+      `limit ${limitMiB}Mi must cover 2 x ${concurrency} x ${bufferCapMiB}MiB = ${worstCaseMiB}MiB of buffering (concurrency from ${source}); a smaller limit is an OOMKill the relay can trigger at will`,
     ).toBeGreaterThanOrEqual(worstCaseMiB);
-  });
-
-  it("does not raise WORKER_MAX_CONCURRENT above what the memory limit funds", () => {
-    // The template does not set it today; if someone adds it, the arithmetic above
-    // silently stops holding, because the Go default is no longer what runs.
-    const override = get(template(), "WORKER_MAX_CONCURRENT");
-    if (override === undefined) return;
-    const runnerGo = readFileSync(resolve(WORKER, "internal/exec/runner.go"), "utf8");
-    const bufferCapMatch = /BufferCap = (\d+) \* 1024 \* 1024/.exec(runnerGo);
-    if (!bufferCapMatch) throw new Error("could not find `BufferCap = N * 1024 * 1024` in runner.go — constant reformatted?");
-    const bufferCapMiB = Number(bufferCapMatch[1]);
-    const limit = template().spec.template.spec.containers[0].resources.limits.memory;
-    const limitMatch = /^(\d+)Mi$/.exec(limit);
-    if (!limitMatch) throw new Error(`resources.limits.memory "${limit}" is not in the expected "<N>Mi" form`);
-    const limitMiB = Number(limitMatch[1]);
-    expect(2 * Number(override) * bufferCapMiB).toBeLessThanOrEqual(limitMiB);
   });
 });
