@@ -173,7 +173,7 @@ Expect `Results: 6 passed, 0 failed`. Verified on OpenShift 4.20.8 (AWS): all si
 assertions pass, including both fingerprint directions and the post-teardown presence
 check.
 
-Three things to know before running it:
+Four things to know before running it:
 
 - **A reachable model credential is required.** Every assertion drives a real leaf,
   so the harness must be able to call the model. If the cluster cannot reach the
@@ -181,13 +181,30 @@ Three things to know before running it:
   [`README-ocp.md`](README-ocp.md#choosing-the-model).
 - **Teardown removes the relay.** Cleanup runs
   `kubectl delete -f relay-deployment.yaml`, so a relay that `setup-ocp.sh` created is
-  deleted with it. Re-apply the manifest (or re-run `setup-ocp.sh`) if you still need
-  one.
+  deleted with it. Recover by re-running `setup-ocp.sh` — do **not** re-apply
+  `relay-deployment.yaml` directly. On OpenShift the relay is a resource of the
+  `overlays/ocp` kustomization, whose `images:` transformer rewrites the pin and whose
+  render pipeline then substitutes `$HARNESS_IMAGE`; applying the raw manifest puts
+  back `image: dev.local/serverless-harness:local`, reproducing the exact
+  `ImagePullBackOff` this override exists to avoid. Rendering the overlay by hand has
+  the same trap in a different form — it emits the `ghcr.io/kagenti/…` path, which
+  currently 403s (see #177) — so it needs the image substituted too:
+
+  ```bash
+  oc kustomize --load-restrictor LoadRestrictionsNone deploy/knative/overlays/ocp \
+    | sed "s#ghcr.io/kagenti/serverless-harness:latest#<pullable-image>#g" \
+    | oc apply -f -
+  ```
 - **The harness env is flipped, then restored.** The script snapshots the ksvc env,
   points the pool selector at a label matching no pods so only the worker can be
   leased, then restores the snapshot exactly. Restore is `trap`-driven on `EXIT`, so
   an interrupted run does not leave the harness stranded with a selector matching
   nothing.
+- **`NS` must stay `default`.** `lib.sh` honors `NS`, but `relay-deployment.yaml`
+  hardcodes `namespace: default` and this script performs no namespace rewrite (unlike
+  `setup-ocp.sh`, which seds both `namespace:` and `redis.default.svc` when the target
+  namespace differs). With `NS=foo` the relay lands in `default` while the rollout wait
+  watches `-n foo`, and the run aborts.
 
 ## The wire contract your worker must satisfy
 

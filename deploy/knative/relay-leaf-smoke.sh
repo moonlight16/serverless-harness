@@ -114,8 +114,8 @@ echo "=== Relay leaf smoke (sandbox=$SANDBOX_ID, model=$MODEL) ==="
 # attempt against a cluster that fails these. ---
 claim "Preflight"
 kubectl cluster-info >/dev/null 2>&1 || abort "cluster unreachable (kubectl cluster-info failed)"
-kubectl get ksvc "$KSVC" -n "$NS" >/dev/null 2>&1 || abort "ksvc/$KSVC not found in namespace $NS (run setup-kind.sh first)"
-kubectl get deploy redis -n "$NS" >/dev/null 2>&1 || abort "deploy/redis not found in namespace $NS (run setup-kind.sh first)"
+kubectl get ksvc "$KSVC" -n "$NS" >/dev/null 2>&1 || abort "ksvc/$KSVC not found in namespace $NS (run setup-kind.sh, or setup-ocp.sh/setup-k8s.sh on a real cluster, first)"
+kubectl get deploy redis -n "$NS" >/dev/null 2>&1 || abort "deploy/redis not found in namespace $NS (run setup-kind.sh, or setup-ocp.sh/setup-k8s.sh on a real cluster, first)"
 
 POOL_SELECTOR="$(kubectl get ksvc "$KSVC" -n "$NS" -o json \
   | jq -r '.spec.template.spec.containers[0].env[]? | select(.name=="KAGENTI_SANDBOX_POOL_SELECTOR") | .value' 2>/dev/null || true)"
@@ -132,7 +132,9 @@ ensure_port_forward >/dev/null || true
 # side), loaded into kind so the cluster can pull it with no registry. ---
 claim "Worker image"
 if [ -n "$WORKER_IMAGE" ]; then
-  echo "using externally provided WORKER_IMAGE=$WORKER_IMAGE (assumed already loaded into kind cluster '$CLUSTER_NAME')"
+  # Do not claim kind here: on a real cluster WORKER_IMAGE is a registry reference the
+  # nodes pull, not an image loaded into a kind node's store.
+  echo "using externally provided WORKER_IMAGE=$WORKER_IMAGE (assumed pullable by the cluster's nodes, or preloaded into kind cluster '$CLUSTER_NAME')"
 else
   NODE_ARCH="$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}' 2>/dev/null || true)"
   [ -n "$NODE_ARCH" ] || abort "could not read kind node architecture (kubectl get nodes)"
@@ -175,9 +177,15 @@ claim "Deploy relay + worker"
 # abort at the rollout below. Unset = kind behavior, unchanged.
 if [ -n "${RELAY_IMAGE:-}" ]; then
   RELAY_RENDERED=$(sed "s#image: dev.local/serverless-harness:local#image: ${RELAY_IMAGE}#" relay-deployment.yaml)
-  # Verify the substitution landed rather than assuming it did: if the manifest's pin is
-  # ever renamed, sed matches nothing and we would silently deploy the kind-local image,
-  # surfacing much later as a confusing ImagePullBackOff.
+  # Verify the substitution rather than assuming it, in both directions -- they catch
+  # different regressions and neither implies the other:
+  #   (a) no kind-local pin survives. Guards a manifest that grows a second image line,
+  #       where the new image could be present while a stale pin still ships.
+  #   (b) the new image is actually present. Guards the pin being renamed, where sed
+  #       matches nothing, (a) is vacuously true, and we would deploy the renamed
+  #       kind-local image -- surfacing later as a confusing ImagePullBackOff.
+  printf '%s' "$RELAY_RENDERED" | grep -qF 'image: dev.local/serverless-harness:local' \
+    && abort "RELAY_IMAGE=$RELAY_IMAGE set, but a kind-local 'image: dev.local/serverless-harness:local' line survived the rewrite"
   printf '%s' "$RELAY_RENDERED" | grep -qF "image: ${RELAY_IMAGE}" \
     || abort "RELAY_IMAGE=$RELAY_IMAGE set, but relay-deployment.yaml has no 'image: dev.local/serverless-harness:local' line to replace"
   printf '%s\n' "$RELAY_RENDERED" | kubectl apply -f - >/dev/null \
