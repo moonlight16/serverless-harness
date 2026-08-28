@@ -19,7 +19,7 @@ describe("makeReqIdSource", () => {
     expect([...setB].some((id) => setA.has(id))).toBe(false);
   });
 
-  it("stays inside Number.MAX_SAFE_INTEGER even at counter exhaustion", () => {
+  it("stays inside Number.MAX_SAFE_INTEGER for sampled ids; exhaustion boundary is checked by static arithmetic", () => {
     // req_id is uint64 on the wire but a JS number after longToNumber, so an id past
     // 2^53-1 would silently lose precision and alias onto another exec.
     const next = makeReqIdSource();

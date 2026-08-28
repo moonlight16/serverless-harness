@@ -25,6 +25,45 @@ We will delegate remote command execution over a single **worker-dialed gRPC bid
 - Negative / accepted cost: a new in-cluster relay component plus a Protobuf/gRPC toolchain; single-replica relay means a restart drops all parked streams and fails in-flight execs (recovery is leaf retry — no mid-exec durability); exactly-once is impossible — at-least-once + dedup only, with partial-write risk on crash.
 - Follow-up owed: untrusted-BYO SPIFFE/mTLS on the same `Attach` endpoint; multi-replica relay HA; private-mesh reachability (Headscale / WireGuard); additional-language workers; HTTP/1.1-only proxy traversal — all additive behind the same seam.
 
+## Revisions
+
+### 2026-08-28 — `req_id` uniqueness (issue #179)
+
+The original decision left `req_id` as "monotonic", which was implemented as a
+module-scope counter — per process. `select-sandbox` shares a sandbox across replicas by
+design (`max-scale: 5`, lease cap 20), and the relay keys per-exec sinks by `req_id`
+within a session, so two replicas emitting `1, 2, 3…` could silently detach one caller
+(it hangs to its deadline) and interleave both execs' output into the other.
+
+**Decided:** ids carry a 21-bit per-process random salt in the high bits and a 32-bit
+counter in the low bits. The maximum reachable id is `(2^21 − 1)·2^32 + (2^32 − 1) =
+9007199254740991`, exactly `Number.MAX_SAFE_INTEGER` — required because the generated
+TypeScript maps `uint64` through `longToNumber`. That is zero headroom, not a margin: the
+layout lands precisely on the boundary, so widening the salt to 22 bits or the counter to
+33 does not consume slack — it immediately crosses into precision loss and silent id
+aliasing, where two different execs collapse onto one number. Uniqueness is probabilistic
+in the salt (birthday collision ≈ 4.8e-6 across five replicas — `C(5,2)/2^21`) and exact in
+the counter.
+
+**Rejected:** widening the generated mapping to `string`/`Long` with a UUID — correct but
+it reopens the `sandbox/v1` contract and the Go worker's cache key for a failure mode the
+salt already closes. Also rejected: caller-scoped correlation at the relay
+(`(callerId, reqId)`), which needs a proto field and leaves the worker's dedup cache still
+keyed on a non-unique id.
+
+**Consequence:** the relay now rejects a duplicate in-flight `req_id` rather than
+overwriting the live sink, converting a silent misroute into a loud error.
+
+### 2026-08-28 — the output cap is a seam guarantee, not a transport detail
+
+§8 always worded the cap as a harness-level property, but only `GrpcRelayTransport`
+implemented it; `KubectlTransport` buffered without bound behind a `TODO(M3)`.
+
+**Decided:** both transports enforce it, the constant and marker live on the seam
+(`transport.ts`), and the shared conformance battery asserts it for both — because a cap
+on one implementation makes the transports distinguishable to Pi, which contradicts the
+swappability the epic's driver #2 claims.
+
 ---
 
 *Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>*

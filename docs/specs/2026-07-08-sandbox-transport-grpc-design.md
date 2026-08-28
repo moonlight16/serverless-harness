@@ -289,9 +289,12 @@ trust-correct). It:
    `SandboxWorker.Attach` over TLS `:443` with `Authorization: Bearer <token>`.
 2. Send `Hello` (id, labels, capabilities, `capacity_max`, `trust`).
 3. Loop on `ServerFrame`:
-   - `Exec` → run `bash -c <command>` locally (feeding `stdin`), stream stdout back as
-     `Chunk`* then `End{exit_code}` when `streaming`; otherwise a single `End` carrying
-     full stdout. Enforce `timeout_s` locally (SIGKILL on expiry).
+   - `Exec` → run `bash -c <command>` locally (feeding `stdin`), streaming stdout back as
+     `Chunk`* then `End{exit_code}`. When `streaming` is false the worker buffers instead of
+     delivering incrementally, but the output still leaves as `Chunk` frames at exit —
+     `End` has no data field, so "one `End` carrying full stdout" is not expressible in
+     `sandbox/v1`, and frames remain `ChunkSize`-capped either way. Enforce `timeout_s`
+     locally (SIGKILL on expiry).
    - `Abort` → SIGKILL the in-flight child for that `req_id`.
 4. Send `Heartbeat` periodically (liveness + NAT/proxy keepalive).
 5. Maintain a bounded `req_id → End` dedup cache; **re-emit the cached result** instead of
@@ -306,23 +309,40 @@ one-in-flight execs.
 The frame *semantics* are carried from the superseded design verbatim — only the encoding
 (protobuf) and transport (gRPC bidi) changed.
 
-- **Correlation & ordering.** Each `exec()` gets a monotonic `req_id`. One exec in flight
-  ⇒ req order == execution order. `req_id` doubles as the idempotency key.
+- **Correlation & ordering.** Each `exec()` gets a `req_id` unique across harness
+  processes, not merely within one: `[21-bit random salt][32-bit counter]`, kept inside
+  `Number.MAX_SAFE_INTEGER` because the generated client maps `uint64` through
+  `longToNumber`. Per-process counters are **not** sufficient — `select-sandbox` shares one
+  sandbox across replicas at a lease cap of 20, and the relay keys its per-exec sinks by
+  `req_id` within a session, so colliding ids detach one caller and interleave both execs'
+  output. The relay rejects a duplicate in-flight `req_id` rather than overwrite a live
+  sink. One exec in flight per `req_id` ⇒ req order == execution order; `req_id` doubles as
+  the idempotency key.
 - **Streaming vs one-shot.** Streaming ops (bash/grep) emit `Chunk`* then `End`; the
   harness replays each `Chunk` into `opts.onData`, matching today's `ExecInPod` contract
-  byte-for-byte. Non-streaming ops (read/write) emit a single `End` with full stdout.
+  byte-for-byte. Non-streaming ops (read/write) differ only in *when* bytes leave: the
+  worker withholds them until exit and then emits `ChunkSize`-capped `Chunk` frames
+  followed by `End`. `streaming: false` means "no incremental delivery", not "exactly one
+  frame" — `End` carries no payload.
 - **At-least-once → dedup.** A reconnect mid-exec can redeliver a command. The worker's
   bounded `req_id → End` cache re-emits the cached terminal result rather than re-running.
-  *Honest limitation:* if the worker died mid-write, exactly-once is impossible — the
-  contract is at-least-once + dedup-by-`req_id`, and partial filesystem effects on crash
-  are possible (same risk class as a leaf re-run today).
+  **A cache hit therefore returns the exit code with no output** — a redelivered streaming
+  `cat file` yields exit 0 and empty stdout, because `End` has nowhere to put the bytes and
+  the `Chunk`s were consumed by the original delivery. This is a known asymmetry with
+  `KubectlTransport`, which keeps no cache and so re-runs and returns output. Callers must
+  not treat a dedup hit as a content read. *Honest limitation:* if the worker died mid-write,
+  exactly-once is impossible — the contract is at-least-once + dedup-by-`req_id`, and partial
+  filesystem effects on crash are possible (same risk class as a leaf re-run today).
 - **Dual-ended timeout.** The worker kills its local child at `timeout_s`; the harness has
   its own deadline and synthesizes a timeout `error` if no `End` arrives — it never hangs
   on a silent or malicious worker.
-- **Poisoned-output defense.** The harness enforces a **total-output cap per exec**; on
-  exceed it issues `Abort`, truncates, and surfaces an `[output truncated]` marker to Pi.
-  This is the concrete mitigation for the driver-#1 threat of a malicious sandbox flooding
-  the model's context. `Chunk` size is capped so a single frame stays small (backpressure).
+- **Poisoned-output defense.** **Every** `SandboxTransport` enforces a total-output cap per
+  exec — this is a seam-level guarantee, so Pi cannot tell which backend served a flood.
+  `GrpcRelayTransport` issues `Abort`; `KubectlTransport` SIGKILLs its `kubectl exec` child.
+  Both truncate, append `[output truncated]`, and return a null exit code. The shared
+  conformance battery asserts it for both, so neither can regress alone. This is the
+  concrete mitigation for the driver-#1 threat of a malicious sandbox flooding the model's
+  context. `Chunk` size is capped so a single frame stays small (backpressure).
 - **Abort/end races.** A late `End` for an aborted `req_id` is dropped; an `Abort` for an
   already-ended `req_id` is a no-op.
 

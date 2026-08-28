@@ -13,11 +13,13 @@ const COUNTER_SPACE = 2 ** 32;
  * observable effect is not an error: one caller's sink is replaced and it hangs to its
  * deadline while the other receives both execs' output interleaved (#179).
  *
- * Layout: [21-bit random salt][32-bit counter]. The exclusive upper bound of the range
- * is 2^21 * 2^32 = 2^53, so the maximum producible id (2^53 - 1) is exactly
- * Number.MAX_SAFE_INTEGER — required because the generated client maps uint64 through
- * longToNumber. Uniqueness is probabilistic in the salt (birthday collision across 5
- * replicas ≈ 6e-6), exact in the counter.
+ * Layout: [21-bit random salt][32-bit counter]. The maximum producible id is
+ * (2^21 - 1) * 2^32 + (2^32 - 1) = 9007199254740991, exactly Number.MAX_SAFE_INTEGER —
+ * required because the generated client maps uint64 through longToNumber. That is zero
+ * headroom, not a margin: widening the salt to 22 bits or the counter to 33 doesn't spend
+ * slack, it immediately overflows into precision loss and silent id aliasing (two execs
+ * collapsing onto one number). Uniqueness is probabilistic in the salt (birthday collision
+ * across 5 replicas ≈ 4.8e-6 = C(5,2)/2^21), exact in the counter.
  */
 export function makeReqIdSource(): () => number {
   const salt = randomInt(0, 2 ** SALT_BITS);
