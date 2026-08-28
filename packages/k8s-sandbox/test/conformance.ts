@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
-import type { SandboxTransport } from "../src/transport.js";
+import { OUTPUT_TRUNCATED_MARKER, type SandboxTransport } from "../src/transport.js";
 
 /**
  * A scripted sandbox backend, transport-agnostic. Each transport's conformance
@@ -23,7 +23,10 @@ export interface FakeHandle {
   stdinSeen: () => Buffer | undefined;
 }
 
-export type TransportFactory = (behavior: FakeBehavior) => FakeHandle;
+export type TransportFactory = (
+  behavior: FakeBehavior,
+  opts?: { outputCapBytes?: number },
+) => FakeHandle;
 
 /**
  * The shared SandboxTransport contract. ST2 runs it against KubectlTransport;
@@ -60,6 +63,18 @@ export function runConformance(label: string, make: TransportFactory): void {
       const { transport } = make({ stdout: [], exitCode: 3 });
       const r = await transport.exec("false");
       expect(r.exitCode).toBe(3);
+    });
+
+    it("caps returned stdout, appends the truncation marker, and stops collecting", async () => {
+      // Both transports advertise a total-output-per-exec cap (spec §8): the concrete
+      // mitigation for a hostile sandbox flooding the model's context. A cap on one
+      // transport only is a divergence in the seam, not an implementation detail.
+      const { transport } = make({ stdout: ["aaaa", "bbbb", "cccc"], exitCode: 0 }, { outputCapBytes: 6 });
+      const r = await transport.exec("cat big");
+      const s = r.stdout.toString();
+      expect(s).toContain(OUTPUT_TRUNCATED_MARKER);
+      expect(s).not.toContain("cccc"); // collection stopped at the cap
+      expect(r.exitCode).toBeNull(); // the exec was cut short, so there is no real exit code
     });
 
     it("rejects with timeout:<n> when the command exceeds the timeout", async () => {

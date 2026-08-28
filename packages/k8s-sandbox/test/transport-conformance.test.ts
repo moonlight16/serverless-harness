@@ -15,7 +15,7 @@ const cfg: K8sSandboxConfig = {
 };
 
 /** Build a KubectlTransport whose child process is a scripted fake. */
-const kubectlFactory: TransportFactory = (b) => {
+const kubectlFactory: TransportFactory = (b, opts) => {
   let stdin: Buffer | undefined;
   const spawn = ((_cmd: string, _args: string[]) => {
     const child = new EventEmitter() as any;
@@ -33,7 +33,8 @@ const kubectlFactory: TransportFactory = (b) => {
     });
     return child;
   }) as unknown as SpawnFn;
-  return { transport: KubectlTransport(cfg, { spawn }), stdinSeen: () => stdin };
+  const transport = KubectlTransport(cfg, { spawn, outputCapBytes: opts?.outputCapBytes });
+  return { transport, stdinSeen: () => stdin };
 };
 
 runConformance("KubectlTransport", kubectlFactory);

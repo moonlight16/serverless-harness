@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { runConformance, type FakeBehavior, type FakeHandle } from "./conformance.js";
+import { runConformance, type FakeBehavior, type TransportFactory } from "./conformance.js";
 import {
   GrpcRelayTransport,
   type ExecClientLike,
@@ -47,9 +47,10 @@ function fakeClient(behavior: FakeBehavior): {
   return { client, stdinSeen: () => stdin, aborted: () => aborted };
 }
 
-const grpcFactory = (behavior: FakeBehavior): FakeHandle => {
+const grpcFactory: TransportFactory = (behavior, opts) => {
   const { client, stdinSeen } = fakeClient(behavior);
-  return { transport: GrpcRelayTransport("sbx-1", client), stdinSeen };
+  const transport = GrpcRelayTransport("sbx-1", client, { outputCapBytes: opts?.outputCapBytes });
+  return { transport, stdinSeen };
 };
 
 runConformance("GrpcRelayTransport", grpcFactory);
@@ -95,17 +96,6 @@ describe("GrpcRelayTransport extra semantics", () => {
     expect(r.stdout.toString()).toBe("hi");
     // A duplicate terminal frame after settlement must not throw or change the result.
     expect(() => emit({ end: { reqId: 1, exitCode: 9 } } as ExecEvent)).not.toThrow();
-  });
-
-  it("output cap: aborts, truncates, appends [output truncated]", async () => {
-    const { client, emit, aborted, reqId } = manualClient();
-    const t = GrpcRelayTransport("sbx-1", client as never, { outputCapBytes: 4 });
-    const p = t.exec("cat big");
-    emit({ chunk: { reqId: reqId()!, data: Buffer.from("12345"), stream: Stream.STREAM_STDOUT } } as ExecEvent);
-    const r = await p;
-    expect(r.stdout.toString()).toContain("[output truncated]");
-    expect(r.exitCode).toBeNull();
-    expect(aborted()).toContain(reqId());
   });
 
   it("harness deadline fires independently of worker timeout_s", async () => {

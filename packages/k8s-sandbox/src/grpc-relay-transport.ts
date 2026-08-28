@@ -1,4 +1,4 @@
-import type { SandboxTransport } from "./transport.js";
+import { DEFAULT_OUTPUT_CAP, OUTPUT_TRUNCATED_MARKER, type SandboxTransport } from "./transport.js";
 import {
   Stream,
   type AbortRequest,
@@ -27,7 +27,6 @@ function nextReqId(): number {
 }
 
 const DEFAULT_DEADLINE_MS = 120_000;
-const DEFAULT_OUTPUT_CAP = 8 * 1024 * 1024; // 8 MiB per exec
 
 export function GrpcRelayTransport(
   sandboxId: string,
@@ -92,7 +91,7 @@ export function GrpcRelayTransport(
               bytes += data.length;
               if (bytes > outputCap) {
                 truncated = true;
-                stdout.push(Buffer.from("\n[output truncated]"));
+                stdout.push(Buffer.from(OUTPUT_TRUNCATED_MARKER));
                 call.cancel();
                 client.abort({ sandboxId, reqId }, () => {});
                 finish(() => resolve({ stdout: Buffer.concat(stdout), exitCode: null }));
