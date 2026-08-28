@@ -182,6 +182,22 @@ remote-sandbox path on the harness, and deploy the worker pod — see
 [`README-worker.md`](README-worker.md). A ready-to-edit worker Deployment is in
 [`worker-example.yaml`](worker-example.yaml).
 
+To prove the remote path actually served the work — rather than an idle sandbox pod
+winning the lease — run the live gate. On OpenShift it needs the harness Route plus
+two pullable images, since its defaults assume kind:
+
+```bash
+KSVC_URL=$(oc get ksvc serverless-harness -n default -o jsonpath='{.status.url}') \
+RELAY_IMAGE=<registry>/serverless-harness:latest \
+WORKER_IMAGE=image-registry.openshift-image-registry.svc:5000/default/remote-worker:latest \
+RELAY_LIVE_SMOKE=1 bash deploy/knative/relay-leaf-smoke.sh
+# => Results: 6 passed, 0 failed
+```
+
+Its teardown deletes the relay this script installed. See
+[README-worker.md](README-worker.md#running-the-live-gate-on-a-real-cluster) for what
+each assertion proves and the full list of caveats.
+
 ## Enabling KEDA (async leaf)
 
 Base bring-up skips KEDA. To install the Red Hat **Custom Metrics Autoscaler

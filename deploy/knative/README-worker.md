@@ -130,6 +130,65 @@ grpcurl -plaintext -proto proto/sandbox/v1/sandbox.proto \
 work lands a leaf on the sandbox; the leaf executes through your worker. See the
 smoke test in [`README-ocp.md`](README-ocp.md#smoke-test).
 
+## Running the live gate on a real cluster
+
+[`relay-leaf-smoke.sh`](relay-leaf-smoke.sh) automates the verification above: it
+deploys a relay + reference worker, drives real leaves, and asserts the work ran on
+the worker rather than on an in-cluster sandbox pod. It settles the ambiguity noted
+at the top of this page — a green leaf alone does not tell you which backend served
+it, because `select-sandbox.ts` leases least-loaded-first and an idle pod can win.
+
+It discriminates by OS fingerprint: sandbox pods run Alpine, the reference worker
+image runs RHEL. A leaf grepping `/etc/os-release` for `Alpine` is CLEAR on the
+worker and FLAGGED on a pod; for `Red Hat` it is the reverse. Both directions are
+asserted, and the discriminator itself is verified before being relied on, so a leaf
+that quietly landed on a pod is caught either way.
+
+On **kind** (after `setup-kind.sh`) the defaults are correct:
+
+```bash
+RELAY_LIVE_SMOKE=1 bash deploy/knative/relay-leaf-smoke.sh
+```
+
+On a **real cluster** the script's kind assumptions do not hold — the harness is
+reached through a Route rather than a `kourier` port-forward, and images must come
+from a registry the cluster can pull rather than a kind node's image store. Set three
+overrides:
+
+| Variable | Why |
+|----------|-----|
+| `KSVC_URL` | The harness Route. `lib.sh` then targets it directly, drops the `Host` header, and adds `curl -k` for the router's cert. |
+| `RELAY_IMAGE` | `relay-deployment.yaml` pins `dev.local/serverless-harness:local`, which exists only in kind. Without this the apply **replaces a working relay with an unpullable one** and aborts at the rollout. |
+| `WORKER_IMAGE` | A pre-published worker image; skips the `kind load` path. Build one with [`build-image.sh`](../../remote-worker/build-image.sh), which packages a `linux/amd64` binary into the OpenShift internal registry. |
+
+```bash
+export KUBECONFIG=/path/to/kubeconfig
+KSVC_URL=https://serverless-harness-default.apps.<domain> \
+RELAY_IMAGE=<registry>/serverless-harness:latest \
+WORKER_IMAGE=image-registry.openshift-image-registry.svc:5000/default/remote-worker:latest \
+RELAY_LIVE_SMOKE=1 bash deploy/knative/relay-leaf-smoke.sh
+```
+
+Expect `Results: 6 passed, 0 failed`. Verified on OpenShift 4.20.8 (AWS): all six
+assertions pass, including both fingerprint directions and the post-teardown presence
+check.
+
+Three things to know before running it:
+
+- **A reachable model credential is required.** Every assertion drives a real leaf,
+  so the harness must be able to call the model. If the cluster cannot reach the
+  endpoint baked into `llm-credentials`, the leaves time out — see
+  [`README-ocp.md`](README-ocp.md#choosing-the-model).
+- **Teardown removes the relay.** Cleanup runs
+  `kubectl delete -f relay-deployment.yaml`, so a relay that `setup-ocp.sh` created is
+  deleted with it. Re-apply the manifest (or re-run `setup-ocp.sh`) if you still need
+  one.
+- **The harness env is flipped, then restored.** The script snapshots the ksvc env,
+  points the pool selector at a label matching no pods so only the worker can be
+  leased, then restores the snapshot exactly. Restore is `trap`-driven on `EXIT`, so
+  an interrupted run does not leave the harness stranded with a selector matching
+  nothing.
+
 ## The wire contract your worker must satisfy
 
 From `proto/sandbox/v1/sandbox.proto` (§8) and what the harness-side

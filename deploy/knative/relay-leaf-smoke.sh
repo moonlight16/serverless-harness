@@ -29,6 +29,11 @@
 #   pre-loaded WORKER_IMAGE); llm-credentials secret populated (model reachable).
 # Usage: RELAY_LIVE_SMOKE=1 bash deploy/knative/relay-leaf-smoke.sh
 #        WORKER_IMAGE=dev.local/remote-worker:preloaded RELAY_LIVE_SMOKE=1 bash deploy/knative/relay-leaf-smoke.sh
+#
+# On a real cluster (e.g. OpenShift) the kind assumptions above do not hold; set all
+# three of KSVC_URL (the harness Route; lib.sh then targets it directly), RELAY_IMAGE
+# (a relay image the cluster can pull), and WORKER_IMAGE (skips the kind-load path).
+# See deploy/knative/README-worker.md "Running the live gate on a real cluster".
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./lib.sh   # NS, KSVC, BASE, HOST_HEADER, CURL_OPTS, CURL_HDR, ok/ko, PASS/FAIL,
@@ -163,7 +168,23 @@ fi
 
 # --- Deploy relay + worker, wait for both rollouts. ---
 claim "Deploy relay + worker"
-kubectl apply -f relay-deployment.yaml >/dev/null || abort "kubectl apply relay-deployment.yaml failed"
+# RELAY_IMAGE overrides the manifest's kind-local image (dev.local/...:local), which
+# exists only in a kind node's image store. Required on any real cluster (e.g. OpenShift),
+# where the relay must be pulled from a registry the cluster can reach -- applying the
+# manifest unmodified there would replace a working relay with an unpullable one and
+# abort at the rollout below. Unset = kind behavior, unchanged.
+if [ -n "${RELAY_IMAGE:-}" ]; then
+  RELAY_RENDERED=$(sed "s#image: dev.local/serverless-harness:local#image: ${RELAY_IMAGE}#" relay-deployment.yaml)
+  # Verify the substitution landed rather than assuming it did: if the manifest's pin is
+  # ever renamed, sed matches nothing and we would silently deploy the kind-local image,
+  # surfacing much later as a confusing ImagePullBackOff.
+  printf '%s' "$RELAY_RENDERED" | grep -qF "image: ${RELAY_IMAGE}" \
+    || abort "RELAY_IMAGE=$RELAY_IMAGE set, but relay-deployment.yaml has no 'image: dev.local/serverless-harness:local' line to replace"
+  printf '%s\n' "$RELAY_RENDERED" | kubectl apply -f - >/dev/null \
+    || abort "kubectl apply relay-deployment.yaml (RELAY_IMAGE=$RELAY_IMAGE) failed"
+else
+  kubectl apply -f relay-deployment.yaml >/dev/null || abort "kubectl apply relay-deployment.yaml failed"
+fi
 kubectl -n "$NS" rollout status deploy/sandbox-relay --timeout=90s >/dev/null \
   || abort "sandbox-relay rollout did not become ready"
 
