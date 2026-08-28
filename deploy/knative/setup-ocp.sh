@@ -31,6 +31,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OVERLAY_DIR="$SCRIPT_DIR/overlays/ocp"
 AB_OVERLAY_DIR="$SCRIPT_DIR/overlays/ocp-authbridge"  # only rendered/applied when SH_AUTHBRIDGE=1
+ASYNC_OVERLAY_DIR="$SCRIPT_DIR/overlays/ocp-async"    # only rendered/applied when --with-keda (async leaf ScaledJob)
 
 # ----------------------------------------------------------------------------
 # Defaults (all overridable via flags)
@@ -448,6 +449,57 @@ else
   render_overlay | $KUBECTL apply -f - >"$LOG_DIR/overlay-apply.log" 2>&1 \
     && log_success "Overlay applied (log: $LOG_DIR/overlay-apply.log)" \
     || { log_error "Overlay apply failed — see $LOG_DIR/overlay-apply.log"; cat "$LOG_DIR/overlay-apply.log"; exit 1; }
+fi
+
+# ----------------------------------------------------------------------------
+# 6a. Async leaf ScaledJob (--with-keda). Applied after the base overlay so the
+# serverless-harness SA + Role/RoleBinding (from service.yaml) the worker Jobs
+# reuse already exist, and after Section 2 installed the scaledjobs.keda.sh CRD.
+# render_overlay_dir rewrites dev.local -> $HARNESS_IMAGE (no raw dev.local pull).
+# ----------------------------------------------------------------------------
+if [ "$SKIP_KEDA" = false ]; then
+  if $DRY_RUN; then
+    echo "  [dry-run] render_overlay_dir \"$ASYNC_OVERLAY_DIR\" | $KUBECTL apply -f -   (manifest preview:)"
+    render_overlay_dir "$ASYNC_OVERLAY_DIR" | sed 's/^/    /'
+  else
+    render_overlay_dir "$ASYNC_OVERLAY_DIR" | $KUBECTL apply -f - >"$LOG_DIR/async-overlay-apply.log" 2>&1 \
+      && log_success "Async leaf ScaledJob applied (log: $LOG_DIR/async-overlay-apply.log)" \
+      || { log_error "Async ScaledJob apply failed — see $LOG_DIR/async-overlay-apply.log"; cat "$LOG_DIR/async-overlay-apply.log"; exit 1; }
+
+    # Readiness self-check: assert every part of the async scale-up path is present and
+    # wired before declaring success. Cheap + LLM-free — guards the exact config-drift
+    # bugs this path is prone to (unpullable dev.local image, sandbox-0 pin, wrong queue
+    # names, missing pool pods). Behavioral proof lives in leaf-async-smoke.sh.
+    log_info "Verifying async scale-up readiness..."
+    vfail=0
+    sj() { $KUBECTL -n "$NAMESPACE" get scaledjob leaf-worker -o jsonpath="$1" 2>/dev/null; }
+    # 1. ScaledJob exists + reaches Ready=True (KEDA validates the trigger spec).
+    ready=""; for _ in $(seq 1 15); do ready="$(sj '{.status.conditions[?(@.type=="Ready")].status}')"; [ "$ready" = "True" ] && break; sleep 2; done
+    [ "$ready" = "True" ] && log_success "  ScaledJob leaf-worker Ready" || { log_error "  ScaledJob leaf-worker not Ready (status=${ready:-<none>})"; vfail=$((vfail+1)); }
+    # 2. Worker image resolved to a real registry (not the unpullable dev.local placeholder).
+    img="$(sj '{.spec.jobTargetRef.template.spec.containers[0].image}')"
+    case "$img" in dev.local/*|"") log_error "  worker image unresolved: '${img:-<empty>}'"; vfail=$((vfail+1)) ;; *) log_success "  worker image: $img" ;; esac
+    # 3. Pool-lease env present; stale single-pod pin absent.
+    psel="$(sj '{.spec.jobTargetRef.template.spec.containers[0].env[?(@.name=="KAGENTI_SANDBOX_POOL_SELECTOR")].value}')"
+    pcap="$(sj '{.spec.jobTargetRef.template.spec.containers[0].env[?(@.name=="KAGENTI_SANDBOX_CAP")].value}')"
+    pname="$(sj '{.spec.jobTargetRef.template.spec.containers[0].env[?(@.name=="KAGENTI_SANDBOX_NAME")].value}')"
+    { [ -n "$psel" ] && [ -n "$pcap" ] && [ -z "$pname" ]; } \
+      && log_success "  pool leasing configured (selector=$psel cap=$pcap, no sandbox pin)" \
+      || { log_error "  pool env wrong (selector='$psel' cap='$pcap' name='$pname')"; vfail=$((vfail+1)); }
+    # 4. KEDA triggers point at the leaf work-queue + consumer group.
+    streams="$(sj '{.spec.triggers[*].metadata.stream}')"; groups="$(sj '{.spec.triggers[*].metadata.consumerGroup}')"
+    { echo "$streams" | grep -q 'leaf-queue' && echo "$groups" | grep -q 'leaf-workers'; } \
+      && log_success "  triggers wired (stream=leaf-queue group=leaf-workers)" \
+      || { log_error "  triggers not wired (streams='$streams' groups='$groups')"; vfail=$((vfail+1)); }
+    # 5. At least one Running pool pod matches the selector (else every lease throws "no Running pods").
+    npods="$($KUBECTL -n "$NAMESPACE" get pods -l "$psel" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+    [ "${npods:-0}" -ge 1 ] && log_success "  $npods Running pool pod(s) match '$psel'" || { log_error "  no Running pods match '$psel'"; vfail=$((vfail+1)); }
+    # 6. Redis (work-queue backend) reachable.
+    $KUBECTL -n "$NAMESPACE" get pods -l app=redis --field-selector=status.phase=Running --no-headers 2>/dev/null | grep -q . \
+      && log_success "  redis Running" || { log_error "  no Running redis pod"; vfail=$((vfail+1)); }
+    if [ "$vfail" -gt 0 ]; then log_error "Async scale-up readiness FAILED ($vfail check(s)); see above."; exit 1; fi
+    log_success "Async scale-up readiness verified — all parts in place (run leaf-async-smoke.sh for the behavioral proof)"
+  fi
 fi
 
 # ============================================================================

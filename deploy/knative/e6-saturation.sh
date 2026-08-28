@@ -23,6 +23,15 @@ source ./lib.sh
 # Restore ksvc env + scale on ANY exit; installed AFTER the gate so a SKIP run never touches the cluster.
 trap 'restore_ksvc_env' EXIT
 
+# E6 REQUIRES the sync /runs path — do NOT default it to async. The knee methodology
+# depends on (a) per-leaf [exec-timing] deltas aggregated from the HARNESS pods' logs,
+# (b) set_scale-driven offered concurrency, and (c) an un-capped per-pod lease
+# (KAGENTI_SANDBOX_CAP=1000 via set_ksvc_env). The async/KEDA path runs each leaf in a
+# worker Job — exec-timing never lands in the harness pods (execCount=0) and sandbox
+# concurrency is gated by the ScaledJob's CAP/maxReplicaCount — which would silently
+# cap the knee. Async is exercised by e1-benefit.sh + the general drivers, not here.
+: "${SH_LEAF_ASYNC:=0}"; export SH_LEAF_ASYNC
+
 SAMPLES="${E6_SAMPLES:-3}"
 LADDER="${E6_LADDER:-1 2 4 8 16}"
 DEGRADE_X="${E6_DEGRADE_X:-2}"

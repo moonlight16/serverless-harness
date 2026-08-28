@@ -153,6 +153,20 @@ wait_gitd() {
 dispatch_converge() {
   local sid="$1" id="$2" file="$3" pat="$4" ref="$5" model="${6:-${SH_MODEL:-claude-haiku-4-5}}"
   local body
+  if [ "${SH_LEAF_ASYNC:-0}" = 1 ]; then
+    # Async/KEDA path: enqueue with async:true (harness returns 202 immediately),
+    # then recover the terminal record from Redis via polling. Leaf execution is
+    # done by KEDA-scaled worker Jobs, so the harness never holds a long connection
+    # and no pre-scale is needed (set_scale is a no-op below).
+    body=$(jq -nc --arg s "$sid" --arg id "$id" --arg f "$file" --arg p "$pat" \
+      --arg u "$(gitd_repo_url)" --arg r "$ref" --arg m "$model" \
+      '{sessionId:$s, item:{item_id:$id, file:$f, pattern:$p}, repoUrl:$u, ref:$r, model:$m, async:true}')
+    # shellcheck disable=SC2086  # CURL_OPTS is intentionally word-split
+    curl -s $CURL_OPTS --max-time 30 ${CURL_HDR[@]+"${CURL_HDR[@]}"} \
+      -H "Content-Type: application/json" -d "$body" "$BASE/runs" >/dev/null 2>&1 || true
+    poll_leaf_result "$sid"
+    return
+  fi
   body=$(jq -nc --arg s "$sid" --arg id "$id" --arg f "$file" --arg p "$pat" \
     --arg u "$(gitd_repo_url)" --arg r "$ref" --arg m "$model" \
     '{sessionId:$s, item:{item_id:$id, file:$f, pattern:$p}, repoUrl:$u, ref:$r, model:$m}')
@@ -189,6 +203,16 @@ poll_leaf_result() {
 # Usage: dispatch_solve <sessionId> <postJson> [model]
 dispatch_solve() {
   local sid="$1" post="$2" model="${3:-${SH_MODEL:-claude-haiku-4-5}}" body resp st
+  if [ "${SH_LEAF_ASYNC:-0}" = 1 ]; then
+    # Async/KEDA path: enqueue (202) then recover the persisted result from Redis.
+    # KEDA-scaled workers run the solve; no long-held connection, no pre-scale.
+    body=$(jq -c --arg s "$sid" --arg m "$model" '. + {sessionId:$s, model:$m, async:true}' <<<"$post")
+    # shellcheck disable=SC2086  # CURL_OPTS is intentionally word-split
+    curl -s $CURL_OPTS --max-time 30 ${CURL_HDR[@]+"${CURL_HDR[@]}"} \
+      -H "Content-Type: application/json" -d "$body" "$BASE/runs" >/dev/null 2>&1 || true
+    poll_leaf_result "$sid"
+    return
+  fi
   body=$(jq -c --arg s "$sid" --arg m "$model" '. + {sessionId:$s, model:$m}' <<<"$post")
   # shellcheck disable=SC2086  # CURL_OPTS is intentionally word-split
   resp=$(curl -s $CURL_OPTS --max-time 900 ${CURL_HDR[@]+"${CURL_HDR[@]}"} \
@@ -332,9 +356,36 @@ median() {
 # Patch the ksvc min/max-scale annotations (a merge patch is safe for the annotations map) and wait
 # Ready. Usage: set_scale <min> <max>
 set_scale() {
+  if [ "${SH_LEAF_ASYNC:-0}" = 1 ]; then
+    # Async/KEDA path: the harness is a thin 202 acceptor and leaf concurrency is
+    # driven by KEDA-scaled worker Jobs on the leaf-queue backlog, not by Knative
+    # harness pods. Pre-scaling the ksvc is therefore a no-op — this retires the
+    # manual pre-scale hack the sync path needed to dodge the 1-pod serialization.
+    return 0
+  fi
   kubectl patch ksvc "$KSVC" -n "$NS" --type=merge -p \
     "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"autoscaling.knative.dev/min-scale\":\"$1\",\"autoscaling.knative.dev/max-scale\":\"$2\"}}}}}" >/dev/null
   wait_ksvc_ready
+}
+
+# Upsert env vars on the leaf-worker ScaledJob's container (async/KEDA path). In
+# async mode the leaf runs in a KEDA-spawned worker Job, so per-arm settings like
+# KAGENTI_SANDBOX_CAP / _POOL_SELECTOR must live on the ScaledJob, not the ksvc.
+# KEDA spawns fresh Jobs from the current spec, so new Jobs pick this up immediately.
+# Reads the current env, upserts each KEY=VAL (preserving secretKeyRef entries like
+# ANTHROPIC_*), and replaces the env array via a JSON patch. Usage: set_worker_env K=V...
+set_worker_env() {
+  local envjson kv k v
+  envjson=$(kubectl get scaledjob leaf-worker -n "$NS" -o json \
+    | jq -c '.spec.jobTargetRef.template.spec.containers[0].env')
+  for kv in "$@"; do
+    k="${kv%%=*}"; v="${kv#*=}"
+    envjson=$(jq -c --arg k "$k" --arg v "$v" \
+      'if any(.[]; .name==$k) then map(if .name==$k then {name:$k,value:$v} else . end)
+       else . + [{name:$k,value:$v}] end' <<<"$envjson")
+  done
+  kubectl patch scaledjob leaf-worker -n "$NS" --type=json \
+    -p "[{\"op\":\"replace\",\"path\":\"/spec/jobTargetRef/template/spec/containers/0/env\",\"value\":$envjson}]" >/dev/null
 }
 
 # List Running pool pod names (one per line). Pool selector defaults to the P2 label.
