@@ -230,14 +230,23 @@ kubectl -n "$NS" rollout status deploy/"$WORKER_DEPLOY" --timeout=90s >/dev/null
   || abort "$WORKER_DEPLOY rollout did not become ready"
 echo "relay + worker ($SANDBOX_ID) up"
 
-# --- Assert presence: the worker's live Attach stream IS the registration. ---
+# --- Assert presence: the worker's live Attach stream IS the registration. Registration
+# happens asynchronously after the Deployment rollout completes (the worker Deployment has
+# no readinessProbe -- its readiness *is* the Attach stream reaching the relay, which is not
+# something an HTTP/TCP probe could observe -- so `rollout status` returning only means the
+# pod is Running, not that it has registered yet). Poll with the same bounded wait used below
+# for the disconnect assertion instead of a single racy check. ---
 claim "Assert: worker registered in Redis presence (sh:sandbox:records, transport=grpc)"
-PRESENCE="$(kubectl exec deploy/redis -n "$NS" -- redis-cli HGETALL sh:sandbox:records 2>/dev/null || true)"
-if echo "$PRESENCE" | grep -qF "$SANDBOX_ID" && echo "$PRESENCE" | grep -q '"transport":"grpc"'; then
-  ok "worker $SANDBOX_ID present in sh:sandbox:records with transport=grpc"
-else
-  ko "worker $SANDBOX_ID not found (or wrong transport) in sh:sandbox:records; presence dump: $(echo "$PRESENCE" | head -c 300)"
-fi
+presence_seen=0
+for _i in $(seq 1 20); do
+  PRESENCE="$(kubectl exec deploy/redis -n "$NS" -- redis-cli HGETALL sh:sandbox:records 2>/dev/null || true)"
+  if echo "$PRESENCE" | grep -qF "$SANDBOX_ID" && echo "$PRESENCE" | grep -q '"transport":"grpc"'; then
+    presence_seen=1; break
+  fi
+  sleep 2
+done
+[ "$presence_seen" = 1 ] && ok "worker $SANDBOX_ID present in sh:sandbox:records with transport=grpc" \
+  || ko "worker $SANDBOX_ID not found (or wrong transport) in sh:sandbox:records; presence dump: $(echo "$PRESENCE" | head -c 300)"
 
 # --- Validate the discriminator BEFORE relying on it. Abort (not just ko) if it doesn't
 # hold -- every assertion below would be meaningless against a broken discriminator. ---
