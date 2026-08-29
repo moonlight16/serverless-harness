@@ -358,8 +358,8 @@ The frame *semantics* are carried from the superseded design verbatim — only t
 
 ### Accepted divergences (known, not fixed here)
 
-Both are deliberate: recording them beats leaving them implicit, and changing either is a
-production-behaviour decision outside this epic.
+All three are deliberate: recording them beats leaving them implicit, and changing any of
+them is a production-behaviour decision outside this epic.
 
 - **No default deadline on the kubectl path.** `KubectlTransport` arms a timer only when
   `opts.timeout > 0`; `GrpcRelayTransport` always applies `DEFAULT_DEADLINE_MS` (120 s).
@@ -377,6 +377,18 @@ production-behaviour decision outside this epic.
   model-visible output separately anyway. Fixing it means either changing the spec'd
   truncation semantics on both transports or adding a `truncated` flag to `ExecInPod`'s
   return type.
+- **The output cap's *enforcement* is not equivalent across transports**, despite the
+  "producer was actually stopped" claim in the Poisoned-output-defense bullet above.
+  On a truncation, `GrpcRelayTransport` sends `Abort`, which the worker honours by killing
+  the *remote* process that is actually producing the flood. `KubectlTransport` kills only
+  the local `kubectl exec` client; the in-pod process is then stopped, if at all, by EPIPE
+  on its next write — which a hostile producer that traps or ignores SIGPIPE can survive
+  indefinitely, contrary to the threat model this cap exists for (conformance.ts's own
+  wording: a producer that "keeps burning the pod's CPU"). The conformance battery cannot
+  tell the two apart because each factory collapses its stop mechanism into a single
+  `producerStopped()` boolean: the pod path passes on "we called kill", the gRPC path
+  passes on "the producer was actually told to stop", and the shared spec has no way to
+  distinguish those two claims.
 
 ## 9. Security & reachability
 

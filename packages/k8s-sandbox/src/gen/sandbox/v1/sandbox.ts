@@ -127,7 +127,7 @@ export interface Heartbeat {
 }
 
 export interface Exec {
-  /** salt+counter, unique across processes; correlation + dedup key */
+  /** salt+counter, unique per process, probabilistically across them; correlation + dedup key */
   reqId: number;
   command: string;
   /** raw bytes (protobuf is binary — no base64) */

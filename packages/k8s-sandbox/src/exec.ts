@@ -65,7 +65,12 @@ export function KubectlTransport(
         if (bytes > outputCap) {
           truncated = true;
           out.push(Buffer.from(OUTPUT_TRUNCATED_MARKER));
-          child.kill("SIGKILL"); // stop the flood at the source, like the gRPC Abort
+          // Not parity with the gRPC Abort: that kills the *remote* worker process.
+          // This only kills the local kubectl client; the in-pod process is stopped
+          // (if at all) by EPIPE on its next write to the now-closed stream — fine for
+          // cat/grep, but a hostile producer that traps or ignores SIGPIPE keeps
+          // running in the pod after this returns (spec §8 "Accepted divergences").
+          child.kill("SIGKILL");
         }
       });
       child.stderr.on("data", (d: Buffer) => {
