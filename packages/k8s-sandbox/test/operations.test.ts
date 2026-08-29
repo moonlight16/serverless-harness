@@ -165,7 +165,8 @@ describe("find ops", () => {
     expect(results).toEqual(["src/a.ts", "b.ts"]);
     expect(calls[0].command).toBe(
       "cd '/workspace' && rg --files --hidden -g '*.ts' " +
-        "-g '!**/node_modules/**' -g '!**/.git/**' | head -n 100",
+        "-g '!**/node_modules/**' -g '!**/.git/**' | head -n 100; " +
+        'rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || [ "$rc" = 141 ] || exit "$rc"',
     );
   });
 
@@ -173,7 +174,18 @@ describe("find ops", () => {
     const { fn, calls } = fakeExec({ stdout: "" });
     const ops = createPodFindOps(fn, cfg);
     await ops.glob("*.go", "/head", { ignore: [], limit: 50 });
-    expect(calls[0].command).toBe("cd '/workspace' && rg --files --hidden -g '*.go' | head -n 50");
+    expect(calls[0].command).toBe(
+      "cd '/workspace' && rg --files --hidden -g '*.go' | head -n 50; " +
+        'rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || [ "$rc" = 141 ] || exit "$rc"',
+    );
+  });
+
+  it("rejects a ripgrep failure instead of returning an empty result", async () => {
+    const { fn } = fakeExec({ exitCode: 2 });
+    const ops = createPodFindOps(fn, cfg);
+    await expect(ops.glob("[", "/head", { ignore: [], limit: 50 })).rejects.toThrow(
+      "glob failed in pod",
+    );
   });
 
   it("glob refuses a truncated listing instead of returning a partial list with the marker as a path", async () => {
