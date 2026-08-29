@@ -176,6 +176,26 @@ describe("find ops", () => {
     expect(calls[0].command).toBe("cd '/workspace' && rg --files --hidden -g '*.go' | head -n 50");
   });
 
+  it("glob refuses a truncated listing instead of returning a partial list with the marker as a path", async () => {
+    // Same class as the readFile fix above: exitCode null means the output cap tripped
+    // (or rg was signalled) mid-list, so what came back is not a trustworthy file list —
+    // it may even contain OUTPUT_TRUNCATED_MARKER as a bogus "path" entry.
+    const { fn } = fakeExec({
+      stdout: "src/a.ts\nb.ts\n" + OUTPUT_TRUNCATED_MARKER,
+      exitCode: null,
+    });
+    const ops = createPodFindOps(fn, cfg);
+    await expect(ops.glob("*.ts", "/head", { ignore: [], limit: 5 })).rejects.toThrow(
+      /glob (failed|truncated) in pod/,
+    );
+  });
+
+  it("glob rejects when rg itself fails (e.g. a bad pattern) instead of returning an empty list", async () => {
+    const { fn } = fakeExec({ stdout: "", exitCode: 2 });
+    const ops = createPodFindOps(fn, cfg);
+    await expect(ops.glob("[", "/head", { ignore: [], limit: 100 })).rejects.toThrow(/glob failed in pod/);
+  });
+
   it("exists uses test -e on the mapped path", async () => {
     const { fn, calls } = fakeExec({ exitCode: 0 });
     expect(await createPodFindOps(fn, cfg).exists("/head/x")).toBe(true);

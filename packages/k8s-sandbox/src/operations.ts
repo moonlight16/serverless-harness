@@ -135,6 +135,17 @@ export function createPodFindOps(exec: ExecInPod, cfg: K8sSandboxConfig): FindOp
     glob: async (pattern, cwd, { ignore, limit }) => {
       const globs = [`-g ${shQuote(pattern)}`, ...ignore.map((ig) => `-g ${shQuote(`!${ig}`)}`)];
       const r = await exec(`cd ${q(cwd)} && rg --files --hidden ${globs.join(" ")} | head -n ${limit}`);
+      // A null exit code means the output cap tripped mid-list (spec §8) or rg was
+      // signalled: what came back may even contain OUTPUT_TRUNCATED_MARKER as a bogus
+      // path entry, so it cannot be handed to the model as a file list. Non-zero means
+      // `rg` itself failed (e.g. a malformed pattern) — silently returning [] would read
+      // as "no matches" instead of "the search errored." Both must throw, same as `readdir`.
+      if (r.exitCode === null) {
+        throw new Error(`glob truncated in pod (output cap tripped or rg signalled): ${pattern}`);
+      }
+      if (r.exitCode !== 0) {
+        throw new Error(`glob failed in pod (rg exited ${r.exitCode}): ${pattern}`);
+      }
       return r.stdout
         .toString()
         .split("\n")
