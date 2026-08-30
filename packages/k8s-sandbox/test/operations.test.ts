@@ -166,7 +166,7 @@ describe("find ops", () => {
     expect(calls[0].command).toBe(
       "cd '/workspace' && rg --files --hidden -g '*.ts' " +
         "-g '!**/node_modules/**' -g '!**/.git/**' | head -n 100; " +
-        'rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || [ "$rc" = 141 ] || exit "$rc"',
+        'rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || [ "$rc" = 1 ] || [ "$rc" = 141 ] || exit "$rc"',
     );
   });
 
@@ -176,8 +176,14 @@ describe("find ops", () => {
     await ops.glob("*.go", "/head", { ignore: [], limit: 50 });
     expect(calls[0].command).toBe(
       "cd '/workspace' && rg --files --hidden -g '*.go' | head -n 50; " +
-        'rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || [ "$rc" = 141 ] || exit "$rc"',
+        'rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || [ "$rc" = 1 ] || [ "$rc" = 141 ] || exit "$rc"',
     );
+  });
+
+  it("returns an empty result when ripgrep finds no matches", async () => {
+    const { fn } = fakeExec({ stdout: "", exitCode: 1 });
+    const ops = createPodFindOps(fn, cfg);
+    await expect(ops.glob("*.go", "/head", { ignore: [], limit: 50 })).resolves.toEqual([]);
   });
 
   it("rejects a ripgrep failure instead of returning an empty result", async () => {
