@@ -12,6 +12,12 @@ source ./lib.sh
 [ "${E1B_LIVE:-0}" = "1" ] || { echo "SKIP (set E1B_LIVE=1)"; exit 0; }
 trap 'restore_ksvc_env' EXIT
 
+# Default to the async/KEDA leaf path (#158): each arm sets its CAP + pool selector on
+# the leaf-worker ScaledJob (see run_arm), dispatches POST {async:true} → poll Redis, and
+# set_scale is a no-op (KEDA scales workers). Set SH_LEAF_ASYNC=0 to A/B the sync path.
+# Requires setup-ocp --with-keda and the swebench sandbox pool.
+: "${SH_LEAF_ASYNC:=1}"; export SH_LEAF_ASYNC
+
 C="${E1B_CONCURRENCY:-4}"
 N="${E1B_SHARED_CAP:-8}"          # shared@N cap (default = a mid knee; override from the E6 knee)
 PER_BUCKET="${E1B_PER_BUCKET:-2}"
@@ -41,8 +47,15 @@ SWEEP_MAX_SHARED="${E1B_MAX_SCALE:-20}"
 
 run_arm() {  # $1=arm label ; $2=cap ; echoes "resvSecPerLeaf p95Ms throughput peakPods"
   local arm="$1" cap="$2" f lat_d done_n=0 pids="" t0 wall p95 thr resv peak
-  set_ksvc_env KAGENTI_SANDBOX_POOL_SELECTOR=sh.kagenti.io/sandbox-pool=swebench KAGENTI_SANDBOX_CAP="$cap"
-  set_scale 1 "$SWEEP_MAX_SHARED"   # enough harness pods to offer C (SWEEP_MAX_SHARED set above)
+  if [ "${SH_LEAF_ASYNC:-0}" = 1 ]; then
+    # Async/KEDA: the leaf runs in the worker Job, so the arm's CAP + pool selector
+    # must be set on the leaf-worker ScaledJob (not the ksvc), or both arms would run
+    # at the ScaledJob's baked CAP and the dedicated-vs-shared benefit would collapse.
+    set_worker_env KAGENTI_SANDBOX_POOL_SELECTOR=sh.kagenti.io/sandbox-pool=swebench KAGENTI_SANDBOX_CAP="$cap"
+  else
+    set_ksvc_env KAGENTI_SANDBOX_POOL_SELECTOR=sh.kagenti.io/sandbox-pool=swebench KAGENTI_SANDBOX_CAP="$cap"
+  fi
+  set_scale 1 "$SWEEP_MAX_SHARED"   # sync: pre-scale harness pods to offer C. async: no-op (KEDA scales workers).
   : >"$PRED"
   f=$(mktemp); lat_d=$(mktemp -d)
   local sampler; sampler=$(start_pool_lease_sampler "$f")

@@ -42,8 +42,24 @@ spec:
                 value: "redis://redis.default.svc:6379"
               - name: SH_MODEL
                 value: "claude-haiku-4-5"
-              - name: KAGENTI_SANDBOX_NAME
-                value: "sandbox-0"
+              # Lease from the shared sandbox pool (least-loaded, Redis-backed) instead
+              # of pinning one pod — otherwise all maxReplicaCount workers collide on
+              # sandbox-0. The harness discovers Running pool pods by this label.
+              - name: KAGENTI_SANDBOX_POOL_SELECTOR
+                value: "sh.kagenti.io/sandbox-pool=default"
+              - name: KAGENTI_SANDBOX_NAMESPACE
+                value: "default"
+              # Soft per-pod lease ADMISSION cap (back-pressure) — NOT a resource limit:
+              # up to CAP leaves may hold a lease on one pool pod at once. With P pods this
+              # sets target concurrency P*CAP; workers beyond that hit
+              # SandboxPoolSaturatedError and requeue. Keep maxReplicaCount aligned to P*CAP
+              # (see below). NOTE: to measure a sandbox's true throughput knee, raise CAP
+              # high (e.g. 1000) so the lease cap — not the pod — bounds concurrency
+              # (e6-saturation.sh does exactly this, on the sync path).
+              - name: KAGENTI_SANDBOX_CAP
+                value: "3"
+              - name: KAGENTI_SANDBOX_LEASE_TTL_MS
+                value: "60000"
               - name: LEAF_RESULT_TTL_SECONDS
                 value: "86400"
               - name: ANTHROPIC_API_KEY
@@ -59,6 +75,11 @@ spec:
           - name: tmp
             emptyDir: {}
   pollingInterval: 5
+  # Cap concurrent worker Jobs. Aligned to the pool's ceiling: P(3 pool pods) *
+  # CAP(3 leases/pod) = 9 concurrent leaves. 10 leaves one worker of headroom so
+  # a peak burst exercises the SandboxPoolSaturatedError -> requeue back-pressure
+  # path (rather than failing). Retune together with KAGENTI_SANDBOX_CAP and the
+  # pool size in sandbox-pool.yaml.
   maxReplicaCount: 10
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
