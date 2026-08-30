@@ -1,6 +1,7 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import type { K8sSandboxConfig } from "./config.js";
 import type { ExecInPod, SandboxTransport } from "./transport.js";
+import { DEFAULT_OUTPUT_CAP, OUTPUT_TRUNCATED_MARKER } from "./transport.js";
 
 // Re-export so existing `./exec.js` importers of ExecInPod keep working.
 export type { ExecInPod } from "./transport.js";
@@ -33,9 +34,10 @@ export function formatExecTiming(pod: string, ms: number, command: string): stri
  */
 export function KubectlTransport(
   config: K8sSandboxConfig,
-  deps: { spawn?: SpawnFn } = {},
+  deps: { spawn?: SpawnFn; outputCapBytes?: number } = {},
 ): SandboxTransport {
   const spawnFn = deps.spawn ?? nodeSpawn;
+  const outputCap = deps.outputCapBytes ?? DEFAULT_OUTPUT_CAP;
   const exec: ExecInPod = (command, opts = {}) =>
     new Promise((resolve, reject) => {
       const child = spawnFn("kubectl", buildKubectlArgs(config, command), {
@@ -53,9 +55,23 @@ export function KubectlTransport(
             }, opts.timeout * 1000)
           : undefined;
 
+      let bytes = 0;
+      let truncated = false;
       child.stdout.on("data", (d: Buffer) => {
-        out.push(d); // TODO(M3): bound/stream this buffer for large outputs (perf milestone).
-        opts.onData?.(d);
+        opts.onData?.(d); // streaming is uncapped; the cap is on what Pi gets back
+        if (truncated) return;
+        out.push(d);
+        bytes += d.length;
+        if (bytes > outputCap) {
+          truncated = true;
+          out.push(Buffer.from(OUTPUT_TRUNCATED_MARKER));
+          // Not parity with the gRPC Abort: that kills the *remote* worker process.
+          // This only kills the local kubectl client; the in-pod process is stopped
+          // (if at all) by EPIPE on its next write to the now-closed stream — fine for
+          // cat/grep, but a hostile producer that traps or ignores SIGPIPE keeps
+          // running in the pod after this returns (spec §8 "Accepted divergences").
+          child.kill("SIGKILL");
+        }
       });
       child.stderr.on("data", (d: Buffer) => {
         opts.onData?.(d);
@@ -76,6 +92,7 @@ export function KubectlTransport(
         if (timer) clearTimeout(timer);
         opts.signal?.removeEventListener("abort", onAbort);
         if (opts.signal?.aborted) return reject(new Error("aborted"));
+        if (truncated) return resolve({ stdout: Buffer.concat(out), exitCode: null });
         if (timedOut) return reject(new Error(`timeout:${opts.timeout}`));
         if (shouldEmitExecTiming(process.env)) {
           process.stderr.write(formatExecTiming(config.pod, Date.now() - startMs, command));

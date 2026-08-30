@@ -15,15 +15,22 @@ const cfg: K8sSandboxConfig = {
 };
 
 /** Build a KubectlTransport whose child process is a scripted fake. */
-const kubectlFactory: TransportFactory = (b) => {
+const kubectlFactory: TransportFactory = (b, opts) => {
   let stdin: Buffer | undefined;
+  // The producer here is the `kubectl exec` child; "stopped" means the transport
+  // signalled it. The fake emits `close` on its own, so nothing else in the run
+  // reveals whether the kill actually happened — this flag is the only witness.
+  let killed = false;
   const spawn = ((_cmd: string, _args: string[]) => {
     const child = new EventEmitter() as any;
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
     child.stdin = { end: (d?: Buffer) => { stdin = d; } };
     // kill() drives a `close` event, exactly as a real SIGKILL would.
-    child.kill = vi.fn(() => child.emit("close", null));
+    child.kill = vi.fn(() => {
+      killed = true;
+      child.emit("close", null);
+    });
     // Emit after the transport has attached its handlers (still synchronous
     // relative to the awaiting test via a microtask).
     queueMicrotask(() => {
@@ -33,7 +40,8 @@ const kubectlFactory: TransportFactory = (b) => {
     });
     return child;
   }) as unknown as SpawnFn;
-  return { transport: KubectlTransport(cfg, { spawn }), stdinSeen: () => stdin };
+  const transport = KubectlTransport(cfg, { spawn, outputCapBytes: opts?.outputCapBytes });
+  return { transport, stdinSeen: () => stdin, producerStopped: () => killed };
 };
 
 runConformance("KubectlTransport", kubectlFactory);

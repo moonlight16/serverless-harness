@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { runConformance, type FakeBehavior, type FakeHandle } from "./conformance.js";
+import { runConformance, type FakeBehavior, type TransportFactory } from "./conformance.js";
 import {
   GrpcRelayTransport,
   type ExecClientLike,
@@ -17,13 +17,16 @@ function fakeClient(behavior: FakeBehavior): {
   client: ExecClientLike;
   stdinSeen: () => Buffer | undefined;
   aborted: () => number[];
+  reqIdSeen: () => number | undefined;
 } {
   let stdin: Buffer | undefined;
+  let lastReqId: number | undefined;
   const aborted: number[] = [];
   const client: ExecClientLike = {
     exec(request: ExecRequest) {
       stdin = request.exec ? Buffer.from(request.exec.stdin) : undefined;
       const reqId = request.exec?.reqId ?? 0;
+      lastReqId = reqId;
       const stream = new EventEmitter() as EventEmitter & { cancel: () => void };
       stream.cancel = () => {};
       // Emit scripted frames on the next tick so listeners attach first.
@@ -44,22 +47,33 @@ function fakeClient(behavior: FakeBehavior): {
       return {};
     },
   };
-  return { client, stdinSeen: () => stdin, aborted: () => aborted };
+  return { client, stdinSeen: () => stdin, aborted: () => aborted, reqIdSeen: () => lastReqId };
 }
 
-const grpcFactory = (behavior: FakeBehavior): FakeHandle => {
-  const { client, stdinSeen } = fakeClient(behavior);
-  return { transport: GrpcRelayTransport("sbx-1", client), stdinSeen };
+const grpcFactory: TransportFactory = (behavior, opts) => {
+  const { client, stdinSeen, aborted, reqIdSeen } = fakeClient(behavior);
+  const transport = GrpcRelayTransport("sbx-1", client, { outputCapBytes: opts?.outputCapBytes });
+  return {
+    transport,
+    stdinSeen,
+    // On this wire, stopping the producer means an Abort naming the exec's own
+    // req_id — the relay routes the abort by that id, so an Abort for any other id
+    // would leave the flood running. Correlate rather than just counting calls.
+    producerStopped: () => {
+      const id = reqIdSeen();
+      return id !== undefined && aborted().includes(id);
+    },
+  };
 };
 
 runConformance("GrpcRelayTransport", grpcFactory);
 
 function manualClient() {
   let stream!: EventEmitter & { cancel: () => void };
-  // The transport assigns reqId from its own module-scoped counter (shared with
-  // every other exec() call made earlier in this test file, e.g. the
-  // runConformance battery above), so the id it actually uses is whatever that
-  // counter is at, not a literal we can predict. Capture it from the request
+  // The transport draws reqId from a salted per-process source (shared with every
+  // other exec() call made earlier in this test file, e.g. the runConformance
+  // battery above), so the id it actually uses is an unpredictable salt-plus-counter
+  // value, not a literal we can predict. Capture it from the request
   // GrpcRelayTransport hands to exec() so assertions can compare against the
   // real id instead of guessing it.
   let lastReqId: number | undefined;
@@ -85,6 +99,23 @@ function manualClient() {
 }
 
 describe("GrpcRelayTransport extra semantics", () => {
+  it("the cap's Abort names the exec's own req_id", async () => {
+    // The shared battery only asks "was the producer stopped". Here we pin the wire
+    // detail the battery cannot express portably: the relay routes an Abort by req_id,
+    // so an Abort carrying any other id would leave the flood running at full rate
+    // while this exec has already stopped reading (spec §8).
+    const { client, emit, aborted, reqId } = manualClient();
+    const t = GrpcRelayTransport("sbx-1", client as never, { outputCapBytes: 6 });
+    const p = t.exec("cat big");
+    await Promise.resolve(); // let exec() register its handlers
+    emit({
+      chunk: { reqId: reqId()!, data: Buffer.from("aaaabbbb"), stream: Stream.STREAM_STDOUT },
+    } as ExecEvent);
+    const r = await p;
+    expect(r.stdout.toString()).toContain("[output truncated]");
+    expect(aborted()).toContain(reqId());
+  });
+
   it("dedups: a late End for a settled reqId is dropped", async () => {
     const { client, emit } = manualClient();
     const t = GrpcRelayTransport("sbx-1", client as never);
@@ -95,17 +126,6 @@ describe("GrpcRelayTransport extra semantics", () => {
     expect(r.stdout.toString()).toBe("hi");
     // A duplicate terminal frame after settlement must not throw or change the result.
     expect(() => emit({ end: { reqId: 1, exitCode: 9 } } as ExecEvent)).not.toThrow();
-  });
-
-  it("output cap: aborts, truncates, appends [output truncated]", async () => {
-    const { client, emit, aborted, reqId } = manualClient();
-    const t = GrpcRelayTransport("sbx-1", client as never, { outputCapBytes: 4 });
-    const p = t.exec("cat big");
-    emit({ chunk: { reqId: reqId()!, data: Buffer.from("12345"), stream: Stream.STREAM_STDOUT } } as ExecEvent);
-    const r = await p;
-    expect(r.stdout.toString()).toContain("[output truncated]");
-    expect(r.exitCode).toBeNull();
-    expect(aborted()).toContain(reqId());
   });
 
   it("harness deadline fires independently of worker timeout_s", async () => {

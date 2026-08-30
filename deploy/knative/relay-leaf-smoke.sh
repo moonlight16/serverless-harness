@@ -230,14 +230,23 @@ kubectl -n "$NS" rollout status deploy/"$WORKER_DEPLOY" --timeout=90s >/dev/null
   || abort "$WORKER_DEPLOY rollout did not become ready"
 echo "relay + worker ($SANDBOX_ID) up"
 
-# --- Assert presence: the worker's live Attach stream IS the registration. ---
+# --- Assert presence: the worker's live Attach stream IS the registration. Registration
+# happens asynchronously after the Deployment rollout completes (the worker Deployment has
+# no readinessProbe -- its readiness *is* the Attach stream reaching the relay, which is not
+# something an HTTP/TCP probe could observe -- so `rollout status` returning only means the
+# pod is Running, not that it has registered yet). Poll with the same bounded wait used below
+# for the disconnect assertion instead of a single racy check. ---
 claim "Assert: worker registered in Redis presence (sh:sandbox:records, transport=grpc)"
-PRESENCE="$(kubectl exec deploy/redis -n "$NS" -- redis-cli HGETALL sh:sandbox:records 2>/dev/null || true)"
-if echo "$PRESENCE" | grep -qF "$SANDBOX_ID" && echo "$PRESENCE" | grep -q '"transport":"grpc"'; then
-  ok "worker $SANDBOX_ID present in sh:sandbox:records with transport=grpc"
-else
-  ko "worker $SANDBOX_ID not found (or wrong transport) in sh:sandbox:records; presence dump: $(echo "$PRESENCE" | head -c 300)"
-fi
+presence_seen=0
+for _i in $(seq 1 20); do
+  PRESENCE="$(kubectl exec deploy/redis -n "$NS" -- redis-cli HGETALL sh:sandbox:records 2>/dev/null || true)"
+  if echo "$PRESENCE" | grep -qF "$SANDBOX_ID" && echo "$PRESENCE" | grep -q '"transport":"grpc"'; then
+    presence_seen=1; break
+  fi
+  sleep 2
+done
+[ "$presence_seen" = 1 ] && ok "worker $SANDBOX_ID present in sh:sandbox:records with transport=grpc" \
+  || ko "worker $SANDBOX_ID not found (or wrong transport) in sh:sandbox:records; presence dump: $(echo "$PRESENCE" | head -c 300)"
 
 # --- Validate the discriminator BEFORE relying on it. Abort (not just ko) if it doesn't
 # hold -- every assertion below would be meaningless against a broken discriminator. ---
@@ -307,6 +316,38 @@ resp_redhat="$(dispatch_pattern "relay-smoke-remote-redhat-$$" "Red Hat")"
 assert_verdict "remote/RedHat" "$resp_redhat" "FLAGGED" \
   "a CLEAR verdict here means the exec landed on an Alpine sandbox pod, not the remote RHEL worker -- the smoke did not prove what it claims to"
 
+# --- Assert: a worker that disappears does not wedge the leaf. With the real pool
+# selector restored, pods and the worker are both candidates; deleting the worker
+# removes its presence record, and the next leaf must lease a pod and complete rather
+# than hang or fail. This is §10's "no mid-exec durability" gate at leaf level: the
+# transport-level half (an in-flight exec surfacing an error) is covered by
+# packages/k8s-sandbox/test/live-relay.test.ts.
+#
+# NOTE: this assertion is only meaningful together with the delete below -- with the
+# worker alive, a pod also returns FLAGGED for Alpine too. It proves recovery, not
+# routing; the routing proof is the Alpine/Red Hat pair asserted above while the
+# worker was the only candidate. ---
+claim "Assert: worker disconnect re-leases a healthy sandbox"
+set_ksvc_env SH_REMOTE_SANDBOX=1 SH_RELAY_ADDR="$RELAY_ADDR" KAGENTI_SANDBOX_POOL_SELECTOR="$POOL_SELECTOR"
+wait_latest_ready 150 || abort "harness did not reach a ready latest revision before the disconnect assertion"
+
+kubectl delete deploy "$WORKER_DEPLOY" -n "$NS" --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
+presence_gone=0
+for _i in $(seq 1 20); do
+  if ! kubectl exec deploy/redis -n "$NS" -- redis-cli HGETALL sh:sandbox:records 2>/dev/null | grep -qF "$SANDBOX_ID"; then
+    presence_gone=1; break
+  fi
+  sleep 2
+done
+[ "$presence_gone" = 1 ] && ok "presence record for $SANDBOX_ID cleared when the worker's Attach stream closed" \
+  || ko "presence record for $SANDBOX_ID survived the worker's deletion (stream-close teardown did not propagate)"
+
+# SH_REMOTE_SANDBOX is still 1 and SH_RELAY_ADDR still points at a live relay with no
+# worker parked behind it. A leaf must now come back on the pod path: Alpine => FLAGGED.
+resp_disconnect="$(dispatch_pattern "relay-smoke-disconnect-$$" "Alpine")"
+assert_verdict "disconnect/Alpine" "$resp_disconnect" "FLAGGED" \
+  "with the worker gone the leaf must re-lease an Alpine sandbox pod and complete; an empty or non-FLAGGED verdict means it hung on the dead grpc record or failed instead of retrying"
+
 # --- Restore the harness env, then a control run: with the pool path restored, Alpine
 # must be FLAGGED again -- proving both the contrast and that the restore worked. ---
 claim "Restore harness env, control run (Alpine must be FLAGGED again)"
@@ -316,18 +357,14 @@ resp_control="$(dispatch_pattern "relay-smoke-control-$$" "Alpine")"
 assert_verdict "control/Alpine" "$resp_control" "FLAGGED" \
   "a CLEAR verdict here means the env restore did not take effect (still on the remote path)"
 
-# --- Teardown relay + worker; presence must disappear once the Attach stream closes. ---
-claim "Teardown relay + worker, assert presence is gone"
+# --- Teardown the relay. The worker was already deleted by the disconnect assertion
+# above, so re-asserting presence-gone here would be a tautology; retarget on the
+# relay, which is what this teardown step actually removes. ---
+claim "Teardown relay, assert it is removed"
 teardown_relay_and_worker
-gone=0
-for _i in $(seq 1 20); do
-  if ! kubectl exec deploy/redis -n "$NS" -- redis-cli HGETALL sh:sandbox:records 2>/dev/null | grep -qF "$SANDBOX_ID"; then
-    gone=1; break
-  fi
-  sleep 2
-done
-[ "$gone" = 1 ] && ok "presence record for $SANDBOX_ID removed after teardown" \
-  || ko "presence record for $SANDBOX_ID still present after teardown (stream close may not have propagated)"
+kubectl get deploy sandbox-relay -n "$NS" >/dev/null 2>&1 \
+  && ko "deploy/sandbox-relay still present after teardown" \
+  || ok "deploy/sandbox-relay removed after teardown"
 
 if [ "$BUILT_IMAGE" = 1 ]; then
   echo "NOTE: locally built worker image $WORKER_IMAGE was not removed from the kind node or the local docker daemon (harmless; re-run to overwrite)."

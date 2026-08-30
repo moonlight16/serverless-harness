@@ -81,4 +81,33 @@ describe("relay Exec/Abort routing", () => {
     // The sink must have been cleaned up (routeExec's finally ran) -- no leak.
     expect(relay.parked()).not.toContain("sbx-1");
   });
+
+  it("refuses a second in-flight exec with the same req_id instead of overwriting the first", async () => {
+    // Sinks are keyed by req_id per parked session, so an overwrite silently detaches
+    // the first caller (it then hangs to its own deadline) and hands its frames to the
+    // second. Failing loudly is strictly better than cross-talk (#179).
+    const relay = createRelay({ records, validateToken: () => true } as never);
+    const s = fakeAttach();
+    relay.onAttach(s as never);
+    s.emitData({ hello: { sandboxId: "sbx-1", labels: {}, capabilities: [], image: "", arch: "amd64", capacityMax: 1, trust: "trusted" } });
+
+    const events: any[] = [];
+    const pump = (async () => {
+      for await (const ev of relay.routeExec("sbx-1", 7, "sleep 5", new Uint8Array(), 0, true)) events.push(ev);
+    })();
+
+    // Wait until the first exec's sink is registered and its ServerFrame{exec} written,
+    // i.e. it is genuinely in-flight, before the duplicate arrives.
+    await vi.waitFor(() => expect(s.written.at(-1)?.exec?.reqId).toBe(7));
+
+    await expect(
+      (async () => {
+        for await (const _ of relay.routeExec("sbx-1", 7, "echo hi", new Uint8Array(), 0, true)) void _;
+      })(),
+    ).rejects.toThrow(/req_id 7 already in flight/);
+
+    // Clean up the first generator so the test doesn't leak a pending pump.
+    s.emitData({ end: { reqId: 7, exitCode: 0 } });
+    await pump;
+  });
 });

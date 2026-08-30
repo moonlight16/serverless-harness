@@ -47,7 +47,7 @@ message Hello {
 message Heartbeat {}                   // liveness/keepalive only; harness owns lease counts
 
 message Exec {
-  uint64 req_id    = 1;                // monotonic; correlation + dedup key
+  uint64 req_id    = 1;                // salt+counter, unique per process, probabilistically across them; correlation + dedup key
   string command   = 2;
   bytes  stdin     = 3;                // raw bytes (protobuf is binary — no base64)
   uint32 timeout_s = 4;

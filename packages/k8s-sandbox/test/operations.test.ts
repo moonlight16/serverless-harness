@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExecInPod } from "../src/exec.js";
 import type { K8sSandboxConfig } from "../src/config.js";
+import { OUTPUT_TRUNCATED_MARKER } from "../src/transport.js";
 import {
   createPodReadOps,
   createPodWriteOps,
@@ -23,7 +24,9 @@ function fakeExec(result: { stdout?: string; exitCode?: number | null }) {
   const calls: Array<{ command: string; stdin?: string }> = [];
   const fn: ExecInPod = async (command, opts) => {
     calls.push({ command, stdin: opts?.stdin?.toString() });
-    return { stdout: Buffer.from(result.stdout ?? ""), exitCode: result.exitCode ?? 0 };
+    // `?? 0` would swallow a deliberate null (the truncation signal), so branch on undefined.
+    const exitCode = result.exitCode === undefined ? 0 : result.exitCode;
+    return { stdout: Buffer.from(result.stdout ?? ""), exitCode };
   };
   return { fn, calls };
 }
@@ -35,6 +38,24 @@ describe("read ops", () => {
     const buf = await ops.readFile("/head/a.txt");
     expect(buf.toString()).toBe("hello");
     expect(calls[0].command).toBe("cat '/workspace/a.txt'");
+  });
+
+  it("readFile refuses a truncated read instead of returning partial bytes", async () => {
+    // The seam caps returned stdout and signals it as exitCode null (spec §8). Pi's
+    // Edit tool writes back whatever readFile returns, so returning these bytes would
+    // truncate the file in the sandbox AND write "[output truncated]" into it.
+    const { fn } = fakeExec({
+      stdout: "a".repeat(64) + OUTPUT_TRUNCATED_MARKER,
+      exitCode: null,
+    });
+    const ops = createPodReadOps(fn, cfg);
+    await expect(ops.readFile("/head/big.txt")).rejects.toThrow(/truncated in pod.*big\.txt/);
+  });
+
+  it("readFile rejects when the cat itself fails", async () => {
+    const { fn } = fakeExec({ stdout: "", exitCode: 1 });
+    const ops = createPodReadOps(fn, cfg);
+    await expect(ops.readFile("/head/missing.txt")).rejects.toThrow(/Read failed in pod.*missing\.txt/);
   });
 
   it("access rejects when test -r exits non-zero", async () => {
@@ -153,6 +174,26 @@ describe("find ops", () => {
     const ops = createPodFindOps(fn, cfg);
     await ops.glob("*.go", "/head", { ignore: [], limit: 50 });
     expect(calls[0].command).toBe("cd '/workspace' && rg --files --hidden -g '*.go' | head -n 50");
+  });
+
+  it("glob refuses a truncated listing instead of returning a partial list with the marker as a path", async () => {
+    // Same class as the readFile fix above: exitCode null means the output cap tripped
+    // (or rg was signalled) mid-list, so what came back is not a trustworthy file list —
+    // it may even contain OUTPUT_TRUNCATED_MARKER as a bogus "path" entry.
+    const { fn } = fakeExec({
+      stdout: "src/a.ts\nb.ts\n" + OUTPUT_TRUNCATED_MARKER,
+      exitCode: null,
+    });
+    const ops = createPodFindOps(fn, cfg);
+    await expect(ops.glob("*.ts", "/head", { ignore: [], limit: 5 })).rejects.toThrow(
+      /glob (failed|truncated) in pod/,
+    );
+  });
+
+  it("glob rejects when rg itself fails (e.g. a bad pattern) instead of returning an empty list", async () => {
+    const { fn } = fakeExec({ stdout: "", exitCode: 2 });
+    const ops = createPodFindOps(fn, cfg);
+    await expect(ops.glob("[", "/head", { ignore: [], limit: 100 })).rejects.toThrow(/glob failed in pod/);
   });
 
   it("exists uses test -e on the mapped path", async () => {

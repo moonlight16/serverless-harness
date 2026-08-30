@@ -60,6 +60,15 @@ refused instead — an `ExecError`, also logged — rather than run. The real fi
 unique `req_id` — is proposed upstream on ST1/ST3; this guard is defense-in-depth, not a
 substitute.
 
+> **Status 2026-08-28 — the upstream fix landed.** `grpc-relay-transport.ts` now draws
+> `req_id` from a per-process salted source (21-bit `node:crypto` salt in the high bits,
+> 32-bit counter in the low bits — `req-id.ts`), so the finding above no longer describes
+> current behaviour: two replicas do **not** both send `1, 2, 3…`. Collision is now
+> probabilistic rather than certain — two replicas collide only on drawing the same salt,
+> ≈4.8e-6 across five replicas. The fingerprint guard is retained unchanged, still as
+> defense-in-depth, for exactly that residual case. The finding is left as written because
+> it is the record of what shaped this design.
+
 ### 3.2 §7's non-streaming shape is not expressible in `sandbox/v1`
 
 §7 and §8 say non-streaming ops return "a single `End` carrying full stdout", but

@@ -56,11 +56,13 @@ type entry struct {
 // Cache dedups redelivered execs so a redelivery re-emits its terminal frame
 // rather than re-running the command (spec §8).
 //
-// Keyed on req_id but GUARDED by a fingerprint, because req_id is not unique per
-// worker: grpc-relay-transport.ts seeds its counter at module scope (per harness
-// process) while select-sandbox deliberately shares sandboxes across replicas,
-// so two replicas both send req_id 1, 2, 3… to the same worker (spec §3.1).
-// Without the guard, one replica's exec could be answered with another's output.
+// Keyed on req_id but GUARDED by a fingerprint, because req_id is unique only
+// PROBABILISTICALLY per worker. The harness salts its ids per process — a 21-bit
+// crypto salt in the high bits, a 32-bit counter in the low bits (spec §3.1,
+// req-id.ts) — so two replicas sharing a sandbox no longer collide by construction,
+// but they still collide whenever they draw the same salt: ≈4.8e-6 across five
+// replicas. Defense-in-depth, not a workaround: the guard is what keeps that
+// residual case from answering one replica's exec with another's output.
 type Cache struct {
 	mu    sync.Mutex
 	max   int

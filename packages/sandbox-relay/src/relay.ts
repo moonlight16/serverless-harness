@@ -113,6 +113,11 @@ export function createRelay(deps: RelayDeps): Relay {
     const parked = sessions.get(sandboxId);
     if (!parked) throw new Error(`no live worker for sandbox '${sandboxId}'`);
 
+    if (parked.sinks.has(reqId))
+      throw new Error(
+        `req_id ${reqId} already in flight for sandbox '${sandboxId}': refusing to overwrite the live sink (a collision would detach the first caller and interleave both execs' output — see #179)`,
+      );
+
     const queue: ExecEvent[] = [];
     let notify: (() => void) | undefined;
     let done = false;

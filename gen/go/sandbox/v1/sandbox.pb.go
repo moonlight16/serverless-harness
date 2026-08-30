@@ -416,7 +416,7 @@ func (*Heartbeat) Descriptor() ([]byte, []int) {
 
 type Exec struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	ReqId         uint64                 `protobuf:"varint,1,opt,name=req_id,json=reqId,proto3" json:"req_id,omitempty"` // monotonic; correlation + dedup key
+	ReqId         uint64                 `protobuf:"varint,1,opt,name=req_id,json=reqId,proto3" json:"req_id,omitempty"` // salt+counter, unique per process, probabilistically across them; correlation + dedup key
 	Command       string                 `protobuf:"bytes,2,opt,name=command,proto3" json:"command,omitempty"`
 	Stdin         []byte                 `protobuf:"bytes,3,opt,name=stdin,proto3" json:"stdin,omitempty"` // raw bytes (protobuf is binary — no base64)
 	TimeoutS      uint32                 `protobuf:"varint,4,opt,name=timeout_s,json=timeoutS,proto3" json:"timeout_s,omitempty"`
