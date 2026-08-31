@@ -162,9 +162,20 @@ export function createPodFindOps(exec: ExecInPod, cfg: K8sSandboxConfig): FindOp
     // dotfiles in view. Paths come back relative to cwd; strip any leading "./".
     glob: async (pattern, cwd, { ignore, limit }) => {
       const globs = [`-g ${shQuote(pattern)}`, ...ignore.map((ig) => `-g ${shQuote(`!${ig}`)}`)];
-      const r = await exec(`cd ${q(cwd)} && rg --files --hidden ${globs.join(" ")} | head -n ${limit}`);
-      // Non-zero means `rg` itself failed (e.g. a malformed pattern) — silently
-      // returning [] would read as "no matches" instead of "the search errored."
+      const r = await exec(
+        `cd ${q(cwd)} && rg --files --hidden ${globs.join(" ")} | head -n ${limit}; ` +
+          `rc=\${PIPESTATUS[0]}; [ "\$rc" = 0 ] || [ "\$rc" = 1 ] || [ "\$rc" = 141 ] || exit "\$rc"`,
+      );
+      // Two independent concerns, checked in order.
+      //
+      // The shell guard above surfaces `rg`'s own status, which piping to `head` would
+      // otherwise mask (#187): rc 0 and rc 1 (no matches) are both success, 141 is `head`
+      // closing the pipe once it has its limit, and anything else propagates as the exec's
+      // status. That is about the SEARCH failing.
+      //
+      // Truncation is a property of the SEAM, not of rg's exit code, so it has its own
+      // flag and is checked first — a cap trip can happen while rg itself is perfectly
+      // happy, and reporting it as "rg exited N" would blame the wrong component.
       if (r.truncated) {
         // What came back can contain OUTPUT_TRUNCATED_MARKER as a bogus path entry, so
         // it cannot be handed to the model as a file list.
@@ -176,7 +187,7 @@ export function createPodFindOps(exec: ExecInPod, cfg: K8sSandboxConfig): FindOp
       if (r.exitCode === null) {
         throw new Error(`glob failed in pod (rg signalled; no exit status): ${pattern}`);
       }
-      if (r.exitCode !== 0) {
+      if (r.exitCode !== 0 && r.exitCode !== 1) {
         throw new Error(`glob failed in pod (rg exited ${r.exitCode}): ${pattern}`);
       }
       return r.stdout
