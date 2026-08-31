@@ -247,12 +247,12 @@ Four things to know before running it:
   render pipeline then substitutes `$HARNESS_IMAGE`; applying the raw manifest puts
   back `image: dev.local/serverless-harness:local`, reproducing the exact
   `ImagePullBackOff` this override exists to avoid. Rendering the overlay by hand has
-  the same trap in a different form — it emits the `ghcr.io/kagenti/…` path, which
+  the same trap in a different form — it emits the `ghcr.io/rossoctl/…` path, which
   currently 403s (see #177) — so it needs the image substituted too:
 
   ```bash
   oc kustomize --load-restrictor LoadRestrictionsNone deploy/knative/overlays/ocp \
-    | sed "s#ghcr.io/kagenti/serverless-harness:latest#<pullable-image>#g" \
+    | sed "s#ghcr.io/rossoctl/serverless-harness:latest#<pullable-image>#g" \
     | oc apply -f -
   ```
 - **The harness env is flipped, then restored.** The script snapshots the ksvc env,

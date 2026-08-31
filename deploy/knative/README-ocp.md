@@ -18,7 +18,7 @@ Base bring-up only — see [Scope](#scope) for what is deferred.
   - `ANTHROPIC_API_KEY` (direct), **or**
   - `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL` (Bearer-token gateway, e.g. LiteLLM).
 - The harness image. By default the script pulls the published
-  `ghcr.io/kagenti/serverless-harness:latest`; override with `--image`.
+  `ghcr.io/rossoctl/serverless-harness:latest`; override with `--image`.
 - **agent-sandbox controller** (kubernetes-sigs v0.5.0) is installed by the script
   (`sandboxes.agents.x-k8s.io`); it creates the `sandbox-0` pod from the Sandbox CR
   and provisions its durable `/workspace` PVC. The harness resolves the pod via the
@@ -66,7 +66,7 @@ creates a real Route per Knative Service (`oc get ksvc serverless-harness -o jso
 | Knative Serving (+ Kourier) | **Red Hat OpenShift Serverless Operator** (OLM Subscription in `openshift-serverless`) + a `KnativeServing` CR in `knative-serving`. Kourier is bundled. |
 | Knative config | Autoscaler tuning + the `podspec-persistent-volume-claim`/`-write`/`-securitycontext` feature flags are set in the **`KnativeServing` CR spec** (the operator reverts direct `config-*` ConfigMap patches). |
 | Redis | Lightweight in-repo Deployment (`redis:7-alpine`), runs under `restricted-v2`. |
-| Sandbox | Pre-baked image ([`sandbox.Dockerfile`](sandbox.Dockerfile), `USER 65532`), pulled from GHCR (`ghcr.io/kagenti/serverless-harness-sandbox:latest`, republished by `build.yaml` on every push to `main`; override with `--sandbox-image`). |
+| Sandbox | Pre-baked image ([`sandbox.Dockerfile`](sandbox.Dockerfile), `USER 65532`), pulled from GHCR (`ghcr.io/rossoctl/serverless-harness-sandbox:latest`, republished by `build.yaml` on every push to `main`; override with `--sandbox-image`). |
 | Sandbox `/workspace` PVC | `ReadWriteOnce` (Sandbox CR `volumeClaimTemplates`), cluster-default StorageClass. |
 | Harness | Knative Service applied via the [`overlays/ocp`](overlays/ocp) kustomize overlay; SA granted the `nonroot-v2` SCC. |
 | Ingress | Auto-created OpenShift Route. |
@@ -78,8 +78,8 @@ are kustomize patches, not forked YAMLs.
 
 ```
 --namespace <ns>         Target namespace (default: default)
---image <ref>            Harness image (default: ghcr.io/kagenti/serverless-harness:latest)
---sandbox-image <ref>    Sandbox image to pull (default: ghcr.io/kagenti/serverless-harness-sandbox:latest)
+--image <ref>            Harness image (default: ghcr.io/rossoctl/serverless-harness:latest)
+--sandbox-image <ref>    Sandbox image to pull (default: ghcr.io/rossoctl/serverless-harness-sandbox:latest)
 --serverless-channel <c> OpenShift Serverless subscription channel (default: stable)
 --with-keda              Install KEDA (Custom Metrics Autoscaler Operator) for async leaf
 --keda-channel <c>       Custom Metrics Autoscaler channel (default: stable)
@@ -226,14 +226,14 @@ and verifying the async-leaf path itself on OpenShift is a further step.
 ## Image delivery
 
 Both images default to the published GHCR builds. `build.yaml` republishes
-`ghcr.io/kagenti/serverless-harness` **and**
-`ghcr.io/kagenti/serverless-harness-sandbox` (from [`sandbox.Dockerfile`](sandbox.Dockerfile))
+`ghcr.io/rossoctl/serverless-harness` **and**
+`ghcr.io/rossoctl/serverless-harness-sandbox` (from [`sandbox.Dockerfile`](sandbox.Dockerfile))
 on every push to `main`, so OpenShift pulls them directly — no in-cluster build step.
 
-- **Harness:** pull the published `ghcr.io/kagenti/serverless-harness` image; pin a
-  tag with `--image ghcr.io/kagenti/serverless-harness:<tag>`.
-- **Sandbox:** pull the published `ghcr.io/kagenti/serverless-harness-sandbox` image;
-  override with `--sandbox-image ghcr.io/kagenti/serverless-harness-sandbox:<tag>`.
+- **Harness:** pull the published `ghcr.io/rossoctl/serverless-harness` image; pin a
+  tag with `--image ghcr.io/rossoctl/serverless-harness:<tag>`.
+- **Sandbox:** pull the published `ghcr.io/rossoctl/serverless-harness-sandbox` image;
+  override with `--sandbox-image ghcr.io/rossoctl/serverless-harness-sandbox:<tag>`.
 - **Build the harness from source in-cluster** (no external registry) against the
   OpenShift internal registry:
   ```bash

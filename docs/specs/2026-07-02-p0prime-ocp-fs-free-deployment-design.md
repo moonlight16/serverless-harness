@@ -87,14 +87,14 @@ Verified against `main` @ `d199484` and a read-only inspection of the live clust
 ## 4. Approach decision — sandbox image source
 
 The sandbox image can be **built in-cluster** (existing BuildConfig → internal registry) or **pulled
-from GHCR** (`build.yaml` publishes `ghcr.io/kagenti/serverless-harness-sandbox` on every push to
+from GHCR** (`build.yaml` publishes `ghcr.io/rossoctl/serverless-harness-sandbox` on every push to
 `main`, explicitly "instead of building it in-cluster").
 
 **Decision: keep the in-cluster build (Option A) for P0′.** We live-verify **before** merging, and
 GHCR `:latest` only rebuilds on merge — so the `ripgrep` fix (§3.2.4) cannot reach GHCR in time for a
 pre-merge smoke. The in-cluster BuildConfig honors the local Dockerfile fix immediately and keeps the
 phase self-contained (no dependency on GHCR freshness/pullability). The harness image stays
-GHCR-pulled (`ghcr.io/kagenti/serverless-harness:latest`, auto-published post-P1).
+GHCR-pulled (`ghcr.io/rossoctl/serverless-harness:latest`, auto-published post-P1).
 
 > **Follow-up (not P0′).** Once the `ripgrep` fix merges and CI republishes the GHCR sandbox image,
 > switching the OCP overlay to pull it (Option B, symmetric with the harness, drops the BuildConfig)
@@ -103,7 +103,7 @@ GHCR-pulled (`ghcr.io/kagenti/serverless-harness:latest`, auto-published post-P1
 ## 5. Design
 
 ### 5.1 Target topology (P1 architecture, realized on OCP)
-- **Harness** — Knative Service, image `ghcr.io/kagenti/serverless-harness:latest`, runs **non-root**
+- **Harness** — Knative Service, image `ghcr.io/rossoctl/serverless-harness:latest`, runs **non-root**
   (UID 65532, `nonroot-v2`), mounts only `/tmp` (emptyDir). Resolves the sandbox pod via
   `KAGENTI_SANDBOX_NAME=sandbox-0` → the `Sandbox` CR's `.status.selector` label query → `kubectl
   exec`s all 7 Pi tool ops into it. External access via the Knative **Route** (`KSVC_URL` contract in

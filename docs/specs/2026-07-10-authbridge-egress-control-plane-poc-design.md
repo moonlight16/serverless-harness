@@ -36,7 +36,7 @@
 > 4. **Plumbing.** The feature flag is **`SH_AUTHBRIDGE`** (off by default, mirroring `SH_REMOTE_SANDBOX`).
 >    The proxy is the **full `authbridge` image** (the `authbridge-lite` binary drops the parsers); now
 >    that #655/#657 are on kext main, RC1 uses the official
->    `ghcr.io/kagenti/kagenti-extensions/authbridge` image (pinned `main-9c131ee`).
+>    `ghcr.io/rossoctl/kagenti-extensions/authbridge` image (pinned `main-9c131ee`).
 >
 > Consequently the §8 RC1-0 deliverable "`static-broker` + `sparc-stub`" is realized as
 > "**`static-inject` plugin + `ibac-stub`**".

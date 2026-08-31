@@ -52,7 +52,7 @@ is the only place the real credential lives.
   both hops; zero dependency on the unmerged #626.
 - Negative / accepted: the plugin (and the reverse-proxy SSE/Host/header fidelity fixes,
   kagenti-extensions **#657**) are now **merged to kext main**; RC1 consumes the official
-  `ghcr.io/kagenti/kagenti-extensions/authbridge` image (pinned `main-9c131ee`) — no stacked-branch
+  `ghcr.io/rossoctl/kagenti-extensions/authbridge` image (pinned `main-9c131ee`) — no stacked-branch
   build. The plugin is still single-tenant/static by design — **per-user issuance and RFC 8693
   token-exchange remain deferred to Z5**; this **refines** the injection-mechanism clause of
   ADR-0025 and spec §3.

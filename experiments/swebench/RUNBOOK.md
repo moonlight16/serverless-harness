@@ -129,9 +129,9 @@ oc get istag -n default | grep swebench-sandbox
 > `docs/notes/swebench-image-facts.md`. It uses `conda create --clone testbed` per env (conda-pack
 > was abandoned — it shipped corrupt numpy for mixed conda+pip envs).
 
-**Harness image:** `setup-ocp.sh` points the ksvc at `ghcr.io/kagenti/serverless-harness:latest`,
+**Harness image:** `setup-ocp.sh` points the ksvc at `ghcr.io/rossoctl/serverless-harness:latest`,
 which carries the solve-leaf code. For a reproducible run, pin a specific tag with
-`setup-ocp.sh --image ghcr.io/kagenti/serverless-harness:main-<sha>` (the drivers only patch ksvc
+`setup-ocp.sh --image ghcr.io/rossoctl/serverless-harness:main-<sha>` (the drivers only patch ksvc
 env/timeout/scale, never the image).
 
 ---

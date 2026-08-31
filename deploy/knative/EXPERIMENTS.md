@@ -78,7 +78,7 @@ Non-authoritative (laptop-bound Kind; the authoritative OCP 4.20 run is recorded
 - Concurrency sweep (L2, `max-scale=20`, degradeX=2, 3 samples/rung): c=1→16 throughput 0.114→0.664 leaves/s (monotonically rising), p95 8671→23892 ms. **knee (CAP floor) = 2**, floorPass=false — p95 crossed the 2× baseline bound at c=4 on Kind's single node (latency-bound, *not* throughput saturation). Environment-limited; the authoritative concurrency floor is the deferred OCP run.
 - Two driver bugs were caught and fixed live (invisible to shellcheck / the gated no-op): a pod-Running race (`wait_ksvc_ready` ≠ a Running pod) and single-pod exec-timing sampling under Knative multi-revision routing (fixed by aggregating the exec-timing delta across all Running harness pods).
 
-### P3.1 authoritative OCP result (OCP 4.20.8, 3-pod pool, image ghcr.io/kagenti/serverless-harness:0.2.1, SH_MODEL=claude-haiku-4-5, 2026-07-04)
+### P3.1 authoritative OCP result (OCP 4.20.8, 3-pod pool, image ghcr.io/rossoctl/serverless-harness:0.2.1, SH_MODEL=claude-haiku-4-5, 2026-07-04)
 
 Issue #64. Standing P3 stack (4-node cluster, Route ingress); gitd re-applied for the `work` ref. N-vs-workload curve, C=1, warm, 3 samples/variant:
 

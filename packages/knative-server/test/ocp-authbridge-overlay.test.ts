@@ -60,17 +60,17 @@ describe('ocp-authbridge overlay kustomization', () => {
       expect.arrayContaining([
         expect.objectContaining({
           name: 'dev.local/serverless-harness',
-          newName: 'ghcr.io/kagenti/serverless-harness',
+          newName: 'ghcr.io/rossoctl/serverless-harness',
           newTag: 'latest',
         }),
         expect.objectContaining({
           name: 'dev.local/echo-target',
-          newName: 'ghcr.io/kagenti/serverless-harness-echo-target',
+          newName: 'ghcr.io/rossoctl/serverless-harness-echo-target',
           newTag: 'latest',
         }),
         expect.objectContaining({
           name: 'dev.local/sandbox-rc1',
-          newName: 'ghcr.io/kagenti/serverless-harness-sandbox',
+          newName: 'ghcr.io/rossoctl/serverless-harness-sandbox',
           newTag: 'latest',
         }),
       ]),
@@ -81,7 +81,7 @@ describe('ocp-authbridge overlay kustomization', () => {
   it('does NOT remap the official authbridge image (no remap needed)', () => {
     const images = kustomization.images ?? [];
     const names = images.map((i: any) => i.name);
-    expect(names).not.toContain('ghcr.io/kagenti/kagenti-extensions/authbridge');
+    expect(names).not.toContain('ghcr.io/rossoctl/kagenti-extensions/authbridge');
   });
 
   it('wires the Sandbox JSON6902 patch with an explicit target block', () => {

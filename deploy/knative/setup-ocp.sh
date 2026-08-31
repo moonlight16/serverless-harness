@@ -38,8 +38,8 @@ ASYNC_OVERLAY_DIR="$SCRIPT_DIR/overlays/ocp-async"    # only rendered/applied wh
 # ----------------------------------------------------------------------------
 DRY_RUN=false
 NAMESPACE="default"
-HARNESS_IMAGE="ghcr.io/kagenti/serverless-harness:latest"
-SANDBOX_IMAGE="ghcr.io/kagenti/serverless-harness-sandbox:latest"  # pre-baked, pulled from GHCR
+HARNESS_IMAGE="${HARNESS_IMAGE:-ghcr.io/rossoctl/serverless-harness:latest}"
+SANDBOX_IMAGE="${SANDBOX_IMAGE:-ghcr.io/rossoctl/serverless-harness-sandbox:latest}"  # pre-baked, pulled from GHCR
 SKIP_KEDA=true             # base bring-up: async leaf / KEDA is opt-in (--with-keda)
 SERVERLESS_CHANNEL="stable"
 KEDA_CHANNEL="stable"
@@ -73,8 +73,9 @@ and the harness Knative Service — reachable over its auto-created Route.
 
 Options:
   --namespace <ns>        Target namespace (default: ${NAMESPACE})
-  --image <ref>           Harness image (default: ${HARNESS_IMAGE})
-  --sandbox-image <ref>   Sandbox image to pull (default: ${SANDBOX_IMAGE})
+  --image <ref> / HARNESS_IMAGE=<ref>   Harness image (default: ${HARNESS_IMAGE})
+  --sandbox-image <ref> / SANDBOX_IMAGE=<ref>
+                          Sandbox image to pull (default: ${SANDBOX_IMAGE})
   --serverless-channel <c> OpenShift Serverless subscription channel (default: ${SERVERLESS_CHANNEL})
   --with-keda             Install KEDA (Red Hat Custom Metrics Autoscaler Operator)
                           for the async-leaf ScaledJob path (default: off)
@@ -92,7 +93,7 @@ Environment:
 Examples:
   $0                                   # default namespace, GHCR harness + sandbox images
   $0 --namespace serverless-harness    # dedicated namespace
-  $0 --image ghcr.io/kagenti/serverless-harness:v1.2.3 --dry-run
+  $0 --image ghcr.io/rossoctl/serverless-harness:v1.2.3 --dry-run
 EOF
 }
 
@@ -434,8 +435,8 @@ render_overlay_dir() {
   local dir="$1"
   $KUBECTL kustomize --load-restrictor LoadRestrictionsNone "$dir" \
     | sed \
-        -e "s#ghcr.io/kagenti/serverless-harness:latest#${HARNESS_IMAGE}#g" \
-        -e "s#ghcr.io/kagenti/serverless-harness-sandbox:latest#${SANDBOX_IMAGE}#g" \
+        -e "s#ghcr.io/rossoctl/serverless-harness:latest#${HARNESS_IMAGE}#g" \
+        -e "s#ghcr.io/rossoctl/serverless-harness-sandbox:latest#${SANDBOX_IMAGE}#g" \
     | if [ "$NAMESPACE" != "default" ]; then
         sed -e "s#namespace: default#namespace: ${NAMESPACE}#g" \
             -e "s#redis.default.svc#redis.${NAMESPACE}.svc#g"
