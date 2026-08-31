@@ -1,5 +1,5 @@
 # Strategic-merge patch onto the authbridge-ab1 Deployment (deploy/knative/authbridge/ab1-deployment.yaml).
-# The official kext authbridge image (ghcr.io/kagenti/kagenti-extensions/authbridge:main-9c131ee)
+# The official kext authbridge image (ghcr.io/rossoctl/kagenti-extensions/authbridge:main-9c131ee)
 # already runs as non-root UID 1001 — unlike the harness image (see leaf-cron.yaml:40-41), it
 # needs NO runAsUser pin, just runAsNonRoot to satisfy the restricted/nonroot-v2 SCC.
 apiVersion: apps/v1

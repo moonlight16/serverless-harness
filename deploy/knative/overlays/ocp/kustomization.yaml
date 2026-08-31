@@ -32,7 +32,7 @@ resources:
 
 images:
   - name: dev.local/serverless-harness
-    newName: ghcr.io/kagenti/serverless-harness
+    newName: ghcr.io/rossoctl/serverless-harness
     newTag: latest
 
 patches:

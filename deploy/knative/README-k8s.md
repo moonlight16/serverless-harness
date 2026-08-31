@@ -39,8 +39,8 @@ ingress domain (so you reach the service by port-forward or NodePort).
 export ANTHROPIC_API_KEY=sk-...
 ./deploy/knative/setup-k8s.sh \
   --namespace serverless-harness \
-  --image ghcr.io/kagenti/serverless-harness:latest \
-  --sandbox-image ghcr.io/kagenti/serverless-harness-sandbox:latest
+  --image ghcr.io/rossoctl/serverless-harness:latest \
+  --sandbox-image ghcr.io/rossoctl/serverless-harness-sandbox:latest
 ```
 
 When it finishes it prints how to reach the service (port-forward by default):

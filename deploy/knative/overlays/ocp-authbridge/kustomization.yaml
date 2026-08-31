@@ -27,15 +27,15 @@ images:
   # ibac-stub reuses the harness image (dev.local/serverless-harness:local in ibac-stub.yaml);
   # this images: transformer matches by name regardless of tag and remaps it to GHCR.
   - name: dev.local/serverless-harness
-    newName: ghcr.io/kagenti/serverless-harness
+    newName: ghcr.io/rossoctl/serverless-harness
     newTag: latest
   - name: dev.local/echo-target
-    newName: ghcr.io/kagenti/serverless-harness-echo-target
+    newName: ghcr.io/rossoctl/serverless-harness-echo-target
     newTag: latest
   - name: dev.local/sandbox-rc1
-    newName: ghcr.io/kagenti/serverless-harness-sandbox
+    newName: ghcr.io/rossoctl/serverless-harness-sandbox
     newTag: latest
-  # NOTE: the AuthBridge sidecar/gateway image (ghcr.io/kagenti/kagenti-extensions/authbridge)
+  # NOTE: the AuthBridge sidecar/gateway image (ghcr.io/rossoctl/kagenti-extensions/authbridge)
   # is already the official public image on both AB1 and AB2 — no remap needed.
 
 patches:

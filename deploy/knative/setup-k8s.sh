@@ -26,8 +26,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ----------------------------------------------------------------------------
 DRY_RUN=false
 NAMESPACE="default"
-HARNESS_IMAGE="ghcr.io/kagenti/serverless-harness:latest"
-SANDBOX_IMAGE="ghcr.io/kagenti/serverless-harness-sandbox:latest"
+HARNESS_IMAGE="${HARNESS_IMAGE:-ghcr.io/rossoctl/serverless-harness:latest}"
+SANDBOX_IMAGE="${SANDBOX_IMAGE:-ghcr.io/rossoctl/serverless-harness-sandbox:latest}"
 STORAGE_CLASS=""                       # empty => use the cluster's default StorageClass
 SKIP_KEDA=true                         # async-leaf / KEDA is opt-in (--with-keda)
 INGRESS="none"                         # none | nodeport
@@ -55,8 +55,9 @@ the LLM secret, and the harness Knative Service (reachable in-cluster; see --ing
 
 Options:
   --namespace <ns>       Target namespace (default: ${NAMESPACE})
-  --image <ref>          Harness image, prebuilt (default: ${HARNESS_IMAGE})
-  --sandbox-image <ref>  Sandbox image, prebuilt (default: ${SANDBOX_IMAGE})
+  --image <ref> / HARNESS_IMAGE=<ref>  Harness image, prebuilt (default: ${HARNESS_IMAGE})
+  --sandbox-image <ref> / SANDBOX_IMAGE=<ref>
+                         Sandbox image, prebuilt (default: ${SANDBOX_IMAGE})
   --storage-class <sc>   StorageClass for the sandbox /workspace PVCs
                          (default: the cluster's default StorageClass).
                          E.g. --storage-class ibm-scale-csi for IBM Storage Scale (GPFS).
