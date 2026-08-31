@@ -295,8 +295,15 @@ executing a leaf's tool calls. One command shows that on a laptop:
 ```bash
 make demo-remote-sandbox                                  # no cluster -> passing A/B
 make demo-remote-sandbox DEMO_ARGS=--reuse-cluster        # skip setup on a warm cluster
-make demo-remote-sandbox-teardown                         # remove everything
+make demo-remote-sandbox-teardown                         # remove the container, relay and image
 ```
+
+Teardown removes everything the demo creates, but **asks before deleting the kind cluster**:
+`--reuse-cluster` exists so the demo can run against a long-lived dev cluster, and a fresh
+`--teardown` process cannot know which kind it is looking at. Answer `y`, or pass
+`--yes` to skip the prompt (`DEMO_ARGS=--yes`). With no terminal to ask on, the cluster is
+kept. A run that *did* create the cluster says so on exit and points at `--teardown`; a run
+against a pre-existing cluster does not.
 
 ```
 laptop

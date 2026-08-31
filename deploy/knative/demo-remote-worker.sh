@@ -32,12 +32,19 @@
 #   ./demo-remote-worker.sh                  # no cluster -> passing A/B, one invocation
 #   ./demo-remote-worker.sh --reuse-cluster   # skip setup if the cluster is already healthy
 #   ./demo-remote-worker.sh --keep            # leave relay + worker running afterwards
-#   ./demo-remote-worker.sh --teardown        # remove everything: container, relay, cluster, image
+#   ./demo-remote-worker.sh --teardown        # remove container, relay, image; ASK about the cluster
+#   ./demo-remote-worker.sh --teardown --yes  # ...and delete the cluster without asking
 #
 # Requires: docker (or podman), kind, kubectl, jq -- and credentials for a model the
 # cluster can reach (ANTHROPIC_API_KEY, or ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL).
 # No local Go toolchain: remote-worker/Dockerfile builds the binary in a builder stage.
 set -euo pipefail
+# Resolve this script's own path BEFORE the cd below. --help reads the header block out of
+# the file, and after the cd a relative "$0" no longer resolves -- which is how the demo is
+# actually invoked (`make demo-remote-sandbox` runs `bash deploy/knative/demo-remote-worker.sh`).
+# The user-facing hints below keep using "$0": those are copy-pasted from the caller's own
+# cwd, which is the one "$0" was relative to.
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 cd "$(dirname "$0")"
 source ./lib.sh   # NS, KSVC, BASE, CURL_OPTS, CURL_HDR, ok/ko, PASS/FAIL, ensure_port_forward
 # shellcheck source=./lib-relay.sh
@@ -70,6 +77,11 @@ PF_LOG="${TMPDIR:-/tmp}/sh-demo-relay-pf.$$.log"
 REUSE_CLUSTER=0
 KEEP=0
 TEARDOWN_ONLY=0
+ASSUME_YES=0
+# Raised only on the path that actually creates the cluster (step 2). --reuse-cluster exists
+# so the demo can run against a long-lived dev cluster, so "the cluster exists" must never be
+# read as "this run may delete it".
+CREATED_CLUSTER=0
 PF_PID=""
 KOURIER_PF_PID=""
 WORKER_DOCKER_ARGS=()
@@ -80,7 +92,11 @@ while [ $# -gt 0 ]; do
     --reuse-cluster) REUSE_CLUSTER=1; shift ;;
     --keep) KEEP=1; shift ;;
     --teardown) TEARDOWN_ONLY=1; shift ;;
-    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -y|--yes) ASSUME_YES=1; shift ;;
+    # Print the header block only: from line 2 (skipping the shebang) to the first
+    # non-comment line. `grep '^#'` would also emit every column-0 comment further down --
+    # section headers and function docs -- which is internal commentary, not help.
+    -h|--help) sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p;}' "$SELF"; exit 0 ;;
     *) echo "unknown arg: $1 (try --help)" >&2; exit 1 ;;
   esac
 done
@@ -140,8 +156,27 @@ remove_relay() {
   kubectl delete -f relay-deployment.yaml --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
 }
 
+# --teardown runs as its own process, so it cannot know whether some earlier invocation
+# created $CLUSTER_NAME or whether it is the dev cluster --reuse-cluster was pointed at.
+# Deleting it unconditionally would make a cleanup command destructive to something the demo
+# never owned, so ask. --yes is the non-interactive answer; with no tty and no --yes, keep the
+# cluster -- refusing to delete is the recoverable direction.
+confirm_cluster_delete() {
+  [ "$ASSUME_YES" = 1 ] && return 0
+  if [ ! -t 0 ]; then
+    echo "    stdin is not a terminal, so cluster '$CLUSTER_NAME' is being KEPT." >&2
+    echo "    re-run with --yes to delete it, or: kind delete cluster --name $CLUSTER_NAME" >&2
+    return 1
+  fi
+  local reply=""
+  printf "    delete kind cluster '%s'? Irreversible, and the demo may not have created it. [y/N] " "$CLUSTER_NAME"
+  read -r reply || true
+  case "$reply" in [yY] | [yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+}
+
 # Full teardown: everything this demo can create, in dependency order. Idempotent, so
-# `--teardown` is safe to run against a half-finished or already-clean laptop.
+# `--teardown` is safe to run against a half-finished or already-clean laptop. The cluster is
+# the one exception to "remove everything" -- see confirm_cluster_delete.
 full_teardown() {
   echo "=== Teardown ==="
   echo "--- stopping the tunnel ---";      stop_port_forward
@@ -150,14 +185,25 @@ full_teardown() {
     echo "--- restoring harness env ---";  restore_harness_env
     echo "--- removing the relay ---";     remove_relay
   fi
+  local cluster_removed=0
   if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
-    echo "--- deleting kind cluster '$CLUSTER_NAME' ---"
-    kind delete cluster --name "$CLUSTER_NAME" >/dev/null 2>&1 || true
+    echo "--- kind cluster '$CLUSTER_NAME' ---"
+    if confirm_cluster_delete; then
+      kind delete cluster --name "$CLUSTER_NAME" >/dev/null 2>&1 || true
+      cluster_removed=1
+      echo "    deleted."
+    else
+      echo "    kept."
+    fi
   fi
   echo "--- removing the built worker image ---"
   docker rmi "$WORKER_IMAGE" >/dev/null 2>&1 || true
   rm -f "$PF_LOG" 2>/dev/null || true
-  echo "teardown complete: no cluster, container, or loaded image left behind"
+  if [ "$cluster_removed" = 1 ]; then
+    echo "teardown complete: no cluster, container, or built image left behind"
+  else
+    echo "teardown complete: container, relay and built image removed; cluster '$CLUSTER_NAME' left running"
+  fi
 }
 
 # EXIT trap. Restoring the harness env is the non-negotiable part: leaving it pointed at a
@@ -179,8 +225,16 @@ cleanup() {
     remove_worker_container
     remove_relay
     stop_kourier_port_forward
-    echo "cluster '$CLUSTER_NAME' left running. Remove everything with:"
-    echo "  $0 --teardown"
+    if [ "$CREATED_CLUSTER" = 1 ]; then
+      echo "cluster '$CLUSTER_NAME' left running (this run created it). Remove everything with:"
+      echo "  $0 --teardown"
+    else
+      # Never advertise --teardown as "remove everything" for a cluster that predates this
+      # run: a reader who reached teardown by following this hint has not re-read the README.
+      echo "cluster '$CLUSTER_NAME' predates this run and is untouched. Nothing else to clean up:"
+      echo "the relay, worker container and tunnel are already gone."
+      echo "('$0 --teardown' would offer to delete the cluster itself; it asks first.)"
+    fi
   fi
   rm -f "$PF_LOG" 2>/dev/null || true
 }
@@ -273,6 +327,13 @@ if [ "$REUSE_CLUSTER" = 1 ] && kind get clusters 2>/dev/null | grep -q "^${CLUST
    && kubectl config use-context "kind-${CLUSTER_NAME}" >/dev/null 2>&1 && cluster_healthy; then
   note "reusing healthy cluster '$CLUSTER_NAME' (--reuse-cluster)"
 else
+  # Check for the cluster BEFORE setup-kind.sh runs: it reuses an existing cluster rather than
+  # recreating it, so afterwards "the cluster exists" says nothing about who made it.
+  if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
+    note "cluster '$CLUSTER_NAME' already exists; setup-kind.sh will reuse it, and teardown will not offer to delete it as this run's own"
+  else
+    CREATED_CLUSTER=1
+  fi
   note "running setup-kind.sh (creates the cluster if absent; several minutes on a cold start)"
   CLUSTER_NAME="$CLUSTER_NAME" ./setup-kind.sh \
     || abort "setup-kind.sh failed -- see its output above (a missing ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN is the usual cause)"
