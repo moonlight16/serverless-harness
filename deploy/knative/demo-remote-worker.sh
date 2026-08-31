@@ -264,7 +264,11 @@ fi
 cluster_healthy || abort "cluster '$CLUSTER_NAME' is not serving the harness (ksvc/$KSVC or deploy/redis missing)"
 
 POOL_SELECTOR="$(resolve_pool_selector)"
-POOL_POD_COUNT="$(count_pool_pods "$POOL_SELECTOR")"
+# `|| true` so a failed query surfaces as the named abort below rather than as a bare
+# set -e exit with no explanation of what went wrong.
+POOL_POD_COUNT="$(count_pool_pods "$POOL_SELECTOR" || true)"
+[ "$POOL_POD_COUNT" = "ERR" ] \
+  && abort "could not query Running pods for pool selector '$POOL_SELECTOR' (kubectl failed -- wrong context, API error, or missing RBAC)"
 [ "${POOL_POD_COUNT:-0}" -ge 1 ] \
   || abort "no Running sandbox pods match pool selector '$POOL_SELECTOR' -- the pod side of the A/B needs at least one"
 SBOX_POD="$(first_pool_pod "$POOL_SELECTOR")"

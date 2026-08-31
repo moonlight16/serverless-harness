@@ -82,7 +82,10 @@ kubectl get ksvc "$KSVC" -n "$NS" >/dev/null 2>&1 || abort "ksvc/$KSVC not found
 kubectl get deploy redis -n "$NS" >/dev/null 2>&1 || abort "deploy/redis not found in namespace $NS (run setup-kind.sh, or setup-ocp.sh/setup-k8s.sh on a real cluster, first)"
 
 POOL_SELECTOR="$(resolve_pool_selector)"
-POOL_POD_COUNT="$(count_pool_pods "$POOL_SELECTOR")"
+# `|| true` so a failed query surfaces as the named abort below rather than as a bare
+# set -e exit with no explanation of what went wrong.
+POOL_POD_COUNT="$(count_pool_pods "$POOL_SELECTOR" || true)"
+[ "$POOL_POD_COUNT" = "ERR" ] && abort "could not query Running pods for pool selector '$POOL_SELECTOR' (kubectl failed -- wrong context, API error, or missing RBAC)"
 [ "${POOL_POD_COUNT:-0}" -ge 1 ] || abort "no Running sandbox pods match pool selector '$POOL_SELECTOR' (needed for the discriminator check and the control run)"
 SBOX_POD="$(first_pool_pod "$POOL_SELECTOR")"
 echo "preflight ok: ksvc=$KSVC redis=up pool_selector='$POOL_SELECTOR' running_pool_pods=$POOL_POD_COUNT (sample=$SBOX_POD)"

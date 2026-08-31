@@ -57,11 +57,19 @@ resolve_pool_selector() {
   echo "${sel:-sh.kagenti.io/sandbox-pool=default}"
 }
 
-# Echo the number of Running pods matching a label selector.
+# Echo the number of Running pods matching a label selector, or "ERR" (return 1) when the
+# query itself failed. The distinction matters: piping a failed `kubectl get` into `wc -l`
+# yields 0, which is indistinguishable from "the selector genuinely matches nothing" -- and
+# a wrong context, transient API error, expired credential or missing RBAC would then read
+# as an empty candidate set. That makes assert_no_pods_match below fail OPEN, which is the
+# one direction it must not. Callers must treat "ERR" as fatal, never as zero.
+# `grep -c .` rather than `wc -l` so a trailing newline is not counted as a pod.
 # Usage: count_pool_pods <selector>
 count_pool_pods() {
-  kubectl get pods -n "$NS" -l "$1" --field-selector=status.phase=Running --no-headers 2>/dev/null \
-    | wc -l | tr -d ' '
+  local out
+  out="$(kubectl get pods -n "$NS" -l "$1" --field-selector=status.phase=Running --no-headers 2>/dev/null)" \
+    || { echo "ERR"; return 1; }
+  printf '%s' "$out" | grep -c . | tr -d ' '
 }
 
 # Echo the name of the first Running pod matching a label selector (empty if none).
@@ -79,7 +87,11 @@ first_pool_pod() {
 # Usage: assert_no_pods_match <selector>
 assert_no_pods_match() {
   local sel="$1" n
-  n="$(count_pool_pods "$sel")"
+  n="$(count_pool_pods "$sel" || true)"
+  # A failed query must abort, not pass. Claiming "matches 0 Running pods" on the strength of
+  # a kubectl error would hand back exactly the vacuous green this assertion exists to rule
+  # out: the remote assertions would then run against an unverified candidate set.
+  [ "$n" = "ERR" ] && abort "could not determine whether pool selector '$sel' matches any Running pods -- the kubectl query failed (wrong context, API error, or missing RBAC). Refusing to continue: an unverified candidate set makes the remote proof vacuous."
   if [ "${n:-0}" -eq 0 ]; then
     ok "pool selector '$sel' matches 0 Running pods -- the remote worker is the only lease candidate"
   else
