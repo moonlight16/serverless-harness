@@ -64,7 +64,8 @@ seam (`transport.ts`), and the shared conformance battery asserts it for both �
 cap on one implementation makes the transports distinguishable to Pi, which contradicts the
 swappability the epic's driver #2 claims.
 
-**Still not a seam-wide guarantee.** There is a third `SandboxTransport`,
+**Superseded by the 2026-08-30 revision below.** **Still not a seam-wide guarantee.** There
+is a third `SandboxTransport`,
 `persistentExecInPod`, and it remains uncapped; `extension.ts` gives it
 Read/Write/Edit/Ls/Find, so the file-reading tools are exactly the ones running without a
 cap. The battery therefore covers two of three implementations, and Pi can still tell the
@@ -73,6 +74,56 @@ separately. What *is* closed here is the damaging consequence: because that tran
 back to the capped `KubectlTransport` on channel death, a truncated read could reach Pi's
 Edit tool and be written back over the file, so `createPodReadOps.readFile` now throws
 instead of returning bytes it cannot vouch for.
+
+### 2026-08-30 — the cap becomes seam-wide; truncation becomes explicit (issues #180, #181, #185)
+
+The 2026-08-28 revision left the cap covering two of three transports and left truncation
+represented only as a null exit code — a value that also means "signalled, no status".
+
+**Decided:** `ExecResult` carries a required `truncated: boolean`, with the invariant
+`truncated === true ⇒ exitCode === null`. Required rather than optional, so a fourth
+transport cannot omit it and read as "not truncated" — that silent divergence is the defect.
+`exitCode` stays null on truncation, so every caller that checks `!== 0` keeps failing
+closed and there is no flag day.
+
+**Decided:** `persistentExecInPod` is capped **in the pod**, by a `head -c <cap + 1>` stage
+in `wrapCommand`'s pipeline. This caps raw bytes before base64 inflation, so the trip point
+matches the per-call transports exactly; a client-side byte count would have capped content
+at cap × 3/4, a weaker form of the same distinguishability. It also bounds
+`FrameParser.push`, which re-stringifies its buffer per chunk and so grows quadratically.
+`PIPESTATUS[0]` still indexes the command, and the resulting SIGPIPE 141 is ignored because
+truncation is detected by length.
+
+**Consequence, and the cost accepted:** a file above the cap is now **unreadable** through
+Read/Edit — not merely truncated. `pi-fork`'s `read.ts` reads the whole file before applying
+`offset`/`limit`, so the paging its own tool description advertises cannot reach past the
+cap either. Accepted because Pi clips Read output to 2000 lines / 50 KB regardless, so what
+is lost is a path returning bytes the model never saw, at the cost of harness memory and
+quadratic parse time. `readFile` names the size, the cap, and a `bash`+`sed` range read.
+
+**Decided:** `createPodBashOps` returns **137** on truncation. 128+9 is the conventional
+SIGKILL status and is accurate — the command was killed by signal 9 at the cap — and it
+routes through Pi's own failure path, which appends the streamed output tail, so the model
+gets both facts. **Rejected:** a bare throw, which loses the tail (`bash.ts` appends output
+only for `aborted`/`timeout:` messages); patching `pi-fork` to carry both, which spans two
+repos for a wording gain; and making truncation reject at the transport level, which
+contradicts §8's truncate-and-surface contract and would change `GrpcRelayTransport`'s
+behaviour, unchanged since ST3.
+
+**Decided:** the battery's `producerStopped(): boolean` becomes
+`producerStop(): ProducerStop`, a four-value mechanism each transport declares and the
+battery pins. **Rejected:** a "was it remote?" boolean — it would assert `false` for both
+kubectl paths and so discard the coverage that `child.kill` is actually called, which is
+load-bearing (with it removed, deleting `child.kill` still passed). **Rejected:** making the
+kubectl paths genuinely stop the remote producer by recording a pid and issuing a second
+`kubectl exec`, which adds a wrapper and an extra exec to every call, with new pid-file
+races, to defend a case only an already-hostile sandbox reaches — #57's territory.
+
+**Consequence:** all three implementations run one battery. `persistentExecInPod` declares
+`streams: false`, since it is request/response over one multiplexed channel; declared rather
+than silently skipped, because quietly omitting a case for one implementation is how the
+#185 asymmetry survived. Its pod-side pipeline is proved against a real `bash`
+(`framing.test.ts`), not by the hermetic fake that simulates it.
 
 ---
 

@@ -3,7 +3,8 @@
  * (`run-leaf`, `run-turn`, `converge`) depends only on `SandboxTransport` and
  * never learns how bytes reach the sandbox. Implementations: `KubectlTransport`
  * (per-call kubectl exec), `GrpcRelayTransport` (added in ST3), and
- * `persistentExecInPod` (one long-lived channel, serving the file tools).
+ * `persistentExecInPod` (one long-lived channel, serving the file tools) — all three
+ * are capped at DEFAULT_OUTPUT_CAP, each by its own mechanism (spec §8).
  */
 
 /**
@@ -55,15 +56,16 @@ export interface SandboxTransport {
 
 /**
  * Total returned-stdout cap per exec (spec §8, "poisoned-output defense"). Enforced by
- * both PER-CALL transports — `KubectlTransport` and `GrpcRelayTransport` — each of which
- * also stops the producer (SIGKILL / `Abort`); test/conformance.ts holds both to that.
+ * ALL THREE `SandboxTransport` implementations, each by its own mechanism, which it
+ * declares to the shared battery (test/conformance.ts):
  *
- * NOT yet a property of the whole seam: `persistentExecInPod` is uncapped, and
- * extension.ts gives it Read/Write/Edit/Ls/Find, so Pi can still tell the backends apart
- * on output volume. Capping the Read path is a production behaviour change, tracked
- * separately (spec §8, "Accepted divergences"). The damaging consequence is closed:
- * `createPodReadOps.readFile` throws on a truncated read rather than let Pi's Edit tool
- * write the truncation back over the file.
+ *  - `KubectlTransport`     `local-kill`        SIGKILLs its `kubectl exec` client
+ *  - `GrpcRelayTransport`   `remote-abort`      `Abort` → the worker kills the process group
+ *  - `persistentExecInPod`  `producer-side-cap` pod-side `head -c` bounds output at the source
+ *
+ * On a trip each truncates, appends OUTPUT_TRUNCATED_MARKER, and sets
+ * `truncated: true` with a null exit code. The battery asserts the invariant and the
+ * declared mechanism for every implementation, so none can regress alone.
  *
  * The Go worker's BufferCap (remote-worker/internal/exec/runner.go) is pinned to this
  * value — change one and change the other; test/output-cap-coupling.test.ts enforces it.
