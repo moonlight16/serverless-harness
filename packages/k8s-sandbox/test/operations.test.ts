@@ -146,7 +146,7 @@ describe("bash ops", () => {
     // throws with the streamed output tail attached, so the model gets both facts.
     const { fn } = fakeExec({ stdout: "", exitCode: null, truncated: true });
     const ops = createPodBashOps(fn, cfg);
-    const r = await ops.exec("yes", "/head", {});
+    const r = await ops.exec("yes", "/head", { onData: () => {} });
     expect(r.exitCode).toBe(137);
   });
 
@@ -156,14 +156,14 @@ describe("bash ops", () => {
     // treating it as it does today.
     const { fn } = fakeExec({ stdout: "", exitCode: null, truncated: false });
     const ops = createPodBashOps(fn, cfg);
-    const r = await ops.exec("something-signalled", "/head", {});
+    const r = await ops.exec("something-signalled", "/head", { onData: () => {} });
     expect(r.exitCode).toBeNull();
   });
 
   it("passes a genuine non-zero exit code through unchanged", async () => {
     const { fn } = fakeExec({ stdout: "", exitCode: 3, truncated: false });
     const ops = createPodBashOps(fn, cfg);
-    const r = await ops.exec("false", "/head", {});
+    const r = await ops.exec("false", "/head", { onData: () => {} });
     expect(r.exitCode).toBe(3);
   });
 });
