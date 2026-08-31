@@ -15,10 +15,34 @@ docker run -d --rm --name sh-m6-redis -p 6379:6379 redis:7-alpine
 pnpm -C experiments test
 ```
 
-- E2 writes recorded results to `experiments/RESULTS.md` and asserts the
-  checkpoint/backend read ratio grows with session length.
+- E2 asserts the checkpoint/backend read ratio grows with session length, writes each
+  run's measured table to the gitignored `experiments/.results/RESULTS.md`, and checks the
+  reproducible columns against the committed baseline in `experiments/RESULTS.md`.
 - E5 structural asserts the voter blocks + persists exactly one `abort` over cap,
   and is inert when the cap is disabled.
+
+### The E2 baseline
+
+`experiments/RESULTS.md` is committed and is **not** rewritten by a test run — that used to
+leave the working tree dirty with machine-local timings after any `pnpm -r test`. A run now
+writes its own table to the gitignored `experiments/.results/` and compares only the columns
+that reproduce anywhere:
+
+| Column | Compared? | Why |
+|---|---|---|
+| `N`, backend/checkpoint entries, ratio | yes | deterministic — identical on CI and a dev box |
+| `backend bytes` | no | environment-sensitive (measured +4 bytes on CI) |
+| `checkpoint bytes` | no | same class as `backend bytes` |
+| `backend ms`, `checkpoint ms` | no | wall-clock; varies run to run |
+
+So a change that moves the read counts fails E2 instead of silently rewriting the recorded
+result. When the move is legitimate, refresh the baseline deliberately and commit it:
+
+```bash
+SH_E2_UPDATE_BASELINE=1 pnpm -C experiments test e2-reconstruction-cost
+```
+
+`SH_E2_RESULTS_DIR=<dir>` redirects the per-run copy elsewhere.
 
 ## E5 live (real model — manual, end-to-end)
 

@@ -28,3 +28,7 @@ Thumbs.db
 # They go stale the moment code merges; the durable "why" lives in docs/specs/ + docs/adrs/.
 docs/plans/*
 !docs/plans/README.md
+
+# E2 writes each run's measured table here; experiments/RESULTS.md is the committed
+# baseline and is no longer overwritten by a test run (see experiments/README.md).
+experiments/.results/
