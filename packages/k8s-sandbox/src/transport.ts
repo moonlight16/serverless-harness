@@ -7,6 +7,30 @@
  */
 
 /**
+ * The result of one exec through the seam.
+ *
+ * `truncated` is REQUIRED, not optional. An optional field lets a fourth transport omit
+ * it and read as "not truncated", silently reintroducing the divergence #180/#185 are
+ * about; required, it is a compile error. The invariant `truncated === true ⇒
+ * exitCode === null` is asserted for every implementation by test/conformance.ts.
+ *
+ * `exitCode: null` is retained on truncation for backward compatibility: every caller
+ * that checks `!== 0` keeps failing closed, so there is no flag day. The flag adds
+ * precision — `truncated: false` with `exitCode: null` now unambiguously means "no exit
+ * status, and NOT because of our cap" (a signalled process; gRPC `end.exitCode < 0`; a
+ * stream that ended without an `End` frame).
+ */
+export interface ExecResult {
+  stdout: Buffer;
+  exitCode: number | null;
+  /**
+   * The seam's output cap tripped (spec §8). `stdout` is incomplete and ends with
+   * OUTPUT_TRUNCATED_MARKER, the producer was stopped, and `exitCode` is null.
+   */
+  truncated: boolean;
+}
+
+/**
  * One command run in the sandbox (`bash -c <command>`). stdout is collected and
  * returned; stderr is streamed to `onData` (with stdout) but NOT included in the
  * returned `stdout`, so file ops get clean bytes. `stdin` feeds data (e.g. base64
@@ -20,7 +44,7 @@ export type ExecInPod = (
     signal?: AbortSignal;
     timeout?: number; // seconds
   },
-) => Promise<{ stdout: Buffer; exitCode: number | null }>;
+) => Promise<ExecResult>;
 
 /** A transport-blind exec channel to one sandbox (spec §3). */
 export interface SandboxTransport {

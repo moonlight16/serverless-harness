@@ -39,7 +39,7 @@ function fakeSpawn(children: any[]) {
   return { spawn, calls };
 }
 
-function recordingFallback(result = { stdout: Buffer.from("FB"), exitCode: 7 }) {
+function recordingFallback(result = { stdout: Buffer.from("FB"), exitCode: 7, truncated: false }) {
   const calls: string[] = [];
   const fallback: ExecInPod = async (command) => (calls.push(command), result);
   return { fallback, calls };
@@ -71,7 +71,7 @@ describe("persistentExecInPod", () => {
     expect(calls).toHaveLength(1); // lazy spawn happened
     expect(writes[0]).toContain("cat '/workspace/a.txt'");
     child.stdout.emit("data", frameFor("n1", "hello", 0));
-    expect(await p).toEqual({ stdout: Buffer.from("hello"), exitCode: 0 });
+    expect(await p).toEqual({ stdout: Buffer.from("hello"), exitCode: 0, truncated: false });
   });
 
   it("reuses one child across sequential calls (no second spawn)", async () => {
@@ -111,7 +111,7 @@ describe("persistentExecInPod", () => {
 
     const p = t.exec("cat '/workspace/a.txt'");
     child.emit("error", new Error("broken pipe"));
-    expect(await p).toEqual({ stdout: Buffer.from("FB"), exitCode: 7 });
+    expect(await p).toEqual({ stdout: Buffer.from("FB"), exitCode: 7, truncated: false });
     expect(calls).toEqual(["cat '/workspace/a.txt'"]);
   });
 
@@ -152,7 +152,7 @@ describe("persistentExecInPod", () => {
     await t.close();
     expect(child.stdin.end).toHaveBeenCalled();
     expect(child.kill).toHaveBeenCalled();
-    expect(await t.exec("echo later")).toEqual({ stdout: Buffer.from("FB"), exitCode: 7 });
+    expect(await t.exec("echo later")).toEqual({ stdout: Buffer.from("FB"), exitCode: 7, truncated: false });
     expect(calls).toEqual(["echo later"]);
   });
 });

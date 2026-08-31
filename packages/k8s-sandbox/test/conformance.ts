@@ -51,6 +51,7 @@ export function runConformance(label: string, make: TransportFactory): void {
       const r = await transport.exec("echo hi");
       expect(r.stdout.toString()).toBe("foobar");
       expect(r.exitCode).toBe(0);
+      expect(r.truncated).toBe(false); // an untruncated exec must say so explicitly
     });
 
     it("streams stdout and stderr to onData; stderr is excluded from stdout", async () => {
@@ -87,6 +88,12 @@ export function runConformance(label: string, make: TransportFactory): void {
       expect(s).toContain(OUTPUT_TRUNCATED_MARKER);
       expect(s).not.toContain("cccc"); // collection stopped at the cap
       expect(r.exitCode).toBeNull(); // the exec was cut short, so there is no real exit code
+      // The seam represents truncation explicitly rather than overloading a null exit
+      // code, which also means "signalled, no status" (spec §3.1). Callers cannot tell
+      // those apart without this flag, which is what let a killed bash read as success.
+      expect(r.truncated).toBe(true);
+      // Invariant asserted for every implementation: truncated ⇒ no real exit status.
+      expect(r.exitCode).toBeNull();
       // Dropping bytes on the floor is not the defense — the producer must be stopped,
       // or a hostile sandbox keeps burning the pod's CPU and the relay's bandwidth
       // after we have stopped reading (spec §8: Abort / SIGKILL).

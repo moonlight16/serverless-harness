@@ -16,7 +16,7 @@ type SpawnFn = typeof nodeSpawn;
 interface Inflight {
   nonce: string;
   /** resolve from a matching frame */
-  done: (r: { stdout: Buffer; exitCode: number | null }) => void;
+  done: (r: { stdout: Buffer; exitCode: number | null; truncated: boolean }) => void;
   /** channel died → caller retries via fallback */
   fail: (e: Error) => void;
 }
@@ -80,7 +80,9 @@ export function persistentExecInPod(
         if (inflight && f.nonce === inflight.nonce) {
           const cur = inflight;
           inflight = null;
-          cur.done({ stdout: f.stdout, exitCode: f.exitCode });
+          // truncated is always false here until Task 3 adds the cap; the frame parser
+          // has no cap of its own today.
+          cur.done({ stdout: f.stdout, exitCode: f.exitCode, truncated: false });
           pump();
         }
       }

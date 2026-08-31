@@ -20,13 +20,13 @@ const cfg: K8sSandboxConfig = {
 };
 
 /** Build a fake ExecInPod that returns scripted results and records calls. */
-function fakeExec(result: { stdout?: string; exitCode?: number | null }) {
+function fakeExec(result: { stdout?: string; exitCode?: number | null; truncated?: boolean }) {
   const calls: Array<{ command: string; stdin?: string }> = [];
   const fn: ExecInPod = async (command, opts) => {
     calls.push({ command, stdin: opts?.stdin?.toString() });
     // `?? 0` would swallow a deliberate null (the truncation signal), so branch on undefined.
     const exitCode = result.exitCode === undefined ? 0 : result.exitCode;
-    return { stdout: Buffer.from(result.stdout ?? ""), exitCode };
+    return { stdout: Buffer.from(result.stdout ?? ""), exitCode, truncated: result.truncated ?? false };
   };
   return { fn, calls };
 }

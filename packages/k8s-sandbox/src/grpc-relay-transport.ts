@@ -95,19 +95,20 @@ export function GrpcRelayTransport(
                 stdout.push(Buffer.from(OUTPUT_TRUNCATED_MARKER));
                 call.cancel();
                 client.abort({ sandboxId, reqId }, () => {});
-                finish(() => resolve({ stdout: Buffer.concat(stdout), exitCode: null }));
+                finish(() => resolve({ stdout: Buffer.concat(stdout), exitCode: null, truncated: true }));
               }
             }
           }
         } else if (ev.end) {
           const code = ev.end.exitCode < 0 ? null : ev.end.exitCode;
-          finish(() => resolve({ stdout: Buffer.concat(stdout), exitCode: code }));
+          finish(() => resolve({ stdout: Buffer.concat(stdout), exitCode: code, truncated: false }));
         } else if (ev.error) {
           finish(() => reject(new Error(ev.error!.message)));
         }
       });
       call.on("error", (err: Error) => finish(() => reject(err)));
-      call.on("end", () => finish(() => resolve({ stdout: Buffer.concat(stdout), exitCode: null })));
+      // Stream ended with no End frame: no exit status, and NOT our cap.
+      call.on("end", () => finish(() => resolve({ stdout: Buffer.concat(stdout), exitCode: null, truncated: false })));
     });
 
   return {
