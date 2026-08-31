@@ -195,26 +195,38 @@ changes is only that the killing is now reported.
 `runConformance` gains a declared-capability object:
 
 ```ts
-runConformance("KubectlTransport",    make, { producerStopReach: "local",  streams: true  })
-runConformance("GrpcRelayTransport",  make, { producerStopReach: "remote", streams: true  })
-runConformance("persistentExecInPod", make, { producerStopReach: "local",  streams: false })
+type ProducerStop = "remote-abort" | "local-kill" | "producer-side-cap" | "none";
+
+runConformance("KubectlTransport",    make, { producerStop: "local-kill",        streams: true  })
+runConformance("GrpcRelayTransport",  make, { producerStop: "remote-abort",      streams: true  })
+runConformance("persistentExecInPod", make, { producerStop: "producer-side-cap", streams: false })
 ```
 
-- `producerStopped()` becomes `producerStoppedRemotely()`, meaning "the **remote** producer
-  was told to stop" rather than "we invoked our local mechanism". The battery asserts the
-  *declared* reach instead of accepting `true` from everyone, so the kubectl paths are
-  pinned as local and gRPC as remote. The asymmetry becomes a tested, named property, and a
-  future transport cannot stay silent about it — **#185**.
+- `producerStopped(): boolean` becomes `producerStop(): ProducerStop`. Each factory reports
+  the mechanism it *observed*, and the battery asserts it equals the declared value, instead
+  of accepting `true` from everyone. `"none"` is what a transport that stops nothing reports;
+  no transport may declare it, so a regression that deletes the stop becomes a failure rather
+  than a silent `true` — **#185**.
+- **Why an enum and not a "was it remote?" boolean.** A boolean would assert `false` for both
+  kubectl paths, which *discards* the existing coverage that `child.kill` is actually called —
+  coverage #184's review found load-bearing (with it deleted, removing `child.kill` still
+  passed). The enum keeps every transport pinned to a positive claim about its own mechanism.
+- `"producer-side-cap"` is the persistent channel's honest mechanism: pod-side `head -c`
+  bounds the producer at the source, so there is nothing for the client to kill. Its witness
+  in the factory is that `wrapCommand` emitted the cap stage; that the stage actually caps is
+  proved against a real bash in `framing.test.ts` (§5), not by the fake.
 - `streams: false` is required because `persistentExecInPod` genuinely does not stream
   `onData` (`persistent-exec.ts:33`). Declaring it is the point: silently skipping the
   streaming case for one implementation is precisely how #185 arose.
 - The battery asserts the §3.1 invariant, holding all three implementations to one
   contract — **#180**.
 
-**Honest note on the reach declaration.** Pod-side `head -c` stops the producer by SIGPIPE,
-which is the same EPIPE class #185 declines to count as "we stopped it". So
-`persistentExecInPod` declares `"local"` even though its mechanism is stronger than
-`KubectlTransport`'s — the conservative classification, consistent with #185's own framing.
+**Honest note on the declaration.** Pod-side `head -c` bounds output at the source, and a
+producer that outruns it is stopped by SIGPIPE — the same EPIPE class #185 declines to count
+as "we stopped it". `producer-side-cap` therefore claims only what it delivers: the bytes
+cannot exceed the cap, *not* that a hostile producer ignoring SIGPIPE stops burning CPU. It
+is deliberately not `remote-abort`, which is reserved for a transport that tells the far side
+to stop and can observe that it did.
 
 ## 4. Behaviour changes an operator needs to know
 
@@ -260,7 +272,7 @@ lands.
 
 - **Spec §8** — delete the "Known exception" paragraph in the Poisoned-output-defense
   bullet and both cap-related "Accepted divergences" entries (#181, #185); state the
-  `truncated` contract, the invariant, and the local/remote reach table. The #182
+  `truncated` contract, the invariant, and the per-transport producer-stop mechanism table. The #182
   default-deadline divergence stays. *Convention note:* the registry says specs are never
   retro-edited, but §8 is the live seam contract and #184 amended it on the same grounds;
   flagging it rather than assuming.
