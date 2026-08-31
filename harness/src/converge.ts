@@ -55,7 +55,10 @@ export function buildCleanupScript(runId: string): string {
 export async function convergeWorkspace(
   transport: SandboxTransport, repoUrl: string, ref: string, runId: string,
 ): Promise<string> {
-  const { stdout, exitCode } = await transport.exec(buildConvergeScript(repoUrl, ref, runId), { timeout: 300 });
+  const { stdout, exitCode, truncated } = await transport.exec(buildConvergeScript(repoUrl, ref, runId), {
+    timeout: 300,
+  });
+  if (truncated) throw new Error(`converge exceeded the sandbox output cap (converge output too large): ${runId}`);
   if (exitCode !== 0) throw new Error(`converge failed (exit ${exitCode})`);
   return stdout.toString().trim() || leafWorkspaceRef(runId);
 }
@@ -78,7 +81,8 @@ export function buildDiffCaptureScript(runId: string): string {
 
 /** Run the diff-capture script in the pod; return the patch (possibly empty). Throws on non-zero exit. */
 export async function captureWorkspaceDiff(transport: SandboxTransport, runId: string): Promise<string> {
-  const { stdout, exitCode } = await transport.exec(buildDiffCaptureScript(runId), { timeout: 120 });
+  const { stdout, exitCode, truncated } = await transport.exec(buildDiffCaptureScript(runId), { timeout: 120 });
+  if (truncated) throw new Error(`diff capture exceeded the sandbox output cap (diff too large): ${runId}`);
   if (exitCode !== 0) throw new Error(`diff capture failed (exit ${exitCode})`);
   const patch = stdout.toString();
   // A unified diff must end with a newline. `git diff` emits one, but some exec transports strip

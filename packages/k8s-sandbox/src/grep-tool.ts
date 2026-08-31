@@ -41,6 +41,12 @@ export function createPodGrepTool(
         signal,
         onData: (chunk) => streamed.push(chunk),
       });
+      if (r.truncated) {
+        throw new Error(
+          `grep output exceeded the sandbox output cap and was cut short. ` +
+            `Narrow the pattern or search a smaller path.`,
+        );
+      }
       if (r.exitCode !== 0 && r.exitCode !== 1) {
         const detail = Buffer.concat(streamed).toString().trim();
         throw new Error(`rg failed in pod (exit ${r.exitCode})${detail ? `: ${detail}` : ""}`);

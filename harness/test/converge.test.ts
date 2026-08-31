@@ -45,17 +45,27 @@ describe("buildConvergeScript", () => {
 describe("convergeWorkspace", () => {
   it("returns trimmed stdout as the workspace ref on success", async () => {
     const transport = {
-      exec: async () => ({ stdout: Buffer.from("/workspace/leaves/leaf-1\n"), exitCode: 0 }),
+      exec: async () => ({ stdout: Buffer.from("/workspace/leaves/leaf-1\n"), exitCode: 0, truncated: false }),
       close: async () => {},
     };
     expect(await convergeWorkspace(transport, "u", "r", "leaf-1")).toBe("/workspace/leaves/leaf-1");
   });
   it("throws on non-zero exit", async () => {
     const transport = {
-      exec: async () => ({ stdout: Buffer.from(""), exitCode: 1 }),
+      exec: async () => ({ stdout: Buffer.from(""), exitCode: 1, truncated: false }),
       close: async () => {},
     };
     await expect(convergeWorkspace(transport, "u", "r", "leaf-1")).rejects.toThrow(/converge failed/);
+  });
+  it("reports a capped converge as truncation, not a failed converge", async () => {
+    // A converge whose fetch/worktree output overruns the sandbox output cap currently
+    // surfaces as "converge failed (exit null)", which reads as a broken git command
+    // rather than output too large for the seam.
+    const transport = {
+      exec: async () => ({ stdout: Buffer.from("partial"), exitCode: null, truncated: true }),
+      close: async () => {},
+    };
+    await expect(convergeWorkspace(transport, "u", "r", "leaf-1")).rejects.toThrow(/output cap/);
   });
 });
 
@@ -80,21 +90,21 @@ describe("buildDiffCaptureScript", () => {
 describe("captureWorkspaceDiff", () => {
   it("returns stdout as the patch on exit 0", async () => {
     const transport = {
-      exec: async () => ({ stdout: Buffer.from("diff --git a/x b/x\n"), exitCode: 0 }),
+      exec: async () => ({ stdout: Buffer.from("diff --git a/x b/x\n"), exitCode: 0, truncated: false }),
       close: async () => {},
     };
     expect(await captureWorkspaceDiff(transport, "run-1")).toBe("diff --git a/x b/x\n");
   });
   it("throws on non-zero exit", async () => {
     const transport = {
-      exec: async () => ({ stdout: Buffer.from(""), exitCode: 3 }),
+      exec: async () => ({ stdout: Buffer.from(""), exitCode: 3, truncated: false }),
       close: async () => {},
     };
     await expect(captureWorkspaceDiff(transport, "run-1")).rejects.toThrow(/exit 3/);
   });
   it("returns an empty string when the worktree has no changes (exit 0, empty stdout)", async () => {
     const transport = {
-      exec: async () => ({ stdout: Buffer.from(""), exitCode: 0 }),
+      exec: async () => ({ stdout: Buffer.from(""), exitCode: 0, truncated: false }),
       close: async () => {},
     };
     expect(await captureWorkspaceDiff(transport, "run-1")).toBe("");
@@ -103,7 +113,11 @@ describe("captureWorkspaceDiff", () => {
     // Some exec transports drop the trailing newline; a diff that ends mid-line is rejected by
     // `git apply` / GNU patch, so captureWorkspaceDiff must normalize it back.
     const transport = {
-      exec: async () => ({ stdout: Buffer.from("diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b"), exitCode: 0 }),
+      exec: async () => ({
+        stdout: Buffer.from("diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b"),
+        exitCode: 0,
+        truncated: false,
+      }),
       close: async () => {},
     };
     const patch = await captureWorkspaceDiff(transport, "run-1");
@@ -112,9 +126,18 @@ describe("captureWorkspaceDiff", () => {
   });
   it("does not add a second newline when the patch already ends with one", async () => {
     const transport = {
-      exec: async () => ({ stdout: Buffer.from("diff --git a/x b/x\n"), exitCode: 0 }),
+      exec: async () => ({ stdout: Buffer.from("diff --git a/x b/x\n"), exitCode: 0, truncated: false }),
       close: async () => {},
     };
     expect(await captureWorkspaceDiff(transport, "run-1")).toBe("diff --git a/x b/x\n");
+  });
+  it("reports a capped diff as truncation, not a failed capture", async () => {
+    // A >8 MiB diff currently surfaces as "diff capture failed (exit null)", which reads
+    // as a broken git command rather than a diff too large for the seam.
+    const transport = {
+      exec: async () => ({ stdout: Buffer.from("partial"), exitCode: null, truncated: true }),
+      close: async () => {},
+    };
+    await expect(captureWorkspaceDiff(transport, "run-1")).rejects.toThrow(/output cap/);
   });
 });
