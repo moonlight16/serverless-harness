@@ -41,7 +41,10 @@ const kubectlFactory: TransportFactory = (b, opts) => {
     return child;
   }) as unknown as SpawnFn;
   const transport = KubectlTransport(cfg, { spawn, outputCapBytes: opts?.outputCapBytes });
-  return { transport, stdinSeen: () => stdin, producerStopped: () => killed };
+  // KubectlTransport can only kill its own `kubectl exec` client; the in-pod process is
+  // then stopped, if at all, by EPIPE on its next write. `killed` is the only witness
+  // that the kill happened at all — the fake emits `close` on its own.
+  return { transport, stdinSeen: () => stdin, producerStop: () => (killed ? "local-kill" : "none") };
 };
 
-runConformance("KubectlTransport", kubectlFactory);
+runConformance("KubectlTransport", kubectlFactory, { producerStop: "local-kill", streams: true });

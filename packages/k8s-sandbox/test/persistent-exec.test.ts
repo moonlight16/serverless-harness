@@ -2,6 +2,8 @@ import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { K8sSandboxConfig } from "../src/config.js";
 import type { ExecInPod } from "../src/transport.js";
+import { OUTPUT_TRUNCATED_MARKER } from "../src/transport.js";
+import { CAP_STAGE_FAILED } from "../src/framing.js";
 import { buildPersistentKubectlArgs, persistentExecInPod } from "../src/persistent-exec.js";
 
 const cfg: K8sSandboxConfig = {
@@ -39,7 +41,7 @@ function fakeSpawn(children: any[]) {
   return { spawn, calls };
 }
 
-function recordingFallback(result = { stdout: Buffer.from("FB"), exitCode: 7 }) {
+function recordingFallback(result = { stdout: Buffer.from("FB"), exitCode: 7, truncated: false }) {
   const calls: string[] = [];
   const fallback: ExecInPod = async (command) => (calls.push(command), result);
   return { fallback, calls };
@@ -71,7 +73,7 @@ describe("persistentExecInPod", () => {
     expect(calls).toHaveLength(1); // lazy spawn happened
     expect(writes[0]).toContain("cat '/workspace/a.txt'");
     child.stdout.emit("data", frameFor("n1", "hello", 0));
-    expect(await p).toEqual({ stdout: Buffer.from("hello"), exitCode: 0 });
+    expect(await p).toEqual({ stdout: Buffer.from("hello"), exitCode: 0, truncated: false });
   });
 
   it("reuses one child across sequential calls (no second spawn)", async () => {
@@ -111,7 +113,7 @@ describe("persistentExecInPod", () => {
 
     const p = t.exec("cat '/workspace/a.txt'");
     child.emit("error", new Error("broken pipe"));
-    expect(await p).toEqual({ stdout: Buffer.from("FB"), exitCode: 7 });
+    expect(await p).toEqual({ stdout: Buffer.from("FB"), exitCode: 7, truncated: false });
     expect(calls).toEqual(["cat '/workspace/a.txt'"]);
   });
 
@@ -140,6 +142,33 @@ describe("persistentExecInPod", () => {
     expect(child.kill).toHaveBeenCalled();
   });
 
+  it("a broken cap stage routes to the fallback and latches, without respawning", async () => {
+    // CAP_STAGE_FAILED means our own wrapper pipeline failed, not the command. Unhandled it
+    // arrives as empty stdout with exit 0, which readFile would return as a successful
+    // empty read and Pi's Edit would write back — truncating the file. The channel must
+    // hand off to the fallback and stay handed off: the pod's binaries will not change
+    // mid-session, so respawning would fail identically on every op.
+    const { child } = makeFakeChild();
+    const c2 = makeFakeChild();
+    const { spawn, calls } = fakeSpawn([child, c2.child]);
+    const { fallback, calls: fbCalls } = recordingFallback();
+    const t = persistentExecInPod(cfg, { fallback, spawn });
+
+    const p1 = t.exec("cat '/workspace/a.txt'");
+    child.stdout.emit("data", frameFor("n1", "", CAP_STAGE_FAILED));
+    expect(await p1).toEqual({ stdout: Buffer.from("FB"), exitCode: 7, truncated: false });
+
+    // Latched: the second call goes straight to the fallback, and no second child is spawned.
+    expect(await t.exec("cat '/workspace/b.txt'")).toEqual({
+      stdout: Buffer.from("FB"),
+      exitCode: 7,
+      truncated: false,
+    });
+    expect(fbCalls).toEqual(["cat '/workspace/a.txt'", "cat '/workspace/b.txt'"]);
+    expect(calls).toHaveLength(1); // one spawn only — no futile respawn
+    await t.close();
+  });
+
   it("close() kills the child and routes later calls to the fallback", async () => {
     const { child } = makeFakeChild();
     const { spawn } = fakeSpawn([child]);
@@ -152,7 +181,56 @@ describe("persistentExecInPod", () => {
     await t.close();
     expect(child.stdin.end).toHaveBeenCalled();
     expect(child.kill).toHaveBeenCalled();
-    expect(await t.exec("echo later")).toEqual({ stdout: Buffer.from("FB"), exitCode: 7 });
+    expect(await t.exec("echo later")).toEqual({ stdout: Buffer.from("FB"), exitCode: 7, truncated: false });
     expect(calls).toEqual(["echo later"]);
+  });
+
+  it("flags a cap trip, trims to the cap, appends the marker, and does NOT fall back", async () => {
+    // The critical property. persistentExecInPod's `fail` path retries through
+    // deps.fallback, which extension.ts:52 sets to the now-capped KubectlTransport. If a
+    // cap trip were routed through `fail`, the command would RE-RUN and flood twice
+    // before failing anyway. A cap trip is a result, not a channel failure — so it must
+    // resolve.
+    const { child } = makeFakeChild();
+    const { spawn } = fakeSpawn([child]);
+    const { fallback, calls } = recordingFallback();
+    const t = persistentExecInPod(cfg, { fallback, spawn, outputCapBytes: 6 });
+
+    const p = t.exec("cat big");
+    // The pod's `head -c 7` yields cap+1 = 7 bytes; exit 141 because head closed the pipe.
+    child.stdout.emit("data", frameFor("n1", "aaaabbb", 141));
+    const r = await p;
+
+    expect(r.truncated).toBe(true);
+    expect(r.exitCode).toBeNull();
+    expect(r.stdout.toString()).toBe(`aaaabb${OUTPUT_TRUNCATED_MARKER}`);
+    expect(calls).toEqual([]); // no fallback, so no re-run
+  });
+
+  it("does not flag output that lands exactly on the cap", async () => {
+    const { child } = makeFakeChild();
+    const { spawn } = fakeSpawn([child]);
+    const { fallback } = recordingFallback();
+    const t = persistentExecInPod(cfg, { fallback, spawn, outputCapBytes: 6 });
+
+    const p = t.exec("cat exact");
+    child.stdout.emit("data", frameFor("n1", "aaaabb", 0));
+    const r = await p;
+
+    expect(r.truncated).toBe(false);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.toString()).toBe("aaaabb");
+  });
+
+  it("writes the cap into the framed command so the pod enforces it", async () => {
+    const { child, writes } = makeFakeChild();
+    const { spawn } = fakeSpawn([child]);
+    const { fallback } = recordingFallback();
+    const t = persistentExecInPod(cfg, { fallback, spawn, outputCapBytes: 6 });
+
+    const p = t.exec("cat f");
+    expect(writes[0]).toContain("| head -c 7 |");
+    child.stdout.emit("data", frameFor("n1", "", 0));
+    await p;
   });
 });

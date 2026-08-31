@@ -63,12 +63,18 @@ export function buildSwebenchSolvePrompt(problemStatement: string, checkoutDir: 
 export async function setupSwebenchWorkspace(
   t: SandboxTransport, a: { repoUrl: string; baseCommit: string; envKey: string; runId: string },
 ): Promise<string> {
-  const { stdout, exitCode } = await t.exec(buildSwebenchSetupScript(a), { timeout: 900 });
+  const { stdout, exitCode, truncated } = await t.exec(buildSwebenchSetupScript(a), { timeout: 900 });
+  if (truncated) {
+    throw new Error(`swebench setup exceeded the sandbox output cap (setup output too large): ${a.runId}`);
+  }
   if (exitCode !== 0) throw new Error(`swebench setup failed (exit ${exitCode})`);
   return stdout.toString().trim() || swebenchCheckoutDir(a.runId);
 }
 export async function captureSwebenchDiff(t: SandboxTransport, runId: string): Promise<string> {
-  const { stdout, exitCode } = await t.exec(buildSwebenchDiffScript(runId), { timeout: 120 });
+  const { stdout, exitCode, truncated } = await t.exec(buildSwebenchDiffScript(runId), { timeout: 120 });
+  if (truncated) {
+    throw new Error(`swebench diff capture exceeded the sandbox output cap (diff too large): ${runId}`);
+  }
   if (exitCode !== 0) throw new Error(`swebench diff capture failed (exit ${exitCode})`);
   return stdout.toString();
 }

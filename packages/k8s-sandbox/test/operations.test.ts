@@ -20,13 +20,13 @@ const cfg: K8sSandboxConfig = {
 };
 
 /** Build a fake ExecInPod that returns scripted results and records calls. */
-function fakeExec(result: { stdout?: string; exitCode?: number | null }) {
+function fakeExec(result: { stdout?: string; exitCode?: number | null; truncated?: boolean }) {
   const calls: Array<{ command: string; stdin?: string }> = [];
   const fn: ExecInPod = async (command, opts) => {
     calls.push({ command, stdin: opts?.stdin?.toString() });
     // `?? 0` would swallow a deliberate null (the truncation signal), so branch on undefined.
     const exitCode = result.exitCode === undefined ? 0 : result.exitCode;
-    return { stdout: Buffer.from(result.stdout ?? ""), exitCode };
+    return { stdout: Buffer.from(result.stdout ?? ""), exitCode, truncated: result.truncated ?? false };
   };
   return { fn, calls };
 }
@@ -41,21 +41,61 @@ describe("read ops", () => {
   });
 
   it("readFile refuses a truncated read instead of returning partial bytes", async () => {
-    // The seam caps returned stdout and signals it as exitCode null (spec §8). Pi's
-    // Edit tool writes back whatever readFile returns, so returning these bytes would
-    // truncate the file in the sandbox AND write "[output truncated]" into it.
+    // The seam signals a cap trip via truncated: true (spec §8). Pi's Edit tool writes
+    // back whatever readFile returns, so returning these bytes would truncate the file
+    // in the sandbox AND write "[output truncated]" into it.
     const { fn } = fakeExec({
       stdout: "a".repeat(64) + OUTPUT_TRUNCATED_MARKER,
       exitCode: null,
+      truncated: true,
     });
     const ops = createPodReadOps(fn, cfg);
-    await expect(ops.readFile("/head/big.txt")).rejects.toThrow(/truncated in pod.*big\.txt/);
+    await expect(ops.readFile("/head/big.txt")).rejects.toThrow(/output cap.*big\.txt/);
   });
 
   it("readFile rejects when the cat itself fails", async () => {
     const { fn } = fakeExec({ stdout: "", exitCode: 1 });
     const ops = createPodReadOps(fn, cfg);
     await expect(ops.readFile("/head/missing.txt")).rejects.toThrow(/Read failed in pod.*missing\.txt/);
+  });
+
+  it("readFile names the cap and the file size, and suggests a range read", async () => {
+    // pi-fork's read.ts:277 reads the WHOLE file before applying offset/limit, so a
+    // capped file is unreachable through Read even with paging — the model needs to be
+    // told to use bash instead, and how big the file is so it can pick a range.
+    const calls: string[] = [];
+    const fn: ExecInPod = async (command) => {
+      calls.push(command);
+      if (command.startsWith("stat")) return { stdout: Buffer.from("21000000\n"), exitCode: 0, truncated: false };
+      return { stdout: Buffer.from("partial"), exitCode: null, truncated: true };
+    };
+    const ops = createPodReadOps(fn, cfg);
+    // Capture once rather than re-invoking per assertion: each call would re-issue the
+    // stat, and asserting three separate rejections of the same call is not possible.
+    const err = (await ops.readFile("/head/big.json").catch((e) => e)) as Error;
+    expect(err.message).toMatch(/exceeds the .* output cap/);
+    expect(err.message).toMatch(/21000000/); // the size, so the model can pick a range
+    expect(err.message).toMatch(/sed -n/); // the escape hatch
+    expect(calls.some((c) => c.startsWith("stat -c %s"))).toBe(true);
+  });
+
+  it("readFile still reports a signalled cat distinctly from a cap trip", async () => {
+    // truncated: false with a null code is 'no exit status, and NOT our cap'. Blaming
+    // the cap here would send the model chasing a size limit that is not the problem.
+    const { fn } = fakeExec({ stdout: "", exitCode: null, truncated: false });
+    const ops = createPodReadOps(fn, cfg);
+    const err = (await ops.readFile("/head/a.txt").catch((e) => e)) as Error;
+    expect(err.message).toMatch(/no exit status/);
+    expect(err.message).not.toMatch(/output cap/); // must not blame a size limit
+  });
+
+  it("readFile survives a stat that fails, omitting the size", async () => {
+    const fn: ExecInPod = async (command) =>
+      command.startsWith("stat")
+        ? { stdout: Buffer.from(""), exitCode: 1, truncated: false }
+        : { stdout: Buffer.from("partial"), exitCode: null, truncated: true };
+    const ops = createPodReadOps(fn, cfg);
+    await expect(ops.readFile("/head/big.json")).rejects.toThrow(/exceeds the .* output cap/);
   });
 
   it("access rejects when test -r exits non-zero", async () => {
@@ -136,6 +176,36 @@ describe("bash ops", () => {
     });
     expect(calls[0].command).toBe("cd '/workspace' && env GOOD='1' bash -c 'true'");
   });
+
+  it("reports a cap-truncated command as exit 137 rather than success", async () => {
+    // Pi's bash tool treats a null exit code as non-failing
+    // (pi-fork/.../tools/bash.ts:397: `exitCode !== 0 && exitCode !== null`), so
+    // passing the seam's null through told the model a SIGKILLed flood had completed
+    // normally (#181). 137 is 128+9, the conventional SIGKILL status — not a
+    // fabricated code: the command really was killed by signal 9 at the cap. Pi then
+    // throws with the streamed output tail attached, so the model gets both facts.
+    const { fn } = fakeExec({ stdout: "", exitCode: null, truncated: true });
+    const ops = createPodBashOps(fn, cfg);
+    const r = await ops.exec("yes", "/head", { onData: () => {} });
+    expect(r.exitCode).toBe(137);
+  });
+
+  it("passes a null exit code through untouched when it is NOT a cap trip", async () => {
+    // truncated: false with a null code means "signalled, no status" — not our cap.
+    // Mapping that to 137 too would invent a cause, so it stays null and Pi keeps
+    // treating it as it does today.
+    const { fn } = fakeExec({ stdout: "", exitCode: null, truncated: false });
+    const ops = createPodBashOps(fn, cfg);
+    const r = await ops.exec("something-signalled", "/head", { onData: () => {} });
+    expect(r.exitCode).toBeNull();
+  });
+
+  it("passes a genuine non-zero exit code through unchanged", async () => {
+    const { fn } = fakeExec({ stdout: "", exitCode: 3, truncated: false });
+    const ops = createPodBashOps(fn, cfg);
+    const r = await ops.exec("false", "/head", { onData: () => {} });
+    expect(r.exitCode).toBe(3);
+  });
 });
 
 describe("ls ops", () => {
@@ -151,6 +221,19 @@ describe("ls ops", () => {
     expect((await dir).isDirectory()).toBe(true);
     const file = await createPodLsOps(fakeExec({ stdout: "FILE\n" }).fn, cfg).stat("/head/f");
     expect((await file).isDirectory()).toBe(false);
+  });
+
+  it("readdir refuses a truncated listing instead of returning a partial list with the marker as an entry", async () => {
+    // A cap trip (e.g. a directory with ~200k entries) means what came back is not a
+    // trustworthy directory listing — it may even contain OUTPUT_TRUNCATED_MARKER as a
+    // bogus "entry".
+    const { fn } = fakeExec({
+      stdout: "a.txt\nb.txt\n" + OUTPUT_TRUNCATED_MARKER,
+      exitCode: null,
+      truncated: true,
+    });
+    const ops = createPodLsOps(fn, cfg);
+    await expect(ops.readdir("/head/big-dir")).rejects.toThrow(/output cap.*big-dir/);
   });
 });
 
@@ -195,16 +278,16 @@ describe("find ops", () => {
   });
 
   it("glob refuses a truncated listing instead of returning a partial list with the marker as a path", async () => {
-    // Same class as the readFile fix above: exitCode null means the output cap tripped
-    // (or rg was signalled) mid-list, so what came back is not a trustworthy file list —
-    // it may even contain OUTPUT_TRUNCATED_MARKER as a bogus "path" entry.
+    // A cap trip means what came back is not a trustworthy file list — it may even
+    // contain OUTPUT_TRUNCATED_MARKER as a bogus "path" entry.
     const { fn } = fakeExec({
       stdout: "src/a.ts\nb.ts\n" + OUTPUT_TRUNCATED_MARKER,
       exitCode: null,
+      truncated: true,
     });
     const ops = createPodFindOps(fn, cfg);
     await expect(ops.glob("*.ts", "/head", { ignore: [], limit: 5 })).rejects.toThrow(
-      /glob (failed|truncated) in pod/,
+      /output cap/,
     );
   });
 
@@ -212,6 +295,14 @@ describe("find ops", () => {
     const { fn } = fakeExec({ stdout: "", exitCode: 2 });
     const ops = createPodFindOps(fn, cfg);
     await expect(ops.glob("[", "/head", { ignore: [], limit: 100 })).rejects.toThrow(/glob failed in pod/);
+  });
+
+  it("glob reports a cap trip distinctly from an rg failure", async () => {
+    const { fn } = fakeExec({ stdout: "a.ts\n", exitCode: null, truncated: true });
+    const ops = createPodFindOps(fn, cfg);
+    await expect(ops.glob("*.ts", "/head", { ignore: [], limit: 100 })).rejects.toThrow(
+      /output cap/,
+    );
   });
 
   it("exists uses test -e on the mapped path", async () => {

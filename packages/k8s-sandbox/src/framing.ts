@@ -6,6 +6,20 @@
 
 const SOH = "\x01"; // marker lead byte; never appears in base64 output
 
+/**
+ * Reported in place of the command's exit code when a stage of the wrapper pipeline
+ * itself failed (`head -c` or `base64`), rather than the command.
+ *
+ * This exists because the failure is otherwise INVISIBLE and destructive. If `head` is
+ * absent, or present but rejects `-c`, the wrapper yields **empty stdout with the
+ * command's own exit code of 0** — verified against real bash for both cases. A read
+ * would then return an empty buffer with a success status, and Pi's Edit tool writes back
+ * whatever the read returned, truncating the file to zero length. Negative because the
+ * frame carries a single integer and no real exit status is negative; FrameParser already
+ * accepts `-?\d+`.
+ */
+export const CAP_STAGE_FAILED = -2;
+
 export interface Frame {
   nonce: string;
   stdout: Buffer; // base64-decoded command stdout
@@ -15,22 +29,50 @@ export interface Frame {
 /**
  * Build the line(s) written to the session's stdin for one command.
  *
- * `command` is run verbatim; its stdout is base64-encoded between
- * `\x01B<nonce>` and `\x01E<nonce> <exit>` markers. The reported exit code is
- * the COMMAND's (`${PIPESTATUS[0]}`) — NOT base64's `$?`, which is ~always 0.
+ * `command` is run verbatim; its stdout is capped, base64-encoded, and bracketed by
+ * `\x01B<nonce>` and `\x01E<nonce> <exit>` markers. The reported exit code is the
+ * COMMAND's (`${PIPESTATUS[0]}`) — NOT base64's `$?`, which is ~always 0.
  *
- * When `stdin` is provided it is delivered to the command via a nonce-delimited
- * heredoc (a shared-stdin session can't pipe separate per-command stdin). The
- * heredoc body is emitted as latin1 so arbitrary bytes survive round-trip;
- * callers typically pass base64 payloads which are ASCII either way. The
- * command must be a single pipeline whose first stage consumes stdin (holds for
- * `base64 -d > <path>`). The heredoc delimiter uses `KAGENTI_EOF_<nonce>` — a
- * bash-safe word that contains `_`, which the standard base64 alphabet
- * (A-Za-z0-9+/=) never emits, so it cannot collide with a body line.
+ * `capBytes` bounds RAW stdout in the pod via `head -c <capBytes + 1>`, which is why the
+ * cap is applied here rather than client-side (spec ST6 §3.3):
+ *
+ *  - It caps raw bytes BEFORE base64 inflation, so the trip point matches the per-call
+ *    transports exactly. A client-side byte count would cap content at capBytes × 3/4.
+ *  - `PIPESTATUS[0]` still indexes the command: adding a pipeline stage after the group
+ *    does not shift index 0. A cap trip makes it 141 (SIGPIPE), which we ignore — the
+ *    caller detects truncation by length, so nothing depends on telling that 141 apart
+ *    from a command's own internal SIGPIPE.
+ *  - It bounds `FrameParser.push`'s buffer, which is re-stringified per chunk and so
+ *    grows quadratically in the frame size.
+ *
+ * `capBytes + 1` is requested deliberately: the caller flags truncation as
+ * `stdout.length > capBytes`, so it needs one byte of evidence to distinguish output
+ * that landed exactly on the cap (complete) from output that exceeded it.
+ *
+ * When `stdin` is provided it is delivered to the command via a nonce-delimited heredoc
+ * (a shared-stdin session can't pipe separate per-command stdin). The heredoc body is
+ * emitted as latin1 so arbitrary bytes survive round-trip; callers typically pass base64
+ * payloads which are ASCII either way. The command must be a single pipeline whose first
+ * stage consumes stdin (holds for `base64 -d > <path>`). The heredoc delimiter uses
+ * `KAGENTI_EOF_<nonce>` — a bash-safe word that contains `_`, which the standard base64
+ * alphabet (A-Za-z0-9+/=) never emits, so it cannot collide with a body line.
  */
-export function wrapCommand(nonce: string, command: string, stdin?: Buffer): string {
+export function wrapCommand(
+  nonce: string,
+  command: string,
+  stdin: Buffer | undefined,
+  capBytes: number,
+): string {
   const begin = `printf '${SOH}B%s\\n' ${nonce}; `;
-  const end = `printf '${SOH}E%s %d\\n' ${nonce} "\${PIPESTATUS[0]}"\n`;
+  // Capture the whole PIPESTATUS array immediately — any command clobbers it. Index 0 is
+  // the command group, 1 is the `head -c` cap stage, 2 is `base64`. A non-zero status in
+  // 1 or 2 means OUR pipeline broke rather than the command, which would otherwise surface
+  // as empty output with the command's own 0 (see CAP_STAGE_FAILED).
+  const end =
+    `st=("\${PIPESTATUS[@]}"); rc="\${st[0]}"; ` +
+    `{ [ "\${st[1]}" = 0 ] && [ "\${st[2]}" = 0 ]; } || rc=${CAP_STAGE_FAILED}; ` +
+    `printf '${SOH}E%s %d\\n' ${nonce} "\$rc"\n`;
+  const cap = `head -c ${capBytes + 1}`;
   if (stdin) {
     // Heredoc delimiter must be bash-safe AND collision-proof. We CANNOT use the
     // \x01 stream marker here: bash strips control bytes from a heredoc delimiter
@@ -39,9 +81,9 @@ export function wrapCommand(nonce: string, command: string, stdin?: Buffer): str
     // use a delimiter containing '_', which the standard base64 alphabet
     // (A-Za-z0-9+/=) never emits, so it can never collide with a body line.
     const h = `KAGENTI_EOF_${nonce}`;
-    return `${begin}{ ${command} <<'${h}'\n${stdin.toString("latin1")}\n${h}\n} | base64; ${end}`;
+    return `${begin}{ ${command} <<'${h}'\n${stdin.toString("latin1")}\n${h}\n} | ${cap} | base64; ${end}`;
   }
-  return `${begin}{ ${command}; } | base64; ${end}`;
+  return `${begin}{ ${command}; } | ${cap} | base64; ${end}`;
 }
 
 function escapeRe(s: string): string {

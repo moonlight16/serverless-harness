@@ -1,7 +1,8 @@
 import { type ChildProcess, spawn as nodeSpawn } from "node:child_process";
 import type { K8sSandboxConfig } from "./config.js";
 import type { ExecInPod, SandboxTransport } from "./transport.js";
-import { FrameParser, wrapCommand } from "./framing.js";
+import { DEFAULT_OUTPUT_CAP, OUTPUT_TRUNCATED_MARKER } from "./transport.js";
+import { CAP_STAGE_FAILED, FrameParser, wrapCommand } from "./framing.js";
 
 /** argv for the long-lived session: a bare interactive `bash` (NOT `bash -c`). */
 export function buildPersistentKubectlArgs(config: K8sSandboxConfig): string[] {
@@ -16,7 +17,7 @@ type SpawnFn = typeof nodeSpawn;
 interface Inflight {
   nonce: string;
   /** resolve from a matching frame */
-  done: (r: { stdout: Buffer; exitCode: number | null }) => void;
+  done: (r: { stdout: Buffer; exitCode: number | null; truncated: boolean }) => void;
   /** channel died → caller retries via fallback */
   fail: (e: Error) => void;
 }
@@ -31,15 +32,20 @@ interface Inflight {
  */
 export function persistentExecInPod(
   config: K8sSandboxConfig,
-  deps: { fallback: ExecInPod; spawn?: SpawnFn },
+  deps: { fallback: ExecInPod; spawn?: SpawnFn; outputCapBytes?: number },
 ): SandboxTransport {
   const spawnFn = deps.spawn ?? nodeSpawn;
+  const outputCap = deps.outputCapBytes ?? DEFAULT_OUTPUT_CAP;
   let child: ChildProcess | null = null;
   let parser = new FrameParser();
   let inflight: Inflight | null = null;
   const queue: Array<() => void> = [];
   let seq = 0;
   let disposed = false;
+  // Latched once the pod proves it cannot run our wrapper pipeline (missing `head -c`, or
+  // a `head` that rejects it). Not retried: the pod's binaries will not change mid-session,
+  // so respawning would fail identically on every op and pay double for it.
+  let capStageBroken = false;
 
   const killChild = () => {
     if (!child) return;
@@ -80,7 +86,47 @@ export function persistentExecInPod(
         if (inflight && f.nonce === inflight.nonce) {
           const cur = inflight;
           inflight = null;
-          cur.done({ stdout: f.stdout, exitCode: f.exitCode });
+          // The pod capped raw stdout at outputCap + 1 (framing.ts), so one byte past
+          // the cap is the evidence that output was cut. Trim to the cap and append the
+          // marker, matching the per-call transports' `> cap` trip boundary — though not
+          // their byte count: exec.ts and grpc-relay-transport.ts push the whole chunk
+          // that crosses the cap before testing `bytes > outputCap`, so their returned
+          // stdout can exceed the cap by up to one chunk, whereas this transport trims to
+          // exactly `cap`.
+          //
+          // This RESOLVES rather than calling cur.fail(): fail() retries through
+          // deps.fallback (the capped KubectlTransport, per extension.ts:52), so
+          // treating a cap trip as a channel failure would re-run the command and flood
+          // twice before failing anyway. A cap trip is a result, not a dead channel.
+          if (f.exitCode === CAP_STAGE_FAILED) {
+            // Our own pipeline broke, not the command. Left unhandled this arrives as
+            // empty stdout with exit 0, which `readFile` would return as a successful
+            // empty read and Pi's Edit would then write back — truncating the file to
+            // zero. Latch it, say so once, and hand this and every later op to the
+            // fallback transport, which caps client-side and needs no `head -c`.
+            capStageBroken = true;
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[k8s-sandbox] pod ${config.namespace}/${config.pod}: the persistent channel's ` +
+                `output-cap stage failed (\`head -c\` missing or not supporting -c, or \`base64\` ` +
+                `unavailable). Falling back to per-call exec for all file operations. ` +
+                `Check the sandbox image: \`kubectl exec -n ${config.namespace} ${config.pod} -- head -c 1 /dev/null\`.`,
+            );
+            killChild();
+            parser = new FrameParser();
+            cur.fail(new Error("persistent channel output-cap stage unavailable"));
+            pump();
+            continue;
+          }
+          if (f.stdout.length > outputCap) {
+            cur.done({
+              stdout: Buffer.concat([f.stdout.subarray(0, outputCap), Buffer.from(OUTPUT_TRUNCATED_MARKER)]),
+              exitCode: null,
+              truncated: true,
+            });
+          } else {
+            cur.done({ stdout: f.stdout, exitCode: f.exitCode, truncated: false });
+          }
           pump();
         }
       }
@@ -93,7 +139,7 @@ export function persistentExecInPod(
   };
 
   const exec: ExecInPod = (command, opts = {}) => {
-    if (disposed) return deps.fallback(command, opts);
+    if (disposed || capStageBroken) return deps.fallback(command, opts);
     return new Promise((resolve, reject) => {
       const start = () => {
         ensureChild();
@@ -144,7 +190,7 @@ export function persistentExecInPod(
           },
         };
         try {
-          child.stdin!.write(wrapCommand(nonce, command, opts.stdin));
+          child.stdin!.write(wrapCommand(nonce, command, opts.stdin, outputCap));
         } catch (e) {
           failSession(e instanceof Error ? e : new Error(String(e)));
         }

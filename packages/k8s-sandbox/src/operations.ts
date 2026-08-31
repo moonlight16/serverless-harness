@@ -9,6 +9,7 @@ import type {
 import type { K8sSandboxConfig } from "./config.js";
 import type { ExecInPod } from "./exec.js";
 import { mapPath, shQuote } from "./paths.js";
+import { DEFAULT_OUTPUT_CAP } from "./transport.js";
 
 const IMAGE_MIMES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
 
@@ -24,14 +25,22 @@ export function createPodReadOps(exec: ExecInPod, cfg: K8sSandboxConfig): ReadOp
       // Never hand back bytes we cannot vouch for. Pi's Edit tool is
       // read-whole-file → replace → write-whole-file, so returning a partial read
       // would write the truncation — marker text included — back over the real
-      // file. A null exit code means the exec produced no status: the seam's
-      // output cap tripped and the reader was cut off mid-file (spec §8), or the
-      // `cat` was signalled. Non-zero means the `cat` itself failed. Neither can
-      // yield file contents, so both throw, exactly as `access` does below.
-      if (r.exitCode === null) {
+      // file.
+      if (r.truncated) {
+        // pi-fork's read.ts reads the WHOLE file and only then applies offset/limit, so
+        // a file over the cap is unreachable through Read/Edit entirely — not merely
+        // truncated. Name the size so the model can choose a range, and point at the
+        // one tool that can still get there. Error path only, so the extra exec is free.
+        const stat = await exec(`stat -c %s ${q(p)}`).catch(() => null);
+        const size = stat && stat.exitCode === 0 ? stat.stdout.toString().trim() : null;
         throw new Error(
-          `Read truncated in pod (output cap tripped or cat signalled; no exit status): ${p}`,
+          `Read exceeds the ${DEFAULT_OUTPUT_CAP} byte sandbox output cap` +
+            `${size ? ` (file is ${size} bytes)` : ""}: ${p}. ` +
+            `Read a range with bash instead, e.g. sed -n '1,500p' <file>.`,
         );
+      }
+      if (r.exitCode === null) {
+        throw new Error(`Read failed in pod (cat signalled; no exit status): ${p}`);
       }
       if (r.exitCode !== 0) {
         throw new Error(`Read failed in pod (cat exited ${r.exitCode}): ${p}`);
@@ -97,6 +106,17 @@ export function createPodBashOps(exec: ExecInPod, cfg: K8sSandboxConfig): BashOp
         ? `cd ${q(cwd)} && env ${pairs.join(" ")} bash -c ${shQuote(command)}`
         : `cd ${q(cwd)} && ${command}`; // M2's exact form — unchanged when no env
       const r = await exec(wrapped, { onData, signal, timeout });
+      // A cap trip means the command was SIGKILLed mid-flight with no exit status. Pi
+      // treats a null code as non-failing (bash.ts:397), so returning the seam's null
+      // here told the model a killed command had completed (#181). 137 = 128+9 is the
+      // conventional SIGKILL status and is accurate — the command was killed by signal 9
+      // — and it routes through Pi's own failure path, which appends the streamed output
+      // tail. A bare throw would lose that tail: bash.ts applies appendStatus only for
+      // "aborted"/"timeout:" messages and bare-rethrows anything else.
+      //
+      // Caveat: on the kubectl paths we SIGKILL our local client, so the in-pod process
+      // dies by EPIPE rather than by our signal (#185, spec §8's declared mechanisms).
+      if (r.truncated) return { exitCode: 137 };
       return { exitCode: r.exitCode };
     },
   };
@@ -114,6 +134,15 @@ export function createPodLsOps(exec: ExecInPod, cfg: K8sSandboxConfig): LsOperat
     },
     readdir: async (p) => {
       const r = await exec(`ls -1A ${q(p)}`);
+      // A directory with enough entries (~200k) can cross the output cap just like any
+      // other unbounded listing. A cap trip means what came back is not a trustworthy
+      // directory listing — it may even contain OUTPUT_TRUNCATED_MARKER as a bogus entry.
+      if (r.truncated) {
+        throw new Error(
+          `readdir exceeds the ${DEFAULT_OUTPUT_CAP} byte sandbox output cap: ${p}. ` +
+            `List a subdirectory, or use bash with \`ls -1A | head -n <n>\`.`,
+        );
+      }
       if (r.exitCode !== 0) throw new Error(`readdir failed in pod: ${p}`);
       return r.stdout.toString().split("\n").filter((x) => x.length > 0);
     },
@@ -138,11 +167,26 @@ export function createPodFindOps(exec: ExecInPod, cfg: K8sSandboxConfig): FindOp
         `cd ${q(cwd)} && rg --files --hidden ${globs.join(" ")} | head -n ${limit}; ` +
           `rc=\${PIPESTATUS[0]}; [ "\$rc" = 0 ] || [ "\$rc" = 1 ] || [ "\$rc" = 141 ] || exit "\$rc"`,
       );
-      // A null exit code means the output cap tripped or rg was signalled, so the
-      // partial listing must not be returned. rg exits 1 for no matches, which is a
-      // valid empty result; all other non-zero codes indicate a real failure.
+      // Two independent concerns, checked in order.
+      //
+      // The shell guard above surfaces `rg`'s own status, which piping to `head` would
+      // otherwise mask (#187): rc 0 and rc 1 (no matches) are both success, 141 is `head`
+      // closing the pipe once it has its limit, and anything else propagates as the exec's
+      // status. That is about the SEARCH failing.
+      //
+      // Truncation is a property of the SEAM, not of rg's exit code, so it has its own
+      // flag and is checked first — a cap trip can happen while rg itself is perfectly
+      // happy, and reporting it as "rg exited N" would blame the wrong component.
+      if (r.truncated) {
+        // What came back can contain OUTPUT_TRUNCATED_MARKER as a bogus path entry, so
+        // it cannot be handed to the model as a file list.
+        throw new Error(
+          `glob exceeds the ${DEFAULT_OUTPUT_CAP} byte sandbox output cap: ${pattern}. ` +
+            `Narrow the pattern or lower the limit.`,
+        );
+      }
       if (r.exitCode === null) {
-        throw new Error(`glob truncated in pod (output cap tripped or rg signalled): ${pattern}`);
+        throw new Error(`glob failed in pod (rg signalled; no exit status): ${pattern}`);
       }
       if (r.exitCode !== 0 && r.exitCode !== 1) {
         throw new Error(`glob failed in pod (rg exited ${r.exitCode}): ${pattern}`);

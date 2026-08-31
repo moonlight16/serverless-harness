@@ -1,7 +1,7 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import type { K8sSandboxConfig } from "../src/config.js";
 import { KubectlTransport } from "../src/exec.js";
 import { persistentExecInPod } from "../src/persistent-exec.js";
@@ -39,6 +39,30 @@ async function kubectlExecRaw(args: string[]): Promise<string> {
 }
 
 describe.skipIf(!LIVE)("M3 live smoke (real kind cluster)", () => {
+  // Seed the find fixtures this suite reads. Claims 1, 4 and 5 assert on a `.gitignore`
+  // and a tree of seeded `.ts` files that they do NOT create themselves — Claims 2 and 4b
+  // build their own, which is why they pass on a bare pod while the others do not.
+  //
+  // This used to be a manual step in SMOKE.md, and skipping it is actively misleading:
+  // the symptoms are `Read failed in pod (cat exited 1): /head/.gitignore` and
+  // `glob result: []`, which look exactly like regressions in the read/glob paths rather
+  // than like absent fixtures. A pod restart is enough to lose the content, so the suite
+  // seeds itself instead of depending on operator memory.
+  //
+  // Idempotent by construction (`mkdir -p`, `>` truncating redirects), so re-runs and a
+  // partially-seeded workspace are both fine. `/workspace` is used because the pod runs
+  // as an arbitrary non-root UID and `/tmp` is not writable.
+  beforeAll(async () => {
+    await kubectlExecRaw([
+      "bash",
+      "-c",
+      "cd /workspace && mkdir -p src node_modules/pkg .git dist && " +
+        'printf "node_modules/\ndist/\n" > .gitignore && ' +
+        ": > src/keep.ts && : > node_modules/pkg/skip.ts && : > .git/cfg.ts && " +
+        ": > dist/bundle.ts && : > top.ts",
+    ]);
+  }, 60_000);
+
   it("Claim 1: a single persistent process serves a burst of >=3 ops", async () => {
     let spawnCount = 0;
     const countingSpawn = ((...a: Parameters<typeof nodeSpawn>) => {
@@ -233,4 +257,41 @@ describe.skipIf(!LIVE)("M3 live smoke (real kind cluster)", () => {
     // eslint-disable-next-line no-console
     console.log(`[Claim5] bash-process count before=${before} after=${after} (informational)`);
   }, 30000);
+
+  it("Claim 6: a file over the output cap fails the read loudly, with a usable message", async () => {
+    // The one change with no hermetic proxy: a real `head -c` in a real pipeline, over
+    // kubectl exec, against the sandbox image's coreutils. The unit tests prove the
+    // command shape and the client half; only this proves they compose in the pod.
+    const t = persistentExecInPod(cfg, { fallback: KubectlTransport(cfg).exec });
+    try {
+      const big = "/workspace/cap-probe.bin";
+      // 9 MiB > the 8 MiB cap, written in-pod so no large payload crosses the wire.
+      await kubectlExecRaw(["bash", "-c", `head -c 9437184 /dev/zero > ${big}`]);
+      const read = createPodReadOps(t.exec, cfg);
+      // One read, three assertions: re-invoking would push 9 MiB through the pod's
+      // pipeline three times for no extra coverage.
+      const err = (await read.readFile("/head/cap-probe.bin").catch((e) => e)) as Error;
+      expect(err.message).toMatch(/exceeds the .* output cap/);
+      // The message must carry the size and the escape hatch, or the model cannot act.
+      expect(err.message).toMatch(/9437184/);
+      expect(err.message).toMatch(/sed -n/);
+
+      // A file just under the cap must still read cleanly — the cap must not have made
+      // the whole path fragile.
+      const small = "/workspace/cap-probe-small.bin";
+      await kubectlExecRaw(["bash", "-c", `head -c 1048576 /dev/zero > ${small}`]);
+      const buf = await read.readFile("/head/cap-probe-small.bin");
+      expect(buf.length).toBe(1048576);
+
+      // And bash reports the kill rather than success (#181), over the same real pod.
+      const bash = createPodBashOps(KubectlTransport(cfg).exec, cfg);
+      const r = await bash.exec(`cat ${big}`, "/head", { onData: () => {} });
+      expect(r.exitCode).toBe(137);
+    } finally {
+      await t.close();
+      await kubectlExecRaw(["bash", "-c", "rm -f /workspace/cap-probe.bin /workspace/cap-probe-small.bin"]).catch(
+        () => {},
+      );
+    }
+  }, 120_000);
 });

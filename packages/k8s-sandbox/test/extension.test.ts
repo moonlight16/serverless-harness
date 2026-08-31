@@ -25,7 +25,7 @@ function fakePi() {
 }
 
 const okTransport = (close = vi.fn(async () => {})): SandboxTransport => ({
-  exec: async () => ({ stdout: Buffer.from(""), exitCode: 0 }),
+  exec: async () => ({ stdout: Buffer.from(""), exitCode: 0, truncated: false }),
   close,
 });
 

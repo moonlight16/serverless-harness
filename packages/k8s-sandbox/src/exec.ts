@@ -4,7 +4,7 @@ import type { ExecInPod, SandboxTransport } from "./transport.js";
 import { DEFAULT_OUTPUT_CAP, OUTPUT_TRUNCATED_MARKER } from "./transport.js";
 
 // Re-export so existing `./exec.js` importers of ExecInPod keep working.
-export type { ExecInPod } from "./transport.js";
+export type { ExecInPod, ExecResult } from "./transport.js";
 
 type SpawnFn = typeof nodeSpawn;
 
@@ -69,7 +69,7 @@ export function KubectlTransport(
           // This only kills the local kubectl client; the in-pod process is stopped
           // (if at all) by EPIPE on its next write to the now-closed stream — fine for
           // cat/grep, but a hostile producer that traps or ignores SIGPIPE keeps
-          // running in the pod after this returns (spec §8 "Accepted divergences").
+          // running in the pod after this returns (spec §8 "Poisoned-output defense").
           child.kill("SIGKILL");
         }
       });
@@ -92,12 +92,12 @@ export function KubectlTransport(
         if (timer) clearTimeout(timer);
         opts.signal?.removeEventListener("abort", onAbort);
         if (opts.signal?.aborted) return reject(new Error("aborted"));
-        if (truncated) return resolve({ stdout: Buffer.concat(out), exitCode: null });
+        if (truncated) return resolve({ stdout: Buffer.concat(out), exitCode: null, truncated: true });
         if (timedOut) return reject(new Error(`timeout:${opts.timeout}`));
         if (shouldEmitExecTiming(process.env)) {
           process.stderr.write(formatExecTiming(config.pod, Date.now() - startMs, command));
         }
-        resolve({ stdout: Buffer.concat(out), exitCode: code });
+        resolve({ stdout: Buffer.concat(out), exitCode: code, truncated: false });
       });
 
       if (opts.stdin) child.stdin.end(opts.stdin);

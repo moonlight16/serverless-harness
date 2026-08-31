@@ -336,30 +336,36 @@ The frame *semantics* are carried from the superseded design verbatim — only t
 - **Dual-ended timeout.** The worker kills its local child at `timeout_s`; the harness has
   its own deadline and synthesizes a timeout `error` if no `End` arrives — it never hangs
   on a silent or malicious worker.
-- **Poisoned-output defense.** Both **per-call** transports enforce a total-output cap per
-  exec: `GrpcRelayTransport` issues `Abort`, `KubectlTransport` SIGKILLs its `kubectl exec`
-  child. Both truncate, append `[output truncated]`, and return a null exit code, and the
-  shared conformance battery asserts all of it — including that the producer was actually
-  stopped — for both, so neither can regress alone. This is the concrete mitigation for the
-  driver-#1 threat of a malicious sandbox flooding the model's context. `Chunk` size is
-  capped so a single frame stays small (backpressure). **Known exception:**
-  `persistentExecInPod` is a third `SandboxTransport` implementation and is **uncapped**.
-  It is not a corner case — `extension.ts` wires it to Read/Write/Edit/Ls/Find, i.e. every
-  file-reading tool — so the cap is a property of two of the three implementations, not of
-  the seam, and Pi genuinely can tell the backends apart on output volume today. Capping it
-  changes production behaviour on the Read path and is tracked separately, not in this epic.
-  One consequence is closed regardless: a dead persistent channel retries the op through the
-  capped `KubectlTransport`, so a read *can* come back truncated, and
-  `createPodReadOps.readFile` therefore throws on a null or non-zero exit code rather than
-  return bytes it cannot vouch for — a truncated read can no longer be written back over the
-  file by Pi's Edit tool.
+- **Poisoned-output defense.** **All three** `SandboxTransport` implementations enforce a
+  total-returned-output cap per exec, so Pi cannot tell which backend served a flood. Each
+  truncates, appends `[output truncated]`, sets `truncated: true`, and returns a null exit
+  code; `truncated === true ⇒ exitCode === null` is an invariant the shared conformance
+  battery asserts for every implementation. `truncated` exists because a null exit code
+  alone is ambiguous — it also means "signalled, no status" — and callers must be able to
+  tell those apart. This is the concrete mitigation for the driver-#1 threat of a malicious
+  sandbox flooding the model's context. `Chunk` size is separately capped so a single frame
+  stays small (backpressure).
+
+  **The stop mechanism differs by transport, and each declares which one it uses:**
+
+  | Transport | Mechanism | What it guarantees |
+  |---|---|---|
+  | `GrpcRelayTransport` | `remote-abort` — `Abort` for the exec's `req_id` | the worker kills the process group |
+  | `KubectlTransport` | `local-kill` — SIGKILL its `kubectl exec` client | the in-pod process stops on EPIPE, if at all |
+  | `persistentExecInPod` | `producer-side-cap` — pod-side `head -c` in the framed pipeline | raw output cannot exceed the cap at the source |
+
+  The battery asserts the *declared* mechanism rather than accepting any truthy "stopped"
+  signal, so a transport cannot claim one and perform another, and a deleted stop fails
+  loudly. Neither kubectl mechanism defends against a producer that traps or ignores
+  SIGPIPE and keeps burning CPU after we stop reading; that residual threat belongs to
+  VM-level isolation (#57), not to the cap.
 - **Abort/end races.** A late `End` for an aborted `req_id` is dropped; an `Abort` for an
   already-ended `req_id` is a no-op.
 
 ### Accepted divergences (known, not fixed here)
 
-All three are deliberate: recording them beats leaving them implicit, and changing any of
-them is a production-behaviour decision outside this epic.
+This one is deliberate: recording it beats leaving it implicit, and changing it is a
+production-behaviour decision outside this epic.
 
 - **No default deadline on the kubectl path.** `KubectlTransport` arms a timer only when
   `opts.timeout > 0`; `GrpcRelayTransport` always applies `DEFAULT_DEADLINE_MS` (120 s).
@@ -368,27 +374,6 @@ them is a production-behaviour decision outside this epic.
   unbounded pod-side exec on one backend, a surprise 120 s failure on the other. The
   conformance battery cannot see this: its timeout case always passes an explicit
   `timeout`.
-- **A capped `bash` flood is killed but reported as success.** `createPodBashOps` returns
-  only `{ exitCode }` — the buffer is discarded — and Pi's bash tool treats
-  `exitCode: null` as non-failing (`exitCode !== 0 && exitCode !== null`). So a `bash`
-  whose stdout crosses the cap is SIGKILLed mid-flight and presented to the model as
-  having completed normally, with no signal that its output was cut short; the cap
-  protects nothing on this path, because the bytes are thrown away and Pi clips
-  model-visible output separately anyway. Fixing it means either changing the spec'd
-  truncation semantics on both transports or adding a `truncated` flag to `ExecInPod`'s
-  return type.
-- **The output cap's *enforcement* is not equivalent across transports**, despite the
-  "producer was actually stopped" claim in the Poisoned-output-defense bullet above.
-  On a truncation, `GrpcRelayTransport` sends `Abort`, which the worker honours by killing
-  the *remote* process that is actually producing the flood. `KubectlTransport` kills only
-  the local `kubectl exec` client; the in-pod process is then stopped, if at all, by EPIPE
-  on its next write — which a hostile producer that traps or ignores SIGPIPE can survive
-  indefinitely, contrary to the threat model this cap exists for (conformance.ts's own
-  wording: a producer that "keeps burning the pod's CPU"). The conformance battery cannot
-  tell the two apart because each factory collapses its stop mechanism into a single
-  `producerStopped()` boolean: the pod path passes on "we called kill", the gRPC path
-  passes on "the producer was actually told to stop", and the shared spec has no way to
-  distinguish those two claims.
 
 ## 9. Security & reachability
 
