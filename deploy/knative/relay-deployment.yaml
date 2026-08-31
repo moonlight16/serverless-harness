@@ -46,12 +46,21 @@ spec:
               value: dev-token
           ports:
             - containerPort: 8443
+          # The entrypoint is `node --import tsx src/main.ts`, so tsx compiles the relay's
+          # TypeScript in memory at startup: measured 224 MiB steady / 225 MiB peak while
+          # merely idle, before a single exec is relayed. The previous 128Mi limit was
+          # therefore never survivable -- the container was OOMKilled (exit 137) during
+          # startup, restarting before it ever bound :8443. That failed silently in the
+          # worst possible way: `rollout status` reports Ready (the Deployment declares no
+          # readinessProbe, so Running is enough), and only a connection attempt revealed
+          # "connection refused inside namespace". Requests cover the measured idle
+          # footprint; the limit leaves headroom for concurrent relayed streams.
           resources:
             requests:
-              memory: "64Mi"
+              memory: "256Mi"
               cpu: "50m"
             limits:
-              memory: "128Mi"
+              memory: "512Mi"
 ---
 apiVersion: v1
 kind: Service
