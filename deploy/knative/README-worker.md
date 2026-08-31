@@ -286,6 +286,94 @@ expects:
 - **stdin** — feed `exec.stdin` bytes to the child's stdin. `Heartbeat` frames
   are liveness-only; the harness owns lease counts.
 
+## Laptop demo: worker as a host container (one command)
+
+Everything above runs the worker as a **pod**. That demonstrates the plumbing but not the
+driver: the headline claim is a sandbox *outside* the cluster, with **zero inbound rules**,
+executing a leaf's tool calls. One command shows that on a laptop:
+
+```bash
+make demo-remote-sandbox                                  # no cluster -> passing A/B
+make demo-remote-sandbox DEMO_ARGS=--reuse-cluster        # skip setup on a warm cluster
+make demo-remote-sandbox-teardown                         # remove the container, relay and image
+```
+
+Teardown removes everything the demo creates, but **asks before deleting the kind cluster**:
+`--reuse-cluster` exists so the demo can run against a long-lived dev cluster, and a fresh
+`--teardown` process cannot know which kind it is looking at. Answer `y`, or pass
+`--yes` to skip the prompt (`DEMO_ARGS=--yes`). With no terminal to ask on, the cluster is
+kept. A run that *did* create the cluster says so on exit and points at `--teardown`; a run
+against a pre-existing cluster does not.
+
+```
+laptop
+|- kind cluster:  Knative + Redis + harness (ksvc) + sandbox-relay
+|                     ^                                    ^
+|                     | harness -> relay                   | worker -> relay
+|                     | sandbox-relay.default.svc:8443     | host.docker.internal:8443
+|                     |  (in-cluster DNS)                  |  (outbound, through a port-forward)
+\- docker run:    remote-worker  --------- dials out ------/
+```
+
+Neither address is inbound to the laptop. The worker publishes no ports — `docker run` with
+no `-p` at all — and reaches the relay only by dialing *out* through
+`kubectl port-forward`. The demo proves the container can reach the tunnel before it starts
+the worker, and adapts the bind (`--add-host`, then `--address 0.0.0.0`) for runtimes where
+`host.docker.internal` maps to a bridge IP rather than host loopback.
+
+### Why a green run is not enough
+
+`SH_REMOTE_SANDBOX=1` alone does **not** route to the worker — see the pool-selection trap
+at the top of this file. The demo defends against it twice:
+
+1. **Structurally.** Before the remote runs it asserts `KAGENTI_SANDBOX_POOL_SELECTOR`
+   matches **zero Running pods**, so `select-sandbox`'s candidate list contains nothing but
+   the worker. A pod cannot win a lease it is not a candidate for.
+2. **By fingerprint.** The in-cluster pool runs Alpine and the worker image runs RHEL, so a
+   leaf grepping `/etc/os-release` flips its verdict with the backend — and both directions
+   are asserted, so an exec that landed on a pod fails one check or the other:
+
+   | backend | pattern `Alpine` | pattern `Red Hat` | model's stated reason |
+   |---|---|---|---|
+   | in-cluster sandbox pod | `FLAGGED` | `CLEAR` | "…running Alpine Linux" |
+   | remote host container | `CLEAR` | `FLAGGED` | "…Red Hat Enterprise Linux 9.8" |
+
+The discriminator itself is verified before anything relies on it, and the summary prints
+the model's own stated reason — so you see the OS it actually read, rather than inferring it
+from a green check.
+
+### Trust model
+
+Inspect what the worker was given:
+
+```bash
+docker inspect sh-demo-remote-worker --format '{{range .Config.Env}}{{println .}}{{end}}'
+```
+
+A bearer token, a sandbox id, and a relay address. **No LLM key, no kubeconfig, no
+orchestration.** The token must equal the relay's `SH_RELAY_TOKEN`; auth is fail-closed, so
+a mismatch rejects the Attach before the stream is ever parked.
+
+The demo generates that token **fresh per run** and patches it onto the relay, rather than
+reusing `relay-deployment.yaml`'s `dev-token`. That value is a repo constant, and therefore
+public — which matters because on native Linux Docker the demo may bind the relay port to
+`0.0.0.0` (see above), and a LAN-reachable port guarded by a credential anyone can read from
+the repo would let a network peer Attach as a sandbox and receive the leaf's exec payloads.
+So what `docker inspect` shows is a credential scoped to this one run. Set `SANDBOX_TOKEN` to
+pin a value instead. A later `kubectl apply -f relay-deployment.yaml` restores the declared
+dev value, so nothing is left patched for other callers.
+
+### Requirements and limits
+
+- `docker` (or `podman`) + `kind` + `kubectl` + `jq`. **No local Go toolchain** —
+  `remote-worker/Dockerfile` builds the binary in a builder stage. The image is built for
+  the *host*, never `kind load`ed, so its architecture need not match the kind node.
+- A model the **cluster** can reach (`ANTHROPIC_API_KEY`, or `ANTHROPIC_AUTH_TOKEN` +
+  `ANTHROPIC_BASE_URL`). The leaf's verdict is a real model call; the demo fails with an
+  explicit "model endpoint unreachable" message rather than timing out mysteriously.
+- The harness ksvc env is snapshotted and restored from an `EXIT` trap, so an interrupted
+  run never leaves the cluster pointed at a selector matching nothing.
+
 ## Running the worker outside the cluster
 
 The steps above assume the worker runs as a pod in the same cluster, dialing the
