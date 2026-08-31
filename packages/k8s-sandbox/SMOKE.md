@@ -93,13 +93,18 @@ kubectl apply -f packages/k8s-sandbox/deploy/sandbox.yaml
 kubectl -n default rollout status deploy/sandbox --timeout=180s
 POD=$(kubectl -n default get pod -l app=sandbox -o jsonpath='{.items[0].metadata.name}')
 
-# 2. Seed find fixtures: kept files, ignore-listed dirs, and a gitignored DIR (dist/)
-#    plus a gitignored FILE (handled in-test) to exercise the rg nuance.
-kubectl -n default exec "$POD" -- bash -lc '
-  cd /workspace && mkdir -p src node_modules/pkg .git dist &&
-  printf "node_modules/\ndist/\n" > .gitignore &&
-  : > src/keep.ts && : > node_modules/pkg/skip.ts && : > .git/cfg.ts &&
-  : > dist/bundle.ts && : > top.ts'
+# 2. (No longer needed — the suite seeds its own fixtures.)
+#    The find fixtures (a .gitignore plus seeded .ts files under src/, node_modules/pkg/,
+#    .git/ and dist/) are now created by a `beforeAll` in m3-live-smoke.test.ts, so the
+#    suite is self-contained and survives a pod restart. Skipping the old manual step used
+#    to fail Claims 1/4/5 with `Read failed in pod (cat exited 1): /head/.gitignore` and
+#    `glob result: []` — symptoms that point at the read/glob code rather than at absent
+#    fixtures. Kept here only as a record of what the suite seeds:
+#
+#      cd /workspace && mkdir -p src node_modules/pkg .git dist &&
+#      printf "node_modules/\ndist/\n" > .gitignore &&
+#      : > src/keep.ts && : > node_modules/pkg/skip.ts && : > .git/cfg.ts &&
+#      : > dist/bundle.ts && : > top.ts
 
 # 3. Run the gated live smoke (real cluster; no model gateway required)
 M3_LIVE_SMOKE=1 KAGENTI_SANDBOX_POD="$POD" KAGENTI_SANDBOX_CONTEXT=kind-kagenti \
