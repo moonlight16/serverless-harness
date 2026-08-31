@@ -1,4 +1,4 @@
-.PHONY: lint fmt test typecheck demo-remote-sandbox demo-remote-sandbox-teardown
+.PHONY: lint fmt test test-deploy typecheck demo-remote-sandbox demo-remote-sandbox-teardown
 
 lint:
 	pre-commit run --all-files
@@ -9,6 +9,13 @@ fmt:
 test:
 	pnpm -r test
 	cd remote-worker && go test ./...
+	$(MAKE) test-deploy
+
+# Cluster-free unit tests for the deploy/ shell scripts: kubectl, kind and docker are
+# mocked on PATH and only the call log is asserted. Run in CI by the `deploy-scripts` job.
+# `set -e` so one failing test file fails the target instead of being scrolled past.
+test-deploy:
+	@set -e; for t in deploy/knative/tests/*.test.sh; do echo "== $$t"; bash "$$t"; done
 
 typecheck:
 	cd harness && pnpm exec tsc --noEmit

@@ -68,6 +68,19 @@ jobs:
       - name: Test
         run: pnpm -r test
 
+  # The deploy/ shell tests are cluster-free (kubectl/kind/docker are mocked on PATH), so
+  # they need no node, no pnpm and no cluster -- hence their own fast job rather than a step
+  # tacked onto `check`. Without this job nothing runs them: security-scans.yml only
+  # shellchecks deploy/, and the live gate (RELAY_LIVE_SMOKE=1) cannot run in CI at all.
+  deploy-scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Run deploy shell tests
+        run: make test-deploy
+
   proto:
     runs-on: ubuntu-latest
     timeout-minutes: 10
