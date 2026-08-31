@@ -8,21 +8,32 @@ import { FrameParser, wrapCommand } from "../src/framing.js";
 const SOH = "\x01";
 
 describe("wrapCommand", () => {
-  it("brackets base64 output with nonce markers and reports the command's exit code", () => {
-    const line = wrapCommand("n1", "cat '/workspace/a.txt'");
+  // The cap is applied IN THE POD, on the raw stream before base64. Counting bytes
+  // client-side would cap content at cap × 3/4 (base64 inflation), so the trip point
+  // would differ from the per-call transports — a weaker form of exactly the
+  // distinguishability #180 is about. `head -c` also bounds FrameParser.push's
+  // quadratic buffer growth, and keeps PIPESTATUS[0] indexing the command.
+  it("brackets base64 output with nonce markers, caps raw bytes, and reports the command's exit code", () => {
+    const line = wrapCommand("n1", "cat '/workspace/a.txt'", undefined, 8);
     expect(line).toBe(
-      `printf '${SOH}B%s\\n' n1; { cat '/workspace/a.txt'; } | base64; ` +
+      `printf '${SOH}B%s\\n' n1; { cat '/workspace/a.txt'; } | head -c 9 | base64; ` +
         `printf '${SOH}E%s %d\\n' n1 "\${PIPESTATUS[0]}"\n`,
     );
   });
 
-  it("delivers stdin to the command via a nonce-delimited heredoc", () => {
-    const line = wrapCommand("n2", "base64 -d > '/workspace/a.txt'", Buffer.from("aGk="));
+  it("delivers stdin to the command via a nonce-delimited heredoc, still capped", () => {
+    const line = wrapCommand("n2", "base64 -d > '/workspace/a.txt'", Buffer.from("aGk="), 8);
     expect(line).toBe(
       `printf '${SOH}B%s\\n' n2; { base64 -d > '/workspace/a.txt' <<'KAGENTI_EOF_n2'\n` +
-        `aGk=\nKAGENTI_EOF_n2\n} | base64; ` +
+        `aGk=\nKAGENTI_EOF_n2\n} | head -c 9 | base64; ` +
         `printf '${SOH}E%s %d\\n' n2 "\${PIPESTATUS[0]}"\n`,
     );
+  });
+
+  it("asks for cap+1 bytes so the client can distinguish 'exactly at the cap' from 'over it'", () => {
+    // At exactly `cap` bytes the read is complete and must NOT be flagged; the client
+    // detects truncation as `stdout.length > cap`, which needs one byte of evidence.
+    expect(wrapCommand("n3", "cat f", undefined, 100)).toContain("| head -c 101 |");
   });
 });
 
@@ -85,7 +96,7 @@ describe("wrapCommand executed by a real bash (integration)", () => {
     try {
       const target = join(dir, "out.txt");
       const content = Buffer.from('hello\nworld\nspecial "q" $x `b`\n');
-      const line = wrapCommand("n1", `base64 -d > '${target}'`, Buffer.from(content.toString("base64")));
+      const line = wrapCommand("n1", `base64 -d > '${target}'`, Buffer.from(content.toString("base64")), 8 * 1024 * 1024);
       const res = spawnSync("bash", { input: line });
       expect(res.status).toBe(0);
       const frames = new FrameParser().push(res.stdout);
@@ -99,11 +110,58 @@ describe("wrapCommand executed by a real bash (integration)", () => {
   });
 
   maybe("frames a non-zero exit code from a failing write", () => {
-    const line = wrapCommand("n2", "base64 -d > '/no_such_dir_xyz/out.txt'", Buffer.from("eA=="));
+    const line = wrapCommand("n2", "base64 -d > '/no_such_dir_xyz/out.txt'", Buffer.from("eA=="), 8 * 1024 * 1024);
     const res = spawnSync("bash", { input: line });
     const frames = new FrameParser().push(res.stdout);
     expect(frames).toHaveLength(1);
     expect(frames[0].nonce).toBe("n2");
     expect(frames[0].exitCode).not.toBe(0);
+  });
+
+  maybe("caps raw stdout at capBytes + 1 through a real pipeline", () => {
+    // 5000 bytes offered, cap 100 → the pod hands back exactly 101, so the client sees
+    // one byte past the cap and knows the output was cut. Proving this against a real
+    // bash matters: the hermetic conformance fake simulates the cap, so it can only
+    // confirm the client half of the contract.
+    const line = wrapCommand("n3", "yes AAAAAAAA | head -c 5000", undefined, 100);
+    const res = spawnSync("bash", { input: line });
+    const frames = new FrameParser().push(res.stdout);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].stdout.length).toBe(101);
+  });
+
+  maybe("passes output through untouched when it lands under the cap", () => {
+    const line = wrapCommand("n4", "printf 'abc'", undefined, 100);
+    const res = spawnSync("bash", { input: line });
+    const frames = new FrameParser().push(res.stdout);
+    expect(frames[0].stdout.toString()).toBe("abc");
+    expect(frames[0].exitCode).toBe(0);
+  });
+
+  maybe("PIPESTATUS[0] still reports the command, not head or base64", () => {
+    // The cap adds a pipeline stage; if it were inserted before the group, or if the
+    // printf read a different PIPESTATUS index, a failing command would frame as 0.
+    const line = wrapCommand("n5", "exit 42", undefined, 100);
+    const res = spawnSync("bash", { input: line });
+    const frames = new FrameParser().push(res.stdout);
+    expect(frames[0].exitCode).toBe(42);
+  });
+
+  maybe("still writes a file through the capped heredoc-stdin path", () => {
+    // A write produces no stdout, so head passes 0 bytes and the cap is inert — but the
+    // heredoc must survive having a stage appended after the closing brace.
+    const dir = mkdtempSync(join(tmpdir(), "framing-bash-cap-"));
+    try {
+      const target = join(dir, "out.txt");
+      const content = Buffer.from("payload\nwith newline\n");
+      const line = wrapCommand("n6", `base64 -d > '${target}'`, Buffer.from(content.toString("base64")), 100);
+      const res = spawnSync("bash", { input: line });
+      expect(res.status).toBe(0);
+      const frames = new FrameParser().push(res.stdout);
+      expect(frames[0].exitCode).toBe(0);
+      expect(readFileSync(target).equals(content)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

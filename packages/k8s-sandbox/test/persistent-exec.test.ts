@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { K8sSandboxConfig } from "../src/config.js";
 import type { ExecInPod } from "../src/transport.js";
+import { OUTPUT_TRUNCATED_MARKER } from "../src/transport.js";
 import { buildPersistentKubectlArgs, persistentExecInPod } from "../src/persistent-exec.js";
 
 const cfg: K8sSandboxConfig = {
@@ -154,5 +155,54 @@ describe("persistentExecInPod", () => {
     expect(child.kill).toHaveBeenCalled();
     expect(await t.exec("echo later")).toEqual({ stdout: Buffer.from("FB"), exitCode: 7, truncated: false });
     expect(calls).toEqual(["echo later"]);
+  });
+
+  it("flags a cap trip, trims to the cap, appends the marker, and does NOT fall back", async () => {
+    // The critical property. persistentExecInPod's `fail` path retries through
+    // deps.fallback, which extension.ts:52 sets to the now-capped KubectlTransport. If a
+    // cap trip were routed through `fail`, the command would RE-RUN and flood twice
+    // before failing anyway. A cap trip is a result, not a channel failure — so it must
+    // resolve.
+    const { child } = makeFakeChild();
+    const { spawn } = fakeSpawn([child]);
+    const { fallback, calls } = recordingFallback();
+    const t = persistentExecInPod(cfg, { fallback, spawn, outputCapBytes: 6 });
+
+    const p = t.exec("cat big");
+    // The pod's `head -c 7` yields cap+1 = 7 bytes; exit 141 because head closed the pipe.
+    child.stdout.emit("data", frameFor("n1", "aaaabbb", 141));
+    const r = await p;
+
+    expect(r.truncated).toBe(true);
+    expect(r.exitCode).toBeNull();
+    expect(r.stdout.toString()).toBe(`aaaabb${OUTPUT_TRUNCATED_MARKER}`);
+    expect(calls).toEqual([]); // no fallback, so no re-run
+  });
+
+  it("does not flag output that lands exactly on the cap", async () => {
+    const { child } = makeFakeChild();
+    const { spawn } = fakeSpawn([child]);
+    const { fallback } = recordingFallback();
+    const t = persistentExecInPod(cfg, { fallback, spawn, outputCapBytes: 6 });
+
+    const p = t.exec("cat exact");
+    child.stdout.emit("data", frameFor("n1", "aaaabb", 0));
+    const r = await p;
+
+    expect(r.truncated).toBe(false);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.toString()).toBe("aaaabb");
+  });
+
+  it("writes the cap into the framed command so the pod enforces it", async () => {
+    const { child, writes } = makeFakeChild();
+    const { spawn } = fakeSpawn([child]);
+    const { fallback } = recordingFallback();
+    const t = persistentExecInPod(cfg, { fallback, spawn, outputCapBytes: 6 });
+
+    const p = t.exec("cat f");
+    expect(writes[0]).toContain("| head -c 7 |");
+    child.stdout.emit("data", frameFor("n1", "", 0));
+    await p;
   });
 });

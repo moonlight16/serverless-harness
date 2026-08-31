@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn as nodeSpawn } from "node:child_process";
 import type { K8sSandboxConfig } from "./config.js";
 import type { ExecInPod, SandboxTransport } from "./transport.js";
+import { DEFAULT_OUTPUT_CAP, OUTPUT_TRUNCATED_MARKER } from "./transport.js";
 import { FrameParser, wrapCommand } from "./framing.js";
 
 /** argv for the long-lived session: a bare interactive `bash` (NOT `bash -c`). */
@@ -31,9 +32,10 @@ interface Inflight {
  */
 export function persistentExecInPod(
   config: K8sSandboxConfig,
-  deps: { fallback: ExecInPod; spawn?: SpawnFn },
+  deps: { fallback: ExecInPod; spawn?: SpawnFn; outputCapBytes?: number },
 ): SandboxTransport {
   const spawnFn = deps.spawn ?? nodeSpawn;
+  const outputCap = deps.outputCapBytes ?? DEFAULT_OUTPUT_CAP;
   let child: ChildProcess | null = null;
   let parser = new FrameParser();
   let inflight: Inflight | null = null;
@@ -80,9 +82,23 @@ export function persistentExecInPod(
         if (inflight && f.nonce === inflight.nonce) {
           const cur = inflight;
           inflight = null;
-          // truncated is always false here until Task 3 adds the cap; the frame parser
-          // has no cap of its own today.
-          cur.done({ stdout: f.stdout, exitCode: f.exitCode, truncated: false });
+          // The pod capped raw stdout at outputCap + 1 (framing.ts), so one byte past
+          // the cap is the evidence that output was cut. Trim to the cap and append the
+          // marker, matching the per-call transports byte-for-byte.
+          //
+          // This RESOLVES rather than calling cur.fail(): fail() retries through
+          // deps.fallback (the capped KubectlTransport, per extension.ts:52), so
+          // treating a cap trip as a channel failure would re-run the command and flood
+          // twice before failing anyway. A cap trip is a result, not a dead channel.
+          if (f.stdout.length > outputCap) {
+            cur.done({
+              stdout: Buffer.concat([f.stdout.subarray(0, outputCap), Buffer.from(OUTPUT_TRUNCATED_MARKER)]),
+              exitCode: null,
+              truncated: true,
+            });
+          } else {
+            cur.done({ stdout: f.stdout, exitCode: f.exitCode, truncated: false });
+          }
           pump();
         }
       }
@@ -146,7 +162,7 @@ export function persistentExecInPod(
           },
         };
         try {
-          child.stdin!.write(wrapCommand(nonce, command, opts.stdin));
+          child.stdin!.write(wrapCommand(nonce, command, opts.stdin, outputCap));
         } catch (e) {
           failSession(e instanceof Error ? e : new Error(String(e)));
         }
