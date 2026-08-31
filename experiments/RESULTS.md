@@ -5,14 +5,21 @@
 Synthetic sessions, each compacted once with a fixed kept tail. Metric = entries + bytes
 returned by `backend.read()` during reconstruction (the slice each loader rebuilds from).
 `*` ms columns are wall-clock on a dev box — **illustrative only**; the gate is the
-deterministic entries ratio.
+deterministic entries ratio. `backend bytes` is environment-sensitive too (it differs
+between CI and a dev box), so the committed copy of this file is compared on the entries
+and ratio columns only.
+
+This file is a **committed baseline**: `e2-reconstruction-cost.test.ts` asserts that a fresh
+run still matches those columns, and writes each run's own table to the gitignored
+`experiments/.results/`. Refresh it deliberately when a change legitimately moves the read
+counts: `SH_E2_UPDATE_BASELINE=1 pnpm -C experiments test e2-reconstruction-cost`.
 
 | N (session len) | backend entries | checkpoint entries | ratio (b/c) | backend bytes | checkpoint bytes | backend ms* | checkpoint ms* |
 |---|---|---|---|---|---|---|---|
-| 50 | 53 | 6 | 8.8 | 7482 | 896 | 0.9 | 1.0 |
-| 200 | 203 | 6 | 33.8 | 28508 | 901 | 1.4 | 1.6 |
-| 1000 | 1003 | 6 | 167.2 | 140908 | 901 | 5.7 | 5.9 |
-| 5000 | 5003 | 6 | 833.8 | 706909 | 906 | 22.7 | 20.9 |
+| 50 | 53 | 6 | 8.8 | 7482 | 896 | 0.9 | 1.2 |
+| 200 | 203 | 6 | 33.8 | 28508 | 901 | 2.1 | 3.2 |
+| 1000 | 1003 | 6 | 167.2 | 140908 | 901 | 4.8 | 5.1 |
+| 5000 | 5003 | 6 | 833.8 | 706909 | 906 | 23.5 | 20.0 |
 
 **Pass:** checkpoint entries stay ~constant (bounded by the kept tail) while backend entries
 grow linearly with N, so the backend/checkpoint ratio strictly increases with N. `buildSessionContext()`
