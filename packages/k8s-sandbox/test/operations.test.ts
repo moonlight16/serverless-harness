@@ -136,6 +136,36 @@ describe("bash ops", () => {
     });
     expect(calls[0].command).toBe("cd '/workspace' && env GOOD='1' bash -c 'true'");
   });
+
+  it("reports a cap-truncated command as exit 137 rather than success", async () => {
+    // Pi's bash tool treats a null exit code as non-failing
+    // (pi-fork/.../tools/bash.ts:397: `exitCode !== 0 && exitCode !== null`), so
+    // passing the seam's null through told the model a SIGKILLed flood had completed
+    // normally (#181). 137 is 128+9, the conventional SIGKILL status — not a
+    // fabricated code: the command really was killed by signal 9 at the cap. Pi then
+    // throws with the streamed output tail attached, so the model gets both facts.
+    const { fn } = fakeExec({ stdout: "", exitCode: null, truncated: true });
+    const ops = createPodBashOps(fn, cfg);
+    const r = await ops.exec("yes", "/head", {});
+    expect(r.exitCode).toBe(137);
+  });
+
+  it("passes a null exit code through untouched when it is NOT a cap trip", async () => {
+    // truncated: false with a null code means "signalled, no status" — not our cap.
+    // Mapping that to 137 too would invent a cause, so it stays null and Pi keeps
+    // treating it as it does today.
+    const { fn } = fakeExec({ stdout: "", exitCode: null, truncated: false });
+    const ops = createPodBashOps(fn, cfg);
+    const r = await ops.exec("something-signalled", "/head", {});
+    expect(r.exitCode).toBeNull();
+  });
+
+  it("passes a genuine non-zero exit code through unchanged", async () => {
+    const { fn } = fakeExec({ stdout: "", exitCode: 3, truncated: false });
+    const ops = createPodBashOps(fn, cfg);
+    const r = await ops.exec("false", "/head", {});
+    expect(r.exitCode).toBe(3);
+  });
 });
 
 describe("ls ops", () => {

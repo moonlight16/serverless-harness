@@ -97,6 +97,17 @@ export function createPodBashOps(exec: ExecInPod, cfg: K8sSandboxConfig): BashOp
         ? `cd ${q(cwd)} && env ${pairs.join(" ")} bash -c ${shQuote(command)}`
         : `cd ${q(cwd)} && ${command}`; // M2's exact form — unchanged when no env
       const r = await exec(wrapped, { onData, signal, timeout });
+      // A cap trip means the command was SIGKILLed mid-flight with no exit status. Pi
+      // treats a null code as non-failing (bash.ts:397), so returning the seam's null
+      // here told the model a killed command had completed (#181). 137 = 128+9 is the
+      // conventional SIGKILL status and is accurate — the command was killed by signal 9
+      // — and it routes through Pi's own failure path, which appends the streamed output
+      // tail. A bare throw would lose that tail: bash.ts applies appendStatus only for
+      // "aborted"/"timeout:" messages and bare-rethrows anything else.
+      //
+      // Caveat: on the kubectl paths we SIGKILL our local client, so the in-pod process
+      // dies by EPIPE rather than by our signal (#185, spec §8's declared mechanisms).
+      if (r.truncated) return { exitCode: 137 };
       return { exitCode: r.exitCode };
     },
   };
