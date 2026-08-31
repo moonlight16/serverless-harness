@@ -247,16 +247,16 @@ describe("find ops", () => {
   });
 
   it("glob refuses a truncated listing instead of returning a partial list with the marker as a path", async () => {
-    // Same class as the readFile fix above: exitCode null means the output cap tripped
-    // (or rg was signalled) mid-list, so what came back is not a trustworthy file list —
-    // it may even contain OUTPUT_TRUNCATED_MARKER as a bogus "path" entry.
+    // A cap trip means what came back is not a trustworthy file list — it may even
+    // contain OUTPUT_TRUNCATED_MARKER as a bogus "path" entry.
     const { fn } = fakeExec({
       stdout: "src/a.ts\nb.ts\n" + OUTPUT_TRUNCATED_MARKER,
       exitCode: null,
+      truncated: true,
     });
     const ops = createPodFindOps(fn, cfg);
     await expect(ops.glob("*.ts", "/head", { ignore: [], limit: 5 })).rejects.toThrow(
-      /glob (failed|truncated) in pod/,
+      /output cap/,
     );
   });
 
