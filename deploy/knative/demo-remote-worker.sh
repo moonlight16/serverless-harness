@@ -51,9 +51,14 @@ WORKER_IMAGE="${WORKER_IMAGE:-dev.local/remote-worker:demo}"
 WORKER_CTR="${WORKER_CTR:-sh-demo-remote-worker}"
 RELAY_PORT="${RELAY_PORT:-8443}"
 SANDBOX_ID="${SANDBOX_ID:-sbx-laptop-demo}"
-# Must equal the relay's SH_RELAY_TOKEN (relay-deployment.yaml). Auth is fail-closed:
-# a mismatch rejects the Attach before the stream is ever parked.
-RELAY_TOKEN="${SANDBOX_TOKEN:-dev-token}"
+# Must equal the relay's SH_RELAY_TOKEN. Auth is fail-closed: a mismatch rejects the Attach
+# before the stream is ever parked. Left EMPTY here on purpose -- a per-run random token is
+# generated in step 4 and patched onto the relay, rather than reusing relay-deployment.yaml's
+# hardcoded `dev-token`. That value is a repo constant and therefore public, which matters
+# because step 5 may bind the relay port to 0.0.0.0 on native Linux Docker: a LAN-reachable
+# port plus a well-known credential would let anyone on the network Attach as a sandbox and
+# receive the leaf's exec payloads. Set SANDBOX_TOKEN to pin a value instead.
+RELAY_TOKEN="${SANDBOX_TOKEN:-}"
 # The harness reaches the relay by in-cluster DNS; the worker reaches it through the
 # tunnel. That asymmetry IS the inverted-connectivity story -- neither address is inbound
 # to the laptop.
@@ -114,6 +119,17 @@ wait_harness_reachable() {
     sleep 2
   done
   return 1
+}
+
+# A fresh credential per run, so the token in `docker inspect` is scoped to this one demo
+# rather than being a constant checked into the repo. `head -c` leads the pipeline so no
+# stage is killed by SIGPIPE (which pipefail would surface as a failure).
+gen_relay_token() {
+  local t
+  t="$(openssl rand -hex 16 2>/dev/null || true)"
+  [ -n "$t" ] || t="$(head -c 16 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' || true)"
+  [ -n "$t" ] || abort "could not generate a random relay token (no openssl, and /dev/urandom is not readable). Set SANDBOX_TOKEN to supply one."
+  printf '%s' "$t"
 }
 
 remove_worker_container() {
@@ -297,6 +313,19 @@ note "cluster. It runs as a host container, which is the point of the whole demo
 # --- 4. Relay --------------------------------------------------------------------------
 claim "Relay: the only thing the worker will dial"
 kubectl apply -f relay-deployment.yaml >/dev/null || abort "kubectl apply relay-deployment.yaml failed"
+if [ -n "$RELAY_TOKEN" ]; then
+  note "using the SANDBOX_TOKEN supplied in the environment."
+else
+  RELAY_TOKEN="$(gen_relay_token)"
+  note "generated a random relay token for this run only (not relay-deployment.yaml's public 'dev-token')."
+fi
+# Patch the live Deployment BEFORE waiting on the rollout, so the pod that becomes Ready is
+# already the one holding this run's token -- setting it afterwards would restart the relay
+# out from under the readiness we just established. A later `kubectl apply -f
+# relay-deployment.yaml` (relay-leaf-smoke.sh does exactly that) reverts it to the declared
+# dev value, so this leaves nothing behind for other callers.
+kubectl set env deploy/sandbox-relay -n "$NS" "SH_RELAY_TOKEN=$RELAY_TOKEN" >/dev/null \
+  || abort "could not set SH_RELAY_TOKEN on deploy/sandbox-relay"
 kubectl -n "$NS" rollout status deploy/sandbox-relay --timeout=90s >/dev/null \
   || abort "sandbox-relay rollout did not become ready"
 note "relay up. It is inert until a worker attaches AND the harness is on SH_REMOTE_SANDBOX=1."
@@ -325,7 +354,10 @@ else
   if probe_from_container --add-host=host.docker.internal:host-gateway; then
     WORKER_DOCKER_ARGS+=(--add-host=host.docker.internal:host-gateway)
     echo "    WARN: the relay port is bound to 0.0.0.0 for the duration of this demo, so it is"
-    echo "          reachable from your local network. It is torn down on exit."
+    echo "          reachable from your local network. It accepts this run's randomly generated"
+    echo "          bearer token only -- not relay-deployment.yaml's public 'dev-token' -- so a"
+    echo "          LAN peer cannot Attach as a sandbox with a credential read from the repo."
+    echo "          It is torn down on exit."
   else
     abort "the relay answers from the host, but no container could reach it on port $RELAY_PORT -- this is container-to-host networking, not the relay. Alternative: attach the worker to kind's docker network and dial the node directly (see README-worker.md)."
   fi
@@ -343,7 +375,7 @@ WORKER_RUN=(docker run -d --name "$WORKER_CTR"
 echo "    \$ ${WORKER_RUN[*]}"
 "${WORKER_RUN[@]}" >/dev/null || abort "docker run of the worker container failed"
 note "Note what is absent: no -p, no --publish, no inbound rule. The worker dials OUT."
-note "Its whole credential set is a bearer token -- no LLM key, no kubeconfig."
+note "Its whole credential set is a bearer token, scoped to this run -- no LLM key, no kubeconfig."
 
 # --- 7. Presence -----------------------------------------------------------------------
 claim "Presence: the worker's live Attach stream IS its registration"

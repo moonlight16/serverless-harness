@@ -347,6 +347,15 @@ A bearer token, a sandbox id, and a relay address. **No LLM key, no kubeconfig, 
 orchestration.** The token must equal the relay's `SH_RELAY_TOKEN`; auth is fail-closed, so
 a mismatch rejects the Attach before the stream is ever parked.
 
+The demo generates that token **fresh per run** and patches it onto the relay, rather than
+reusing `relay-deployment.yaml`'s `dev-token`. That value is a repo constant, and therefore
+public — which matters because on native Linux Docker the demo may bind the relay port to
+`0.0.0.0` (see above), and a LAN-reachable port guarded by a credential anyone can read from
+the repo would let a network peer Attach as a sandbox and receive the leaf's exec payloads.
+So what `docker inspect` shows is a credential scoped to this one run. Set `SANDBOX_TOKEN` to
+pin a value instead. A later `kubectl apply -f relay-deployment.yaml` restores the declared
+dev value, so nothing is left patched for other callers.
+
 ### Requirements and limits
 
 - `docker` (or `podman`) + `kind` + `kubectl` + `jq`. **No local Go toolchain** —
