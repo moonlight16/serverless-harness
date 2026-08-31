@@ -139,7 +139,8 @@ export function createPodLsOps(exec: ExecInPod, cfg: K8sSandboxConfig): LsOperat
       // directory listing — it may even contain OUTPUT_TRUNCATED_MARKER as a bogus entry.
       if (r.truncated) {
         throw new Error(
-          `readdir exceeds the ${DEFAULT_OUTPUT_CAP} byte sandbox output cap: ${p}.`,
+          `readdir exceeds the ${DEFAULT_OUTPUT_CAP} byte sandbox output cap: ${p}. ` +
+            `List a subdirectory, or use bash with \`ls -1A | head -n <n>\`.`,
         );
       }
       if (r.exitCode !== 0) throw new Error(`readdir failed in pod: ${p}`);

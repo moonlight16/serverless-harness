@@ -6,6 +6,20 @@
 
 const SOH = "\x01"; // marker lead byte; never appears in base64 output
 
+/**
+ * Reported in place of the command's exit code when a stage of the wrapper pipeline
+ * itself failed (`head -c` or `base64`), rather than the command.
+ *
+ * This exists because the failure is otherwise INVISIBLE and destructive. If `head` is
+ * absent, or present but rejects `-c`, the wrapper yields **empty stdout with the
+ * command's own exit code of 0** — verified against real bash for both cases. A read
+ * would then return an empty buffer with a success status, and Pi's Edit tool writes back
+ * whatever the read returned, truncating the file to zero length. Negative because the
+ * frame carries a single integer and no real exit status is negative; FrameParser already
+ * accepts `-?\d+`.
+ */
+export const CAP_STAGE_FAILED = -2;
+
 export interface Frame {
   nonce: string;
   stdout: Buffer; // base64-decoded command stdout
@@ -50,7 +64,14 @@ export function wrapCommand(
   capBytes: number,
 ): string {
   const begin = `printf '${SOH}B%s\\n' ${nonce}; `;
-  const end = `printf '${SOH}E%s %d\\n' ${nonce} "\${PIPESTATUS[0]}"\n`;
+  // Capture the whole PIPESTATUS array immediately — any command clobbers it. Index 0 is
+  // the command group, 1 is the `head -c` cap stage, 2 is `base64`. A non-zero status in
+  // 1 or 2 means OUR pipeline broke rather than the command, which would otherwise surface
+  // as empty output with the command's own 0 (see CAP_STAGE_FAILED).
+  const end =
+    `st=("\${PIPESTATUS[@]}"); rc="\${st[0]}"; ` +
+    `{ [ "\${st[1]}" = 0 ] && [ "\${st[2]}" = 0 ]; } || rc=${CAP_STAGE_FAILED}; ` +
+    `printf '${SOH}E%s %d\\n' ${nonce} "\$rc"\n`;
   const cap = `head -c ${capBytes + 1}`;
   if (stdin) {
     // Heredoc delimiter must be bash-safe AND collision-proof. We CANNOT use the

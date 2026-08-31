@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { K8sSandboxConfig } from "../src/config.js";
 import type { ExecInPod } from "../src/transport.js";
 import { OUTPUT_TRUNCATED_MARKER } from "../src/transport.js";
+import { CAP_STAGE_FAILED } from "../src/framing.js";
 import { buildPersistentKubectlArgs, persistentExecInPod } from "../src/persistent-exec.js";
 
 const cfg: K8sSandboxConfig = {
@@ -139,6 +140,33 @@ describe("persistentExecInPod", () => {
     ac.abort();
     await expect(p).rejects.toThrow("aborted");
     expect(child.kill).toHaveBeenCalled();
+  });
+
+  it("a broken cap stage routes to the fallback and latches, without respawning", async () => {
+    // CAP_STAGE_FAILED means our own wrapper pipeline failed, not the command. Unhandled it
+    // arrives as empty stdout with exit 0, which readFile would return as a successful
+    // empty read and Pi's Edit would write back — truncating the file. The channel must
+    // hand off to the fallback and stay handed off: the pod's binaries will not change
+    // mid-session, so respawning would fail identically on every op.
+    const { child } = makeFakeChild();
+    const c2 = makeFakeChild();
+    const { spawn, calls } = fakeSpawn([child, c2.child]);
+    const { fallback, calls: fbCalls } = recordingFallback();
+    const t = persistentExecInPod(cfg, { fallback, spawn });
+
+    const p1 = t.exec("cat '/workspace/a.txt'");
+    child.stdout.emit("data", frameFor("n1", "", CAP_STAGE_FAILED));
+    expect(await p1).toEqual({ stdout: Buffer.from("FB"), exitCode: 7, truncated: false });
+
+    // Latched: the second call goes straight to the fallback, and no second child is spawned.
+    expect(await t.exec("cat '/workspace/b.txt'")).toEqual({
+      stdout: Buffer.from("FB"),
+      exitCode: 7,
+      truncated: false,
+    });
+    expect(fbCalls).toEqual(["cat '/workspace/a.txt'", "cat '/workspace/b.txt'"]);
+    expect(calls).toHaveLength(1); // one spawn only — no futile respawn
+    await t.close();
   });
 
   it("close() kills the child and routes later calls to the fallback", async () => {

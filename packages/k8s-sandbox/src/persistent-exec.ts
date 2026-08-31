@@ -2,7 +2,7 @@ import { type ChildProcess, spawn as nodeSpawn } from "node:child_process";
 import type { K8sSandboxConfig } from "./config.js";
 import type { ExecInPod, SandboxTransport } from "./transport.js";
 import { DEFAULT_OUTPUT_CAP, OUTPUT_TRUNCATED_MARKER } from "./transport.js";
-import { FrameParser, wrapCommand } from "./framing.js";
+import { CAP_STAGE_FAILED, FrameParser, wrapCommand } from "./framing.js";
 
 /** argv for the long-lived session: a bare interactive `bash` (NOT `bash -c`). */
 export function buildPersistentKubectlArgs(config: K8sSandboxConfig): string[] {
@@ -42,6 +42,10 @@ export function persistentExecInPod(
   const queue: Array<() => void> = [];
   let seq = 0;
   let disposed = false;
+  // Latched once the pod proves it cannot run our wrapper pipeline (missing `head -c`, or
+  // a `head` that rejects it). Not retried: the pod's binaries will not change mid-session,
+  // so respawning would fail identically on every op and pay double for it.
+  let capStageBroken = false;
 
   const killChild = () => {
     if (!child) return;
@@ -94,6 +98,26 @@ export function persistentExecInPod(
           // deps.fallback (the capped KubectlTransport, per extension.ts:52), so
           // treating a cap trip as a channel failure would re-run the command and flood
           // twice before failing anyway. A cap trip is a result, not a dead channel.
+          if (f.exitCode === CAP_STAGE_FAILED) {
+            // Our own pipeline broke, not the command. Left unhandled this arrives as
+            // empty stdout with exit 0, which `readFile` would return as a successful
+            // empty read and Pi's Edit would then write back — truncating the file to
+            // zero. Latch it, say so once, and hand this and every later op to the
+            // fallback transport, which caps client-side and needs no `head -c`.
+            capStageBroken = true;
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[k8s-sandbox] pod ${config.namespace}/${config.pod}: the persistent channel's ` +
+                `output-cap stage failed (\`head -c\` missing or not supporting -c, or \`base64\` ` +
+                `unavailable). Falling back to per-call exec for all file operations. ` +
+                `Check the sandbox image: \`kubectl exec -n ${config.namespace} ${config.pod} -- head -c 1 /dev/null\`.`,
+            );
+            killChild();
+            parser = new FrameParser();
+            cur.fail(new Error("persistent channel output-cap stage unavailable"));
+            pump();
+            continue;
+          }
           if (f.stdout.length > outputCap) {
             cur.done({
               stdout: Buffer.concat([f.stdout.subarray(0, outputCap), Buffer.from(OUTPUT_TRUNCATED_MARKER)]),
@@ -115,7 +139,7 @@ export function persistentExecInPod(
   };
 
   const exec: ExecInPod = (command, opts = {}) => {
-    if (disposed) return deps.fallback(command, opts);
+    if (disposed || capStageBroken) return deps.fallback(command, opts);
     return new Promise((resolve, reject) => {
       const start = () => {
         ensureChild();

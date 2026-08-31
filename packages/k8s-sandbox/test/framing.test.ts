@@ -1,9 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { FrameParser, wrapCommand } from "../src/framing.js";
+import { CAP_STAGE_FAILED, FrameParser, wrapCommand } from "../src/framing.js";
 
 const SOH = "\x01";
 
@@ -17,7 +17,9 @@ describe("wrapCommand", () => {
     const line = wrapCommand("n1", "cat '/workspace/a.txt'", undefined, 8);
     expect(line).toBe(
       `printf '${SOH}B%s\\n' n1; { cat '/workspace/a.txt'; } | head -c 9 | base64; ` +
-        `printf '${SOH}E%s %d\\n' n1 "\${PIPESTATUS[0]}"\n`,
+        `st=("\${PIPESTATUS[@]}"); rc="\${st[0]}"; ` +
+        `{ [ "\${st[1]}" = 0 ] && [ "\${st[2]}" = 0 ]; } || rc=${CAP_STAGE_FAILED}; ` +
+        `printf '${SOH}E%s %d\\n' n1 "\$rc"\n`,
     );
   });
 
@@ -26,7 +28,9 @@ describe("wrapCommand", () => {
     expect(line).toBe(
       `printf '${SOH}B%s\\n' n2; { base64 -d > '/workspace/a.txt' <<'KAGENTI_EOF_n2'\n` +
         `aGk=\nKAGENTI_EOF_n2\n} | head -c 9 | base64; ` +
-        `printf '${SOH}E%s %d\\n' n2 "\${PIPESTATUS[0]}"\n`,
+        `st=("\${PIPESTATUS[@]}"); rc="\${st[0]}"; ` +
+        `{ [ "\${st[1]}" = 0 ] && [ "\${st[2]}" = 0 ]; } || rc=${CAP_STAGE_FAILED}; ` +
+        `printf '${SOH}E%s %d\\n' n2 "\$rc"\n`,
     );
   });
 
@@ -145,6 +149,48 @@ describe("wrapCommand executed by a real bash (integration)", () => {
     const res = spawnSync("bash", { input: line });
     const frames = new FrameParser().push(res.stdout);
     expect(frames[0].exitCode).toBe(42);
+  });
+
+  maybe("reports CAP_STAGE_FAILED when `head` is missing, instead of empty-with-exit-0", () => {
+    // THE data-loss scenario, reproduced rather than argued. With `head` absent the
+    // pipeline yields empty stdout and the COMMAND's own exit 0 (verified: group=0,
+    // head=127), so a read would come back as a successful empty buffer and Pi's Edit
+    // would write that back over the file. Shadow `head` with a 127 stub on PATH and
+    // assert the frame now carries the sentinel instead.
+    const dir = mkdtempSync(join(tmpdir(), "framing-nohead-"));
+    try {
+      writeFileSync(join(dir, "head"), "#!/bin/sh\nexit 127\n", { mode: 0o755 });
+      const line = wrapCommand("n7", "printf abc", undefined, 100);
+      const res = spawnSync("bash", { input: line, env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } });
+      const frames = new FrameParser().push(res.stdout);
+      expect(frames).toHaveLength(1);
+      expect(frames[0].stdout.length).toBe(0); // the silent part: no output came back
+      expect(frames[0].exitCode).toBe(CAP_STAGE_FAILED); // the loud part: it is now reported
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  maybe("reports CAP_STAGE_FAILED when `head` exists but rejects -c (busybox-style)", () => {
+    // The other real variant, and it produces the identical silent signature (group=0,
+    // head=1), so detecting only "command not found" would have missed it.
+    const dir = mkdtempSync(join(tmpdir(), "framing-badhead-"));
+    try {
+      writeFileSync(join(dir, "head"), '#!/bin/sh\necho "head: unrecognized option" >&2\nexit 1\n', { mode: 0o755 });
+      const line = wrapCommand("n8", "printf abc", undefined, 100);
+      const res = spawnSync("bash", { input: line, env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } });
+      const frames = new FrameParser().push(res.stdout);
+      expect(frames[0].exitCode).toBe(CAP_STAGE_FAILED);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  maybe("a healthy pipeline still reports the command's own status, not the sentinel", () => {
+    // Guards the inverse: the stage check must not swallow real exit codes.
+    const line = wrapCommand("n9", "exit 42", undefined, 100);
+    const res = spawnSync("bash", { input: line });
+    expect(new FrameParser().push(res.stdout)[0].exitCode).toBe(42);
   });
 
   maybe("still writes a file through the capped heredoc-stdin path", () => {
