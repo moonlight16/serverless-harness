@@ -69,7 +69,7 @@ export function KubectlTransport(
           // This only kills the local kubectl client; the in-pod process is stopped
           // (if at all) by EPIPE on its next write to the now-closed stream — fine for
           // cat/grep, but a hostile producer that traps or ignores SIGPIPE keeps
-          // running in the pod after this returns (spec §8 "Accepted divergences").
+          // running in the pod after this returns (spec §8 "Poisoned-output defense").
           child.kill("SIGKILL");
         }
       });

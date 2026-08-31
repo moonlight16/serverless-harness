@@ -99,7 +99,8 @@ Read/Edit — not merely truncated. `pi-fork`'s `read.ts` reads the whole file b
 `offset`/`limit`, so the paging its own tool description advertises cannot reach past the
 cap either. Accepted because Pi clips Read output to 2000 lines / 50 KB regardless, so what
 is lost is a path returning bytes the model never saw, at the cost of harness memory and
-quadratic parse time. `readFile` names the size, the cap, and a `bash`+`sed` range read.
+quadratic parse time. `readFile` throws naming the cap, the path, and a `bash`+`sed`
+range read, plus the file size when a truncation-path `stat` can supply it.
 
 **Decided:** `createPodBashOps` returns **137** on truncation. 128+9 is the conventional
 SIGKILL status and is accurate — the command was killed by signal 9 at the cap — and it
