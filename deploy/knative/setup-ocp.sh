@@ -51,8 +51,20 @@ LOG_DIR="${LOG_DIR:-/tmp/serverless-harness-ocp}"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 log_info()    { echo -e "${BLUE}→${NC} $1"; }
 log_success() { echo -e "${GREEN}✓${NC} $1"; }
-log_warn()    { echo -e "${YELLOW}⚠${NC} $1"; }
-log_error()   { echo -e "${RED}✗${NC} $1"; }
+# Diagnostics go to stderr (matching setup-k8s.sh) so a failure is not swallowed when the
+# caller redirects stdout, and stays distinguishable when the bring-up is piped (issue #178).
+log_warn()    { echo -e "${YELLOW}⚠${NC} $1" >&2; }
+log_error()   { echo -e "${RED}✗${NC} $1" >&2; }
+# die: log a fatal error and stop. Prefer this over `log_error ...; exit 1` so the failure
+# path is terminating by construction and cannot lose its exit in a later edit.
+die()         { log_error "$1"; exit 1; }
+
+# When sourced by tests (SH_SOURCE_ONLY=1), stop here so only the helpers above are exposed —
+# mirrors setup-kind.sh. Must come before the arg-parse loop, which would otherwise consume
+# the sourcing shell's positional parameters.
+if [ "${SH_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0
+fi
 
 # run_cmd: execute (or, under --dry-run, echo) a command. Do NOT pass secrets.
 run_cmd() {
@@ -126,11 +138,11 @@ elif command -v kubectl &>/dev/null; then
   KUBECTL=kubectl
   log_warn "oc not found; falling back to kubectl (operator installs + Routes work best with oc)"
 else
-  log_error "Neither oc nor kubectl found in PATH"; exit 1
+  die "Neither oc nor kubectl found in PATH"
 fi
 
 if ! $KUBECTL cluster-info &>/dev/null; then
-  log_error "Cannot reach a cluster. Run 'oc login' first."; exit 1
+  die "Cannot reach a cluster. Run 'oc login' first."
 fi
 log_success "Connected to cluster ($KUBECTL)"
 
@@ -156,8 +168,11 @@ if [ -n "$DEFAULT_SC" ]; then
 elif [ "$($KUBECTL get storageclass --no-headers 2>/dev/null | wc -l | tr -d ' ')" != "0" ]; then
   log_warn "No default StorageClass; the sandbox /workspace PVC may stay Pending unless one is set."
 else
-  log_error "No StorageClass found — the sandbox /workspace PVC cannot bind. Install a storage provisioner first."
-  $DRY_RUN || exit 1
+  if $DRY_RUN; then
+    log_warn "No StorageClass found — the sandbox /workspace PVC cannot bind (continuing: --dry-run)."
+  else
+    die "No StorageClass found — the sandbox /workspace PVC cannot bind. Install a storage provisioner first."
+  fi
 fi
 
 echo
@@ -261,10 +276,12 @@ spec:
 EOF
 if ! $DRY_RUN; then
   log_info "Waiting for KnativeServing to be Ready (up to 5m)..."
-  $KUBECTL wait --for=condition=Ready knativeserving/knative-serving -n knative-serving --timeout=300s \
-    >"$LOG_DIR/knativeserving-wait.log" 2>&1 \
-    && log_success "KnativeServing Ready" \
-    || { log_error "KnativeServing not Ready (see $LOG_DIR/knativeserving-wait.log)"; exit 1; }
+  if $KUBECTL wait --for=condition=Ready knativeserving/knative-serving -n knative-serving --timeout=300s \
+       >"$LOG_DIR/knativeserving-wait.log" 2>&1; then
+    log_success "KnativeServing Ready"
+  else
+    die "KnativeServing not Ready (see $LOG_DIR/knativeserving-wait.log)"
+  fi
 fi
 
 # ============================================================================
@@ -318,10 +335,12 @@ spec:
 EOF
   wait_for_crd scaledjobs.keda.sh 300
   if ! $DRY_RUN; then
-    $KUBECTL wait --for=condition=Available deployment --all -n openshift-keda --timeout=180s \
-      >"$LOG_DIR/keda-wait.log" 2>&1 \
-      && log_success "KEDA ready" \
-      || log_warn "KEDA deployments not all Available yet (see $LOG_DIR/keda-wait.log)"
+    if $KUBECTL wait --for=condition=Available deployment --all -n openshift-keda --timeout=180s \
+         >"$LOG_DIR/keda-wait.log" 2>&1; then
+      log_success "KEDA ready"
+    else
+      log_warn "KEDA deployments not all Available yet (see $LOG_DIR/keda-wait.log)"
+    fi
   fi
 fi
 
@@ -366,9 +385,12 @@ else
   elif $KUBECTL get secret llm-credentials -n "$NAMESPACE" &>/dev/null; then
     log_success "Secret llm-credentials already present in $NAMESPACE — using it"
   else
-    log_error "No ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN in env and no llm-credentials secret in $NAMESPACE."
-    log_error "Provide one, or pre-create: oc create secret generic llm-credentials -n $NAMESPACE --from-literal=api-key=..."
-    $DRY_RUN || exit 1
+    if $DRY_RUN; then
+      log_warn "No ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN and no llm-credentials secret (continuing: --dry-run)."
+    else
+      log_error "No ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN in env and no llm-credentials secret in $NAMESPACE."
+      die "Provide one, or pre-create: oc create secret generic llm-credentials -n $NAMESPACE --from-literal=api-key=..."
+    fi
   fi
 fi
 
@@ -413,10 +435,12 @@ else
   wait_for_crd sandboxes.agents.x-k8s.io 180
 fi
 if ! $DRY_RUN; then
-  $KUBECTL -n agent-sandbox-system rollout status deploy/agent-sandbox-controller --timeout=180s \
-    >"$LOG_DIR/agent-sandbox-rollout.log" 2>&1 \
-    && log_success "agent-sandbox controller ready" \
-    || log_warn "agent-sandbox controller not ready yet (see $LOG_DIR/agent-sandbox-rollout.log)"
+  if $KUBECTL -n agent-sandbox-system rollout status deploy/agent-sandbox-controller --timeout=180s \
+       >"$LOG_DIR/agent-sandbox-rollout.log" 2>&1; then
+    log_success "agent-sandbox controller ready"
+  else
+    log_warn "agent-sandbox controller not ready yet (see $LOG_DIR/agent-sandbox-rollout.log)"
+  fi
 fi
 
 # ============================================================================
@@ -447,9 +471,13 @@ if $DRY_RUN; then
   echo "  [dry-run] render_overlay | $KUBECTL apply -f -   (manifest preview:)"
   render_overlay | sed 's/^/    /'
 else
-  render_overlay | $KUBECTL apply -f - >"$LOG_DIR/overlay-apply.log" 2>&1 \
-    && log_success "Overlay applied (log: $LOG_DIR/overlay-apply.log)" \
-    || { log_error "Overlay apply failed — see $LOG_DIR/overlay-apply.log"; cat "$LOG_DIR/overlay-apply.log"; exit 1; }
+  if render_overlay | $KUBECTL apply -f - >"$LOG_DIR/overlay-apply.log" 2>&1; then
+    log_success "Overlay applied (log: $LOG_DIR/overlay-apply.log)"
+  else
+    log_error "Overlay apply failed — see $LOG_DIR/overlay-apply.log"
+    cat "$LOG_DIR/overlay-apply.log"
+    exit 1
+  fi
 fi
 
 # ----------------------------------------------------------------------------
@@ -463,9 +491,13 @@ if [ "$SKIP_KEDA" = false ]; then
     echo "  [dry-run] render_overlay_dir \"$ASYNC_OVERLAY_DIR\" | $KUBECTL apply -f -   (manifest preview:)"
     render_overlay_dir "$ASYNC_OVERLAY_DIR" | sed 's/^/    /'
   else
-    render_overlay_dir "$ASYNC_OVERLAY_DIR" | $KUBECTL apply -f - >"$LOG_DIR/async-overlay-apply.log" 2>&1 \
-      && log_success "Async leaf ScaledJob applied (log: $LOG_DIR/async-overlay-apply.log)" \
-      || { log_error "Async ScaledJob apply failed — see $LOG_DIR/async-overlay-apply.log"; cat "$LOG_DIR/async-overlay-apply.log"; exit 1; }
+    if render_overlay_dir "$ASYNC_OVERLAY_DIR" | $KUBECTL apply -f - >"$LOG_DIR/async-overlay-apply.log" 2>&1; then
+      log_success "Async leaf ScaledJob applied (log: $LOG_DIR/async-overlay-apply.log)"
+    else
+      log_error "Async ScaledJob apply failed — see $LOG_DIR/async-overlay-apply.log"
+      cat "$LOG_DIR/async-overlay-apply.log"
+      exit 1
+    fi
 
     # Readiness self-check: assert every part of the async scale-up path is present and
     # wired before declaring success. Cheap + LLM-free — guards the exact config-drift
@@ -476,7 +508,11 @@ if [ "$SKIP_KEDA" = false ]; then
     sj() { $KUBECTL -n "$NAMESPACE" get scaledjob leaf-worker -o jsonpath="$1" 2>/dev/null; }
     # 1. ScaledJob exists + reaches Ready=True (KEDA validates the trigger spec).
     ready=""; for _ in $(seq 1 15); do ready="$(sj '{.status.conditions[?(@.type=="Ready")].status}')"; [ "$ready" = "True" ] && break; sleep 2; done
-    [ "$ready" = "True" ] && log_success "  ScaledJob leaf-worker Ready" || { log_error "  ScaledJob leaf-worker not Ready (status=${ready:-<none>})"; vfail=$((vfail+1)); }
+    if [ "$ready" = "True" ]; then
+      log_success "  ScaledJob leaf-worker Ready"
+    else
+      log_error "  ScaledJob leaf-worker not Ready (status=${ready:-<none>})"; vfail=$((vfail+1))
+    fi
     # 2. Worker image resolved to a real registry (not the unpullable dev.local placeholder).
     img="$(sj '{.spec.jobTargetRef.template.spec.containers[0].image}')"
     case "$img" in dev.local/*|"") log_error "  worker image unresolved: '${img:-<empty>}'"; vfail=$((vfail+1)) ;; *) log_success "  worker image: $img" ;; esac
@@ -484,21 +520,32 @@ if [ "$SKIP_KEDA" = false ]; then
     psel="$(sj '{.spec.jobTargetRef.template.spec.containers[0].env[?(@.name=="KAGENTI_SANDBOX_POOL_SELECTOR")].value}')"
     pcap="$(sj '{.spec.jobTargetRef.template.spec.containers[0].env[?(@.name=="KAGENTI_SANDBOX_CAP")].value}')"
     pname="$(sj '{.spec.jobTargetRef.template.spec.containers[0].env[?(@.name=="KAGENTI_SANDBOX_NAME")].value}')"
-    { [ -n "$psel" ] && [ -n "$pcap" ] && [ -z "$pname" ]; } \
-      && log_success "  pool leasing configured (selector=$psel cap=$pcap, no sandbox pin)" \
-      || { log_error "  pool env wrong (selector='$psel' cap='$pcap' name='$pname')"; vfail=$((vfail+1)); }
+    if [ -n "$psel" ] && [ -n "$pcap" ] && [ -z "$pname" ]; then
+      log_success "  pool leasing configured (selector=$psel cap=$pcap, no sandbox pin)"
+    else
+      log_error "  pool env wrong (selector='$psel' cap='$pcap' name='$pname')"; vfail=$((vfail+1))
+    fi
     # 4. KEDA triggers point at the leaf work-queue + consumer group.
     streams="$(sj '{.spec.triggers[*].metadata.stream}')"; groups="$(sj '{.spec.triggers[*].metadata.consumerGroup}')"
-    { echo "$streams" | grep -q 'leaf-queue' && echo "$groups" | grep -q 'leaf-workers'; } \
-      && log_success "  triggers wired (stream=leaf-queue group=leaf-workers)" \
-      || { log_error "  triggers not wired (streams='$streams' groups='$groups')"; vfail=$((vfail+1)); }
+    if echo "$streams" | grep -q 'leaf-queue' && echo "$groups" | grep -q 'leaf-workers'; then
+      log_success "  triggers wired (stream=leaf-queue group=leaf-workers)"
+    else
+      log_error "  triggers not wired (streams='$streams' groups='$groups')"; vfail=$((vfail+1))
+    fi
     # 5. At least one Running pool pod matches the selector (else every lease throws "no Running pods").
     npods="$($KUBECTL -n "$NAMESPACE" get pods -l "$psel" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d ' ')"
-    [ "${npods:-0}" -ge 1 ] && log_success "  $npods Running pool pod(s) match '$psel'" || { log_error "  no Running pods match '$psel'"; vfail=$((vfail+1)); }
+    if [ "${npods:-0}" -ge 1 ]; then
+      log_success "  $npods Running pool pod(s) match '$psel'"
+    else
+      log_error "  no Running pods match '$psel'"; vfail=$((vfail+1))
+    fi
     # 6. Redis (work-queue backend) reachable.
-    $KUBECTL -n "$NAMESPACE" get pods -l app=redis --field-selector=status.phase=Running --no-headers 2>/dev/null | grep -q . \
-      && log_success "  redis Running" || { log_error "  no Running redis pod"; vfail=$((vfail+1)); }
-    if [ "$vfail" -gt 0 ]; then log_error "Async scale-up readiness FAILED ($vfail check(s)); see above."; exit 1; fi
+    if $KUBECTL -n "$NAMESPACE" get pods -l app=redis --field-selector=status.phase=Running --no-headers 2>/dev/null | grep -q .; then
+      log_success "  redis Running"
+    else
+      log_error "  no Running redis pod"; vfail=$((vfail+1))
+    fi
+    if [ "$vfail" -gt 0 ]; then die "Async scale-up readiness FAILED ($vfail check(s)); see above."; fi
     log_success "Async scale-up readiness verified — all parts in place (run leaf-async-smoke.sh for the behavioral proof)"
   fi
 fi
@@ -516,14 +563,16 @@ if ! $DRY_RUN; then
     sleep 2
   done
   if [ -n "$SEL" ]; then
-    $KUBECTL -n "$NAMESPACE" wait --for=condition=Ready pod -l "$SEL" --timeout=180s \
-      >"$LOG_DIR/sandbox-wait.log" 2>&1 \
-      && log_success "Sandbox pod Ready" \
-      || { log_error "Sandbox pod not Ready (see $LOG_DIR/sandbox-wait.log)"; \
-           $KUBECTL -n "$NAMESPACE" get pod sandbox-0 -o wide 2>/dev/null || true; exit 1; }
+    if $KUBECTL -n "$NAMESPACE" wait --for=condition=Ready pod -l "$SEL" --timeout=180s \
+         >"$LOG_DIR/sandbox-wait.log" 2>&1; then
+      log_success "Sandbox pod Ready"
+    else
+      log_error "Sandbox pod not Ready (see $LOG_DIR/sandbox-wait.log)"
+      $KUBECTL -n "$NAMESPACE" get pod sandbox-0 -o wide 2>/dev/null || true
+      exit 1
+    fi
   else
-    log_error "Sandbox sandbox-0 never published .status.selector — is the controller running?"
-    exit 1
+    die "Sandbox sandbox-0 never published .status.selector — is the controller running?"
   fi
 fi
 
@@ -558,26 +607,35 @@ if [ "${SH_AUTHBRIDGE:-0}" = "1" ]; then
     echo "  [dry-run] render_overlay_dir \"$AB_OVERLAY_DIR\" | $KUBECTL apply -f -   (manifest preview:)"
     render_overlay_dir "$AB_OVERLAY_DIR" | sed 's/^/    /'
   else
-    render_overlay_dir "$AB_OVERLAY_DIR" | $KUBECTL apply -f - >"$LOG_DIR/authbridge-overlay-apply.log" 2>&1 \
-      && log_success "AuthBridge overlay applied (log: $LOG_DIR/authbridge-overlay-apply.log)" \
-      || { log_error "AuthBridge overlay apply failed — see $LOG_DIR/authbridge-overlay-apply.log"; \
-           cat "$LOG_DIR/authbridge-overlay-apply.log"; exit 1; }
+    if render_overlay_dir "$AB_OVERLAY_DIR" | $KUBECTL apply -f - >"$LOG_DIR/authbridge-overlay-apply.log" 2>&1; then
+      log_success "AuthBridge overlay applied (log: $LOG_DIR/authbridge-overlay-apply.log)"
+    else
+      log_error "AuthBridge overlay apply failed — see $LOG_DIR/authbridge-overlay-apply.log"
+      cat "$LOG_DIR/authbridge-overlay-apply.log"
+      exit 1
+    fi
   fi
 
   if ! $DRY_RUN; then
     log_info "Waiting for authbridge-ab1 / ibac-stub / echo-target rollouts..."
-    $KUBECTL -n "$NAMESPACE" rollout status deploy/authbridge-ab1 --timeout=180s \
-      >"$LOG_DIR/authbridge-ab1-rollout.log" 2>&1 \
-      && log_success "authbridge-ab1 ready" \
-      || { log_error "authbridge-ab1 not ready (see $LOG_DIR/authbridge-ab1-rollout.log)"; exit 1; }
-    $KUBECTL -n "$NAMESPACE" rollout status deploy/ibac-stub --timeout=180s \
-      >"$LOG_DIR/ibac-stub-rollout.log" 2>&1 \
-      && log_success "ibac-stub ready" \
-      || { log_error "ibac-stub not ready (see $LOG_DIR/ibac-stub-rollout.log)"; exit 1; }
-    $KUBECTL -n "$NAMESPACE" rollout status deploy/echo-target --timeout=180s \
-      >"$LOG_DIR/echo-target-rollout.log" 2>&1 \
-      && log_success "echo-target ready" \
-      || { log_error "echo-target not ready (see $LOG_DIR/echo-target-rollout.log)"; exit 1; }
+    if $KUBECTL -n "$NAMESPACE" rollout status deploy/authbridge-ab1 --timeout=180s \
+         >"$LOG_DIR/authbridge-ab1-rollout.log" 2>&1; then
+      log_success "authbridge-ab1 ready"
+    else
+      die "authbridge-ab1 not ready (see $LOG_DIR/authbridge-ab1-rollout.log)"
+    fi
+    if $KUBECTL -n "$NAMESPACE" rollout status deploy/ibac-stub --timeout=180s \
+         >"$LOG_DIR/ibac-stub-rollout.log" 2>&1; then
+      log_success "ibac-stub ready"
+    else
+      die "ibac-stub not ready (see $LOG_DIR/ibac-stub-rollout.log)"
+    fi
+    if $KUBECTL -n "$NAMESPACE" rollout status deploy/echo-target --timeout=180s \
+         >"$LOG_DIR/echo-target-rollout.log" 2>&1; then
+      log_success "echo-target ready"
+    else
+      die "echo-target not ready (see $LOG_DIR/echo-target-rollout.log)"
+    fi
 
     # The agent-sandbox controller does NOT roll existing pods when a Sandbox CR's spec
     # changes — a pre-existing pod (e.g. sandbox-0 created by the base pool apply in
@@ -609,11 +667,14 @@ if [ "${SH_AUTHBRIDGE:-0}" = "1" ]; then
       [ "$ab2_want" -gt 0 ] && [ "$ab2_ready" -ge "$ab2_want" ] && break
       sleep 2
     done
-    $KUBECTL -n "$NAMESPACE" wait --for=condition=Ready pod -l "$AB_POOL_SELECTOR" --timeout=300s \
-      >"$LOG_DIR/ab2-pool-wait.log" 2>&1 \
-      && log_success "AB2 sandbox pool Ready" \
-      || { log_error "AB2 sandbox pool not all Ready (see $LOG_DIR/ab2-pool-wait.log)"; \
-           $KUBECTL -n "$NAMESPACE" get pods -l "$AB_POOL_SELECTOR" -o wide 2>/dev/null || true; exit 1; }
+    if $KUBECTL -n "$NAMESPACE" wait --for=condition=Ready pod -l "$AB_POOL_SELECTOR" --timeout=300s \
+         >"$LOG_DIR/ab2-pool-wait.log" 2>&1; then
+      log_success "AB2 sandbox pool Ready"
+    else
+      log_error "AB2 sandbox pool not all Ready (see $LOG_DIR/ab2-pool-wait.log)"
+      $KUBECTL -n "$NAMESPACE" get pods -l "$AB_POOL_SELECTOR" -o wide 2>/dev/null || true
+      exit 1
+    fi
   fi
 
   # Roll the harness ksvc so it starts a fresh Revision that picks up the repointed
@@ -630,10 +691,12 @@ fi
 echo
 if ! $DRY_RUN; then
   log_info "Waiting for ksvc/serverless-harness to be Ready (up to 5m)..."
-  $KUBECTL wait ksvc/serverless-harness -n "$NAMESPACE" --for=condition=Ready --timeout=300s \
-    >"$LOG_DIR/ksvc-wait.log" 2>&1 \
-    && log_success "ksvc/serverless-harness Ready" \
-    || { log_error "ksvc not Ready (see $LOG_DIR/ksvc-wait.log)"; exit 1; }
+  if $KUBECTL wait ksvc/serverless-harness -n "$NAMESPACE" --for=condition=Ready --timeout=300s \
+       >"$LOG_DIR/ksvc-wait.log" 2>&1; then
+    log_success "ksvc/serverless-harness Ready"
+  else
+    die "ksvc not Ready (see $LOG_DIR/ksvc-wait.log)"
+  fi
 fi
 
 URL="$($KUBECTL get ksvc serverless-harness -n "$NAMESPACE" -o jsonpath='{.status.url}' 2>/dev/null || echo "")"
