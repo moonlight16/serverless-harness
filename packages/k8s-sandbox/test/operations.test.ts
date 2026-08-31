@@ -41,21 +41,61 @@ describe("read ops", () => {
   });
 
   it("readFile refuses a truncated read instead of returning partial bytes", async () => {
-    // The seam caps returned stdout and signals it as exitCode null (spec §8). Pi's
-    // Edit tool writes back whatever readFile returns, so returning these bytes would
-    // truncate the file in the sandbox AND write "[output truncated]" into it.
+    // The seam signals a cap trip via truncated: true (spec §8). Pi's Edit tool writes
+    // back whatever readFile returns, so returning these bytes would truncate the file
+    // in the sandbox AND write "[output truncated]" into it.
     const { fn } = fakeExec({
       stdout: "a".repeat(64) + OUTPUT_TRUNCATED_MARKER,
       exitCode: null,
+      truncated: true,
     });
     const ops = createPodReadOps(fn, cfg);
-    await expect(ops.readFile("/head/big.txt")).rejects.toThrow(/truncated in pod.*big\.txt/);
+    await expect(ops.readFile("/head/big.txt")).rejects.toThrow(/output cap.*big\.txt/);
   });
 
   it("readFile rejects when the cat itself fails", async () => {
     const { fn } = fakeExec({ stdout: "", exitCode: 1 });
     const ops = createPodReadOps(fn, cfg);
     await expect(ops.readFile("/head/missing.txt")).rejects.toThrow(/Read failed in pod.*missing\.txt/);
+  });
+
+  it("readFile names the cap and the file size, and suggests a range read", async () => {
+    // pi-fork's read.ts:277 reads the WHOLE file before applying offset/limit, so a
+    // capped file is unreachable through Read even with paging — the model needs to be
+    // told to use bash instead, and how big the file is so it can pick a range.
+    const calls: string[] = [];
+    const fn: ExecInPod = async (command) => {
+      calls.push(command);
+      if (command.startsWith("stat")) return { stdout: Buffer.from("21000000\n"), exitCode: 0, truncated: false };
+      return { stdout: Buffer.from("partial"), exitCode: null, truncated: true };
+    };
+    const ops = createPodReadOps(fn, cfg);
+    // Capture once rather than re-invoking per assertion: each call would re-issue the
+    // stat, and asserting three separate rejections of the same call is not possible.
+    const err = (await ops.readFile("/head/big.json").catch((e) => e)) as Error;
+    expect(err.message).toMatch(/exceeds the .* output cap/);
+    expect(err.message).toMatch(/21000000/); // the size, so the model can pick a range
+    expect(err.message).toMatch(/sed -n/); // the escape hatch
+    expect(calls.some((c) => c.startsWith("stat -c %s"))).toBe(true);
+  });
+
+  it("readFile still reports a signalled cat distinctly from a cap trip", async () => {
+    // truncated: false with a null code is 'no exit status, and NOT our cap'. Blaming
+    // the cap here would send the model chasing a size limit that is not the problem.
+    const { fn } = fakeExec({ stdout: "", exitCode: null, truncated: false });
+    const ops = createPodReadOps(fn, cfg);
+    const err = (await ops.readFile("/head/a.txt").catch((e) => e)) as Error;
+    expect(err.message).toMatch(/no exit status/);
+    expect(err.message).not.toMatch(/output cap/); // must not blame a size limit
+  });
+
+  it("readFile survives a stat that fails, omitting the size", async () => {
+    const fn: ExecInPod = async (command) =>
+      command.startsWith("stat")
+        ? { stdout: Buffer.from(""), exitCode: 1, truncated: false }
+        : { stdout: Buffer.from("partial"), exitCode: null, truncated: true };
+    const ops = createPodReadOps(fn, cfg);
+    await expect(ops.readFile("/head/big.json")).rejects.toThrow(/exceeds the .* output cap/);
   });
 
   it("access rejects when test -r exits non-zero", async () => {
@@ -224,6 +264,14 @@ describe("find ops", () => {
     const { fn } = fakeExec({ stdout: "", exitCode: 2 });
     const ops = createPodFindOps(fn, cfg);
     await expect(ops.glob("[", "/head", { ignore: [], limit: 100 })).rejects.toThrow(/glob failed in pod/);
+  });
+
+  it("glob reports a cap trip distinctly from an rg failure", async () => {
+    const { fn } = fakeExec({ stdout: "a.ts\n", exitCode: null, truncated: true });
+    const ops = createPodFindOps(fn, cfg);
+    await expect(ops.glob("*.ts", "/head", { ignore: [], limit: 100 })).rejects.toThrow(
+      /output cap/,
+    );
   });
 
   it("exists uses test -e on the mapped path", async () => {

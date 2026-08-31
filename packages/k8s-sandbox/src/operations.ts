@@ -9,6 +9,7 @@ import type {
 import type { K8sSandboxConfig } from "./config.js";
 import type { ExecInPod } from "./exec.js";
 import { mapPath, shQuote } from "./paths.js";
+import { DEFAULT_OUTPUT_CAP } from "./transport.js";
 
 const IMAGE_MIMES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
 
@@ -24,14 +25,22 @@ export function createPodReadOps(exec: ExecInPod, cfg: K8sSandboxConfig): ReadOp
       // Never hand back bytes we cannot vouch for. Pi's Edit tool is
       // read-whole-file → replace → write-whole-file, so returning a partial read
       // would write the truncation — marker text included — back over the real
-      // file. A null exit code means the exec produced no status: the seam's
-      // output cap tripped and the reader was cut off mid-file (spec §8), or the
-      // `cat` was signalled. Non-zero means the `cat` itself failed. Neither can
-      // yield file contents, so both throw, exactly as `access` does below.
-      if (r.exitCode === null) {
+      // file.
+      if (r.truncated) {
+        // pi-fork's read.ts reads the WHOLE file and only then applies offset/limit, so
+        // a file over the cap is unreachable through Read/Edit entirely — not merely
+        // truncated. Name the size so the model can choose a range, and point at the
+        // one tool that can still get there. Error path only, so the extra exec is free.
+        const stat = await exec(`stat -c %s ${q(p)}`).catch(() => null);
+        const size = stat && stat.exitCode === 0 ? stat.stdout.toString().trim() : null;
         throw new Error(
-          `Read truncated in pod (output cap tripped or cat signalled; no exit status): ${p}`,
+          `Read exceeds the ${DEFAULT_OUTPUT_CAP} byte sandbox output cap` +
+            `${size ? ` (file is ${size} bytes)` : ""}: ${p}. ` +
+            `Read a range with bash instead, e.g. sed -n '1,500p' <file>.`,
         );
+      }
+      if (r.exitCode === null) {
+        throw new Error(`Read failed in pod (cat signalled; no exit status): ${p}`);
       }
       if (r.exitCode !== 0) {
         throw new Error(`Read failed in pod (cat exited ${r.exitCode}): ${p}`);
@@ -151,8 +160,16 @@ export function createPodFindOps(exec: ExecInPod, cfg: K8sSandboxConfig): FindOp
       // path entry, so it cannot be handed to the model as a file list. Non-zero means
       // `rg` itself failed (e.g. a malformed pattern) — silently returning [] would read
       // as "no matches" instead of "the search errored." Both must throw, same as `readdir`.
+      if (r.truncated) {
+        // What came back can contain OUTPUT_TRUNCATED_MARKER as a bogus path entry, so
+        // it cannot be handed to the model as a file list.
+        throw new Error(
+          `glob exceeds the ${DEFAULT_OUTPUT_CAP} byte sandbox output cap: ${pattern}. ` +
+            `Narrow the pattern or lower the limit.`,
+        );
+      }
       if (r.exitCode === null) {
-        throw new Error(`glob truncated in pod (output cap tripped or rg signalled): ${pattern}`);
+        throw new Error(`glob failed in pod (rg signalled; no exit status): ${pattern}`);
       }
       if (r.exitCode !== 0) {
         throw new Error(`glob failed in pod (rg exited ${r.exitCode}): ${pattern}`);
