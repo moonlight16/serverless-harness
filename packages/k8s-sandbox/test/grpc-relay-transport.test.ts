@@ -56,17 +56,17 @@ const grpcFactory: TransportFactory = (behavior, opts) => {
   return {
     transport,
     stdinSeen,
-    // On this wire, stopping the producer means an Abort naming the exec's own
-    // req_id — the relay routes the abort by that id, so an Abort for any other id
-    // would leave the flood running. Correlate rather than just counting calls.
-    producerStopped: () => {
+    // On this wire, stopping the producer means an Abort naming the exec's own req_id —
+    // the relay routes the abort by that id, so an Abort for any other id would leave the
+    // flood running. Correlate rather than just counting calls.
+    producerStop: () => {
       const id = reqIdSeen();
-      return id !== undefined && aborted().includes(id);
+      return id !== undefined && aborted().includes(id) ? "remote-abort" : "none";
     },
   };
 };
 
-runConformance("GrpcRelayTransport", grpcFactory);
+runConformance("GrpcRelayTransport", grpcFactory, { producerStop: "remote-abort", streams: true });
 
 function manualClient() {
   let stream!: EventEmitter & { cancel: () => void };

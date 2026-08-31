@@ -17,21 +17,54 @@ export interface FakeBehavior {
   hang?: boolean;
 }
 
+/**
+ * How a transport stops a flood when the cap trips. Each transport DECLARES its
+ * mechanism and the battery asserts the factory observed exactly that one — instead of
+ * accepting a bare `true`, which every transport could satisfy by killing something
+ * local while the remote producer kept running (#185).
+ *
+ * Why an enum and not a "was it remote?" boolean: a boolean would assert `false` for
+ * both kubectl paths, discarding the existing coverage that `child.kill` is actually
+ * called — coverage that is load-bearing, since with it removed deleting `child.kill`
+ * still passed. Every transport must make a positive claim about its own mechanism.
+ *
+ *  - `remote-abort`       the far side is told to stop and we can observe that it was
+ *                         (GrpcRelayTransport's `Abort` for this exec's req_id)
+ *  - `local-kill`         we kill our local client; the in-pod process stops on EPIPE,
+ *                         if at all (KubectlTransport's `child.kill`)
+ *  - `producer-side-cap`  the producer is bounded at the source in the sandbox, so there
+ *                         is nothing to kill (persistentExecInPod's pod-side `head -c`)
+ *  - `none`               nothing stopped it. No transport may DECLARE this; it exists so
+ *                         a regression that deletes the stop fails loudly instead of
+ *                         silently reporting `true`.
+ */
+export type ProducerStop = "remote-abort" | "local-kill" | "producer-side-cap" | "none";
+
+/** What a transport declares about itself to the battery. */
+export interface TransportCapabilities {
+  producerStop: ProducerStop;
+  /**
+   * Does this transport replay output to `opts.onData` as it arrives? False for
+   * persistentExecInPod, which is request/response over one multiplexed channel
+   * (persistent-exec.ts:33). Declared rather than silently skipped: quietly omitting a
+   * case for one implementation is how the #185 asymmetry survived in the first place.
+   */
+  streams: boolean;
+}
+
 export interface FakeHandle {
   transport: SandboxTransport;
   /** the stdin the transport forwarded to the backend, once exec has run */
   stdinSeen: () => Buffer | undefined;
   /**
-   * Did the transport stop the PRODUCER for the exec it just ran? The cap is only
-   * a defense if the flood is halted at its source, and each transport halts it
-   * differently (spec §8): KubectlTransport SIGKILLs its `kubectl exec` child,
-   * GrpcRelayTransport sends `Abort` for that exec's `req_id`. Each factory
-   * reduces its own mechanism to this one boolean so the battery can hold both
-   * implementations to the requirement without knowing either wire.
+   * Which stop mechanism did the factory actually observe for the exec just run? The
+   * battery compares this against the transport's declared `producerStop`, so a
+   * transport cannot pass by claiming one mechanism and performing another.
    */
-  producerStopped: () => boolean;
+  producerStop: () => ProducerStop;
 }
 
+/** opts.outputCapBytes MUST be honoured by every factory — it is how the cap case drives each transport's own cap, not a fixed default. */
 export type TransportFactory = (
   behavior: FakeBehavior,
   opts?: { outputCapBytes?: number },
@@ -42,7 +75,11 @@ export type TransportFactory = (
  * ST5 will run this SAME battery against GrpcRelayTransport. That identical pass
  * is what makes the two implementations safely swappable (spec §11, driver #2).
  */
-export function runConformance(label: string, make: TransportFactory): void {
+export function runConformance(
+  label: string,
+  make: TransportFactory,
+  caps: TransportCapabilities,
+): void {
   afterEach(() => vi.useRealTimers());
 
   describe(`SandboxTransport conformance: ${label}`, () => {
@@ -54,14 +91,17 @@ export function runConformance(label: string, make: TransportFactory): void {
       expect(r.truncated).toBe(false); // an untruncated exec must say so explicitly
     });
 
-    it("streams stdout and stderr to onData; stderr is excluded from stdout", async () => {
-      const { transport } = make({ stdout: ["out"], stderr: ["err"], exitCode: 0 });
-      const chunks: string[] = [];
-      const r = await transport.exec("cmd", { onData: (c) => chunks.push(c.toString()) });
-      expect(r.stdout.toString()).toBe("out"); // stderr NOT collected
-      expect(chunks).toContain("out");
-      expect(chunks).toContain("err"); // stderr streamed
-    });
+    it.skipIf(!caps.streams)(
+      "streams stdout and stderr to onData; stderr is excluded from stdout",
+      async () => {
+        const { transport } = make({ stdout: ["out"], stderr: ["err"], exitCode: 0 });
+        const chunks: string[] = [];
+        const r = await transport.exec("cmd", { onData: (c) => chunks.push(c.toString()) });
+        expect(r.stdout.toString()).toBe("out"); // stderr NOT collected
+        expect(chunks).toContain("out");
+        expect(chunks).toContain("err"); // stderr streamed
+      },
+    );
 
     it("forwards stdin to the backend", async () => {
       const { transport, stdinSeen } = make({ stdout: [], exitCode: 0 });
@@ -79,11 +119,8 @@ export function runConformance(label: string, make: TransportFactory): void {
       // Both transports advertise a total-output-per-exec cap (spec §8): the concrete
       // mitigation for a hostile sandbox flooding the model's context. A cap on one
       // transport only is a divergence in the seam, not an implementation detail.
-      const { transport, producerStopped } = make(
-        { stdout: ["aaaa", "bbbb", "cccc"], exitCode: 0 },
-        { outputCapBytes: 6 },
-      );
-      const r = await transport.exec("cat big");
+      const handle = make({ stdout: ["aaaa", "bbbb", "cccc"], exitCode: 0 }, { outputCapBytes: 6 });
+      const r = await handle.transport.exec("cat big");
       const s = r.stdout.toString();
       expect(s).toContain(OUTPUT_TRUNCATED_MARKER);
       expect(s).not.toContain("cccc"); // collection stopped at the cap
@@ -94,10 +131,11 @@ export function runConformance(label: string, make: TransportFactory): void {
       expect(r.truncated).toBe(true);
       // Invariant asserted for every implementation: truncated ⇒ no real exit status.
       expect(r.exitCode).toBeNull();
-      // Dropping bytes on the floor is not the defense — the producer must be stopped,
-      // or a hostile sandbox keeps burning the pod's CPU and the relay's bandwidth
-      // after we have stopped reading (spec §8: Abort / SIGKILL).
-      expect(producerStopped()).toBe(true);
+      // Dropping bytes on the floor is not the defense — the flood must be stopped, or a
+      // hostile sandbox keeps burning the pod's CPU and the relay's bandwidth after we
+      // have stopped reading (spec §8). Each transport stops it differently, so assert
+      // the mechanism it DECLARED rather than accepting any truthy value.
+      expect(handle.producerStop()).toBe(caps.producerStop);
     });
 
     it("rejects with timeout:<n> when the command exceeds the timeout", async () => {
