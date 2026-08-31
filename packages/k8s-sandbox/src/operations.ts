@@ -134,6 +134,14 @@ export function createPodLsOps(exec: ExecInPod, cfg: K8sSandboxConfig): LsOperat
     },
     readdir: async (p) => {
       const r = await exec(`ls -1A ${q(p)}`);
+      // A directory with enough entries (~200k) can cross the output cap just like any
+      // other unbounded listing. A cap trip means what came back is not a trustworthy
+      // directory listing — it may even contain OUTPUT_TRUNCATED_MARKER as a bogus entry.
+      if (r.truncated) {
+        throw new Error(
+          `readdir exceeds the ${DEFAULT_OUTPUT_CAP} byte sandbox output cap: ${p}.`,
+        );
+      }
       if (r.exitCode !== 0) throw new Error(`readdir failed in pod: ${p}`);
       return r.stdout.toString().split("\n").filter((x) => x.length > 0);
     },
@@ -155,11 +163,8 @@ export function createPodFindOps(exec: ExecInPod, cfg: K8sSandboxConfig): FindOp
     glob: async (pattern, cwd, { ignore, limit }) => {
       const globs = [`-g ${shQuote(pattern)}`, ...ignore.map((ig) => `-g ${shQuote(`!${ig}`)}`)];
       const r = await exec(`cd ${q(cwd)} && rg --files --hidden ${globs.join(" ")} | head -n ${limit}`);
-      // A null exit code means the output cap tripped mid-list (spec §8) or rg was
-      // signalled: what came back may even contain OUTPUT_TRUNCATED_MARKER as a bogus
-      // path entry, so it cannot be handed to the model as a file list. Non-zero means
-      // `rg` itself failed (e.g. a malformed pattern) — silently returning [] would read
-      // as "no matches" instead of "the search errored." Both must throw, same as `readdir`.
+      // Non-zero means `rg` itself failed (e.g. a malformed pattern) — silently
+      // returning [] would read as "no matches" instead of "the search errored."
       if (r.truncated) {
         // What came back can contain OUTPUT_TRUNCATED_MARKER as a bogus path entry, so
         // it cannot be handed to the model as a file list.

@@ -28,7 +28,7 @@ export interface FakeBehavior {
  * called — coverage that is load-bearing, since with it removed deleting `child.kill`
  * still passed. Every transport must make a positive claim about its own mechanism.
  *
- *  - `remote-abort`       the far side is told to stop and we can observe that it was
+ *  - `remote-abort`       the far side is told to stop, correlated to this exec's req_id
  *                         (GrpcRelayTransport's `Abort` for this exec's req_id)
  *  - `local-kill`         we kill our local client; the in-pod process stops on EPIPE,
  *                         if at all (KubectlTransport's `child.kill`)
@@ -71,9 +71,10 @@ export type TransportFactory = (
 ) => FakeHandle;
 
 /**
- * The shared SandboxTransport contract. ST2 runs it against KubectlTransport;
- * ST5 will run this SAME battery against GrpcRelayTransport. That identical pass
- * is what makes the two implementations safely swappable (spec §11, driver #2).
+ * The shared SandboxTransport contract. This battery runs against all three
+ * implementations — KubectlTransport, GrpcRelayTransport, and persistentExecInPod.
+ * That identical pass is what makes the three implementations safely swappable
+ * (spec §11, driver #2).
  */
 export function runConformance(
   label: string,
@@ -116,9 +117,9 @@ export function runConformance(
     });
 
     it("caps returned stdout, appends the truncation marker, and stops collecting", async () => {
-      // Both transports advertise a total-output-per-exec cap (spec §8): the concrete
-      // mitigation for a hostile sandbox flooding the model's context. A cap on one
-      // transport only is a divergence in the seam, not an implementation detail.
+      // All three transports advertise a total-output-per-exec cap (spec §8): the
+      // concrete mitigation for a hostile sandbox flooding the model's context. A cap on
+      // fewer than all transports is a divergence in the seam, not an implementation detail.
       const handle = make({ stdout: ["aaaa", "bbbb", "cccc"], exitCode: 0 }, { outputCapBytes: 6 });
       const r = await handle.transport.exec("cat big");
       const s = r.stdout.toString();
@@ -136,6 +137,18 @@ export function runConformance(
       // have stopped reading (spec §8). Each transport stops it differently, so assert
       // the mechanism it DECLARED rather than accepting any truthy value.
       expect(handle.producerStop()).toBe(caps.producerStop);
+    });
+
+    it("does not flag output that lands exactly on the cap", async () => {
+      // The boundary is `> cap`, not `>= cap`. Output that lands exactly on the cap is
+      // COMPLETE and must not be reported as truncated — otherwise every read of a
+      // cap-sized file would fail. The over-cap case above pins the other side.
+      const { transport } = make({ stdout: ["aaaa", "bb"], exitCode: 0 }, { outputCapBytes: 6 });
+      const r = await transport.exec("cat exactly-at-cap");
+      expect(r.truncated).toBe(false);
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout.toString()).toBe("aaaabb");
+      expect(r.stdout.toString()).not.toContain(OUTPUT_TRUNCATED_MARKER);
     });
 
     it("rejects with timeout:<n> when the command exceeds the timeout", async () => {

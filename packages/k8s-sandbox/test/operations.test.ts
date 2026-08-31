@@ -222,6 +222,19 @@ describe("ls ops", () => {
     const file = await createPodLsOps(fakeExec({ stdout: "FILE\n" }).fn, cfg).stat("/head/f");
     expect((await file).isDirectory()).toBe(false);
   });
+
+  it("readdir refuses a truncated listing instead of returning a partial list with the marker as an entry", async () => {
+    // A cap trip (e.g. a directory with ~200k entries) means what came back is not a
+    // trustworthy directory listing — it may even contain OUTPUT_TRUNCATED_MARKER as a
+    // bogus "entry".
+    const { fn } = fakeExec({
+      stdout: "a.txt\nb.txt\n" + OUTPUT_TRUNCATED_MARKER,
+      exitCode: null,
+      truncated: true,
+    });
+    const ops = createPodLsOps(fn, cfg);
+    await expect(ops.readdir("/head/big-dir")).rejects.toThrow(/output cap.*big-dir/);
+  });
 });
 
 describe("find ops", () => {

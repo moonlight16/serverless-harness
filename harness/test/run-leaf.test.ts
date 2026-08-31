@@ -25,7 +25,7 @@ vi.mock("../src/select-sandbox.js", () => ({
 const { k8sSandboxExtensionMock, kubectlTransportMock } = vi.hoisted(() => ({
   k8sSandboxExtensionMock: vi.fn(() => () => {}),
   kubectlTransportMock: vi.fn(() => ({
-    exec: vi.fn(async () => ({ stdout: Buffer.from(""), exitCode: 0 })),
+    exec: vi.fn(async () => ({ stdout: Buffer.from(""), exitCode: 0, truncated: false })),
     close: vi.fn(async () => {}),
   })),
 }));
@@ -261,7 +261,7 @@ describe("realProduceVerdict transport wiring (Task 9)", () => {
   it("grpc path: reuses selected.transport for converge + cleanup and closes it exactly once", async () => {
     const close = vi.fn(async () => {});
     const transport = {
-      exec: vi.fn(async () => ({ stdout: Buffer.from(""), exitCode: 0 })),
+      exec: vi.fn(async () => ({ stdout: Buffer.from(""), exitCode: 0, truncated: false })),
       close,
     };
     selectPoolSandboxMock.mockReset().mockResolvedValue({

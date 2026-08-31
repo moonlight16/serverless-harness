@@ -84,7 +84,11 @@ export function persistentExecInPod(
           inflight = null;
           // The pod capped raw stdout at outputCap + 1 (framing.ts), so one byte past
           // the cap is the evidence that output was cut. Trim to the cap and append the
-          // marker, matching the per-call transports byte-for-byte.
+          // marker, matching the per-call transports' `> cap` trip boundary — though not
+          // their byte count: exec.ts and grpc-relay-transport.ts push the whole chunk
+          // that crosses the cap before testing `bytes > outputCap`, so their returned
+          // stdout can exceed the cap by up to one chunk, whereas this transport trims to
+          // exactly `cap`.
           //
           // This RESOLVES rather than calling cur.fail(): fail() retries through
           // deps.fallback (the capped KubectlTransport, per extension.ts:52), so
