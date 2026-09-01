@@ -28,7 +28,7 @@ git clone --recurse-submodules https://github.com/rossoctl/serverless-harness.gi
 > run needs no local Docker build (it falls back to a build only if the pull is unavailable).
 > Testing local source changes? Pass `--build` to build from this checkout; `--skip-build`
 > reuses an image you already loaded as `dev.local/serverless-harness:local`.
-> See [`deploy/knative/README-kind.md`](deploy/knative/README-kind.md) for more setup options.
+> See [`deploy/knative/README-kind.md`](../../deploy/knative/README-kind.md) for more setup options.
 
 `setup-kind.sh` installs everything Act 1 needs (Knative + Kourier, Redis, the
 sandbox pod) **and** KEDA, which Act 2's fan-out rides on.
