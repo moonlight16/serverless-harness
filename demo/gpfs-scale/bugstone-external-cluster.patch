@@ -1,0 +1,105 @@
+diff --git a/agent_specifics/serverless_harness/cluster_io.py b/agent_specifics/serverless_harness/cluster_io.py
+--- a/agent_specifics/serverless_harness/cluster_io.py
++++ b/agent_specifics/serverless_harness/cluster_io.py
+@@ -9,6 +9,7 @@ There is no /work PVC, no resultRef file, no done-marker file.
+ """
+ import json
+ import os
++import time
+ 
+ import requests
+ 
+@@ -36,6 +37,11 @@ def _headers() -> dict:
+     host = os.environ.get("KAGENTI_HOST_HEADER", "")
+     if host and os.environ.get("KAGENTI_CLUSTER", "kind") == "kind":
+         h["Host"] = host
++    # Optional authentication enforced by an external gateway.
++    auth_header = os.environ.get("KAGENTI_AUTH_HEADER", "")
++    auth_value = os.environ.get("KAGENTI_AUTH_VALUE", "")
++    if auth_header and auth_value:
++        h[auth_header] = auth_value
+     return h
+ 
+ 
+@@ -43,12 +49,27 @@ def post_run_leaf(envelope: dict, timeout: int = 300) -> dict:
+     """Synchronous POST /runs. Returns the LeafResult (verdict inline on success)."""
+-    resp = requests.post(
+-        f"{_base()}/runs",
+-        headers=_headers(),
+-        data=json.dumps(envelope),
+-        timeout=timeout,
+-        verify=_verify(),
+-    )
++    try:
++        resp = requests.post(
++            f"{_base()}/runs",
++            headers=_headers(),
++            data=json.dumps(envelope),
++            timeout=timeout,
++            verify=_verify(),
++        )
++    except requests.ConnectionError as original_error:
++        # Some external load balancers close an otherwise healthy idle request
++        # before a long-running synchronous leaf returns. The harness persists
++        # the result by session ID, so recover it without dispatching a duplicate.
++        deadline = time.monotonic() + timeout
++        while time.monotonic() < deadline:
++            try:
++                result = poll_status(envelope["sessionId"])
++                if result.get("status") in _TERMINAL:
++                    return result
++            except requests.RequestException:
++                pass
++            time.sleep(2)
++        raise original_error
+     resp.raise_for_status()
+     return resp.json()
+ 
+ 
+diff --git a/agent_specifics/serverless_harness/env.sh b/agent_specifics/serverless_harness/env.sh
+--- a/agent_specifics/serverless_harness/env.sh
++++ b/agent_specifics/serverless_harness/env.sh
+@@ -33,8 +33,16 @@ case "$KAGENTI_CLUSTER" in
+     export KAGENTI_HOST_HEADER=""
+     export KAGENTI_TLS_VERIFY="${KAGENTI_TLS_VERIFY:-0}"
+     ;;
++  external)
++    # Reach a preconfigured public gateway without a local port-forward.
++    export KAGENTI_BASE="${KAGENTI_BASE:?external mode requires KAGENTI_BASE}"
++    export KAGENTI_HOST_HEADER="${KAGENTI_HOST_HEADER:-}"
++    export KAGENTI_TLS_VERIFY="${KAGENTI_TLS_VERIFY:-1}"
++    export KAGENTI_AUTH_HEADER="${KAGENTI_AUTH_HEADER:-}"
++    export KAGENTI_AUTH_VALUE="${KAGENTI_AUTH_VALUE:-}"
++    ;;
+   *)
+-    echo "env.sh: unknown KAGENTI_CLUSTER=$KAGENTI_CLUSTER (want kind|ocp)" >&2
++    echo "env.sh: unknown KAGENTI_CLUSTER=$KAGENTI_CLUSTER (want kind|ocp|external)" >&2
+     # shellcheck disable=SC2317  # exit is reached only when this file is executed, not sourced
+     return 1 2>/dev/null || exit 1
+     ;;
+diff --git a/agent_specifics/serverless_harness/stage_repo.sh b/agent_specifics/serverless_harness/stage_repo.sh
+--- a/agent_specifics/serverless_harness/stage_repo.sh
++++ b/agent_specifics/serverless_harness/stage_repo.sh
+@@ -21,7 +21,21 @@ ENVFILE="$RESULTS/harness_env.sh"
+ : > "$ENVFILE"
+ 
+ # --- 1. ingress base URL ---
+-if [ "$KAGENTI_CLUSTER" = "ocp" ]; then
++if [ "$KAGENTI_CLUSTER" = "external" ]; then
++  [ -n "${KAGENTI_BASE:-}" ] || {
++    echo "[stage] external mode needs KAGENTI_BASE set" >&2
++    exit 1
++  }
++  echo "[stage] external URL: $KAGENTI_BASE (no port-forward)"
++  {
++    echo "export KAGENTI_CLUSTER=external"
++    echo "export KAGENTI_BASE='${KAGENTI_BASE}'"
++    echo "export KAGENTI_HOST_HEADER='${KAGENTI_HOST_HEADER:-}'"
++    echo "export KAGENTI_TLS_VERIFY='${KAGENTI_TLS_VERIFY:-1}'"
++    echo "export KAGENTI_AUTH_HEADER='${KAGENTI_AUTH_HEADER:-}'"
++    echo "export KAGENTI_AUTH_VALUE='${KAGENTI_AUTH_VALUE:-}'"
++  } >> "$ENVFILE"
++elif [ "$KAGENTI_CLUSTER" = "ocp" ]; then
+   URL="$(kubectl -n "$NS" get ksvc "$KAGENTI_KSVC" -o jsonpath='{.status.url}')"
+   [ -n "$URL" ] || { echo "[stage] could not resolve Route for ksvc $KAGENTI_KSVC" >&2; exit 1; }
+   echo "[stage] ocp Route: $URL"

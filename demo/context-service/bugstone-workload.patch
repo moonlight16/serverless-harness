@@ -1,0 +1,19 @@
+diff --git a/agent_specifics/serverless_harness/leaf_logic.py b/agent_specifics/serverless_harness/leaf_logic.py
+--- a/agent_specifics/serverless_harness/leaf_logic.py
++++ b/agent_specifics/serverless_harness/leaf_logic.py
+@@ -1,4 +1,5 @@
+ """Pure (I/O-free) logic for the serverless-harness Phase-B shim. Unit-tested."""
++import os
+ import re
+ 
+ # Mirror engine/phaseb_normalization.py canonical labels.
+@@ -91,6 +92,9 @@ def build_envelope(
+         "ref": ref,
+         "maxTurns": max_turns,
+     }
++    workload_id = os.environ.get("KAGENTI_WORKLOAD_ID")
++    if workload_id:
++        env["workloadId"] = workload_id
+     if is_async:
+         env["async"] = True
+     return env
