@@ -125,11 +125,20 @@ export ANTHROPIC_API_KEY=sk-...    # ...or a gateway: ANTHROPIC_BASE_URL + ANTHR
 default, so a first run needs no local Docker build. The default model is `claude-haiku-4-5` (fast and
 cheap — ideal for a live demo).
 
-**Next — take the guided tour:** [`serverless-harness-demo.md`](serverless-harness-demo.md) is a
-~10-minute, two-act walkthrough where you watch the agent **cold-start from zero, drop back to zero and
-resume with full memory** (Act 1), then **fan out into a fleet of worker pods** that appear on demand
-and vanish when the queue drains (Act 2). It's the fastest way to see what a serverless agent does that
+**Next — take the guided tour:**
+[`docs/demos/serverless-harness-demo.md`](docs/demos/serverless-harness-demo.md) is a ~10-minute,
+two-act walkthrough where you watch the agent **cold-start from zero, drop back to zero and resume
+with full memory** (Act 1), then **fan out into a fleet of worker pods** that appear on demand and
+vanish when the queue drains (Act 2). It's the fastest way to see what a serverless agent does that
 an always-on one can't.
+
+**Then — the remote sandbox:**
+[`docs/demos/remote-sandbox-demo.md`](docs/demos/remote-sandbox-demo.md) drives a sandbox running as
+a plain `docker run` **on your laptop** — outside the cluster, with **zero inbound rules** and no
+cluster credential — executing a leaf's tool calls. Same request, opposite verdicts, and a secret you
+plant by hand that the cluster reads back. Scripted equivalent: `make demo-remote-sandbox`.
+
+All guided demos are indexed in [`docs/demos/`](docs/demos/).
 
 For setup options and troubleshooting see
 [`deploy/knative/README-kind.md`](deploy/knative/README-kind.md);
