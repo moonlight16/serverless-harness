@@ -1,0 +1,97 @@
+# Proven agentic-node demo values. The model-storage volume currently requires the documented
+# read-only hostPath workaround after Helm rendering because of the Scale CSI attachment defect.
+modelArtifacts:
+  name: nvidia/nemotron-3-ultra
+  uri: pvc://model-nvidia-nemotron-3-ultra-550b-a55b-nvfp4/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4
+  size: 450Gi
+  authSecretName: llm-d-hf-token
+  mountPath: /model-cache
+  labels:
+    cs.io/llm-d-release: nvidia-nemotron-3-ultra
+    llm-d.ai/accelerator-variant: gpu
+    llm-d.ai/accelerator-vendor: nvidia
+    llm-d.ai/guide: inference-scheduling
+    llm-d.ai/inference-serving: "true"
+    llm-d.ai/model: nvidia-nemotron-3-ultra
+
+decode:
+  replicas: 1
+  nodeSelector: {kubernetes.io/hostname: agentic-node-1}
+  parallelism: {tensor: 8}
+  extraConfig: {runtimeClassName: nvidia, hostIPC: true}
+  volumes:
+    - {name: metrics-volume, emptyDir: {}}
+    - {name: torch-compile-cache, emptyDir: {}}
+    - name: shm
+      emptyDir: {medium: Memory, sizeLimit: 256Gi}
+    - name: kv-cache-local
+      hostPath: {path: /mnt/llm-d-cache/nemotron-ultra, type: Directory}
+  initContainers:
+    - name: wait-for-weights
+      image: busybox:1.36
+      command: ["sh", "-c"]
+      args: ['until [ -f /model-cache/.cs-download-complete ]; do echo "waiting for weights"; sleep 10; done']
+      volumeMounts:
+        - {name: model-storage, mountPath: /model-cache, readOnly: true}
+  containers:
+    - name: vllm
+      image: vllm/vllm-openai:v0.27.1-cu129
+      modelCommand: vllmServe
+      mountModelVolume: true
+      env:
+        - {name: NCCL_DEBUG, value: INFO}
+        - {name: NCCL_DEBUG_SUBSYS, value: 'INIT,GRAPH,ENV'}
+        - {name: NCCL_NVLS_ENABLE, value: "0"}
+        - {name: VLLM_WORKER_MULTIPROC_METHOD, value: spawn}
+        - {name: SAFETENSORS_FAST_GPU, value: "1"}
+        - {name: NVIDIA_TF32_OVERRIDE, value: "1"}
+        - {name: PYTHONHASHSEED, value: "0"}
+      args:
+        - --trust-remote-code
+        - --enable-expert-parallel
+        - --kv-cache-dtype=fp8
+        - --max-model-len=131072
+        - --gpu-memory-utilization=0.95
+        - --max-num-seqs=16
+        - --max-num-batched-tokens=32768
+        - --enable-chunked-prefill
+        - --enable-prefix-caching
+        - --reasoning-parser=nemotron_v3
+        - --enable-auto-tool-choice
+        - --tool-call-parser=qwen3_coder
+        - --mamba-ssm-cache-dtype=float16
+        - --mamba-backend=flashinfer
+        - --enable-mamba-cache-stochastic-rounding
+        - --mamba-cache-philox-rounds=5
+        - --speculative-config={"method":"nemotron_h_mtp","num_speculative_tokens":5}
+        - --model-loader-extra-config={"enable_multithread_load":true,"num_threads":96}
+        - --kv-transfer-config={"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":137438953472,"secondary_tiers":[{"type":"fs","root_dir":"/mnt/kv-cache","n_read_threads":32,"n_write_threads":16,"locality":"LOCAL"}]}}
+      ports: [{name: vllm, containerPort: 8000}]
+      resources:
+        requests: {cpu: "96", memory: 768Gi}
+        limits: {cpu: "120", memory: 1200Gi}
+      startupProbe:
+        httpGet: {path: /v1/models, port: vllm}
+        periodSeconds: 30
+        timeoutSeconds: 5
+        failureThreshold: 120
+      readinessProbe:
+        httpGet: {path: /v1/models, port: vllm}
+        periodSeconds: 10
+        timeoutSeconds: 5
+      livenessProbe:
+        httpGet: {path: /health, port: vllm}
+        periodSeconds: 30
+        timeoutSeconds: 5
+        failureThreshold: 5
+      volumeMounts:
+        - {name: metrics-volume, mountPath: /.config}
+        - {name: shm, mountPath: /dev/shm}
+        - {name: torch-compile-cache, mountPath: /.cache}
+        - {name: kv-cache-local, mountPath: /mnt/kv-cache}
+
+prefill: {create: false, replicas: 0}
+routing:
+  servicePort: 8000
+  proxy: {enabled: false}
+enabled: true

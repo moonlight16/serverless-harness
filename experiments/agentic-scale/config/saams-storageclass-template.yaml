@@ -1,0 +1,35 @@
+# Replace every ${...} placeholder before applying. Add the SaaMS cluster to the existing
+# CSIScaleOperator; do not replace its existing local-cluster entry.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: saams-scale-csi-secret
+  namespace: ibm-spectrum-scale-csi-driver
+type: Opaque
+stringData:
+  username: "${SAAMS_GUI_USERNAME}"
+  password: "${SAAMS_GUI_PASSWORD}"
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: {name: saams-swebench}
+provisioner: spectrumscale.csi.ibm.com
+parameters:
+  clusterId: "${SAAMS_CLUSTER_ID}"
+  volBackendFs: "${SAAMS_FILESYSTEM}"
+  filesetType: independent
+  permissions: "0770"
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: saams-swebench-validation
+  namespace: serverless-harness
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: saams-swebench
+  resources:
+    requests: {storage: 1Gi}
