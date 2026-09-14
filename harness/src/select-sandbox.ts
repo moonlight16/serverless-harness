@@ -10,6 +10,87 @@ import {
   type ExecClientLike,
 } from '@sh/k8s-sandbox';
 import { RedisLeaseStore, type LeaseStore } from './sandbox-lease.js';
+
+/**
+ * Process-wide Redis-backed stores, reused across selections instead of built per call.
+ *
+ * Both stores used to be constructed inside `selectPoolSandbox` on every call. That was harmless
+ * while only prompt leaves reached this code — a leaf is a process, so "per call" was "once". The
+ * moment `/turn` began selecting from the pool it became per TURN, and the two failed differently:
+ *
+ *  - `RedisRecordStore` was constructed AND closed, so it churned: measured on a real run, ~10k
+ *    turns produced **35,654** connections.
+ *  - `RedisLeaseStore` was constructed and **never closed** (its constructor connects eagerly), so
+ *    it LEAKED one live connection per turn — monotonically, to the `maxclients 10000` ceiling.
+ *
+ * Redis then answered `ERR max number of clients reached`, node-redis raised that as an `'error'`
+ * event on a client with no listener, and all four workers exited code 1 **simultaneously**,
+ * mid-rung, stranding every in-flight turn (the driver's own curl has no timeout, so those turns
+ * hung indefinitely rather than failing). It took ~13 minutes at 27-54 turns/s to accumulate, which
+ * is why two complete E8 ladders passed before it appeared.
+ *
+ * Each memo holds the STORE, not a promise of one, and is dropped when a call through it rejects:
+ * caching a broken client would turn one transient Redis blip into a permanent failure for the life
+ * of the process — for the record store a permanent "no sandboxes", for the lease store a permanent
+ * inability to acquire. Neither is closed on the happy path; they are process-lived by design and
+ * the process exiting is what releases them.
+ */
+type Closable = { close(): Promise<void> };
+let recordsMemo: { url: string | undefined; store: RecordStore & Closable } | null = null;
+let leaseMemo: { url: string | undefined; store: LeaseStore & Closable } | null = null;
+
+function sharedRecords(url: string | undefined): RecordStore {
+  if (!recordsMemo || recordsMemo.url !== url) {
+    // A changed REDIS_URL means a different Redis; drop the old client rather than silently talking
+    // to the wrong one. Closing is best-effort — it is being replaced either way.
+    if (recordsMemo) void recordsMemo.store.close().catch(() => {});
+    recordsMemo = { url, store: new RedisRecordStore(url) };
+  }
+  const store = recordsMemo.store;
+  const drop = () => {
+    recordsMemo = null;
+  };
+  return {
+    put: (rec) => guard(store.put(rec), drop),
+    remove: (id) => guard(store.remove(id), drop),
+    list: () => guard(store.list(), drop),
+  };
+}
+
+function sharedLease(url: string | undefined): LeaseStore {
+  if (!leaseMemo || leaseMemo.url !== url) {
+    if (leaseMemo) void leaseMemo.store.close().catch(() => {});
+    leaseMemo = { url, store: new RedisLeaseStore(url) };
+  }
+  const store = leaseMemo.store;
+  const drop = () => {
+    leaseMemo = null;
+  };
+  return {
+    load: (pod) => guard(store.load(pod), drop),
+    acquire: (pod, cap, runId, ttlMs) => guard(store.acquire(pod, cap, runId, ttlMs), drop),
+    heartbeat: (pod, runId, ttlMs) => guard(store.heartbeat(pod, runId, ttlMs), drop),
+    release: (pod, runId) => guard(store.release(pod, runId), drop),
+  };
+}
+
+/** Run `p`, and drop the shared store's memo if it rejects so the next call rebuilds it. */
+async function guard<T>(p: Promise<T>, drop: () => void): Promise<T> {
+  try {
+    return await p;
+  } catch (err) {
+    drop();
+    throw err;
+  }
+}
+
+/** Test-only: drop the cached stores so a test can inject its own or force a reconnect. */
+export function resetSharedRecords(): void {
+  if (recordsMemo) void recordsMemo.store.close().catch(() => {});
+  if (leaseMemo) void leaseMemo.store.close().catch(() => {});
+  recordsMemo = null;
+  leaseMemo = null;
+}
 import { RedisRecordStore, type RecordStore, type SandboxRecord } from './pool-records.js';
 
 /** Pure: pods ordered ascending by active load (stable — ties keep input order). */
@@ -123,7 +204,7 @@ export async function selectPoolSandbox(
   const context = env.KAGENTI_SANDBOX_CONTEXT || undefined;
   const podCwd = env.KAGENTI_SANDBOX_CWD ?? '/workspace';
   const list = deps.listPods ?? listPoolPods;
-  const lease = deps.lease ?? new RedisLeaseStore(env.REDIS_URL);
+  const lease = deps.lease ?? sharedLease(env.REDIS_URL);
 
   const source = resolveDiscoverySource(env, opts.remoteSandbox === true);
   const pods = source === 'records' ? [] : await list(selector, namespace, context, deps.run);
@@ -134,16 +215,7 @@ export async function selectPoolSandbox(
   let grpcRecs: SandboxRecord[] = [];
   if (remoteOn) {
     const injected = deps.records;
-    if (injected) {
-      grpcRecs = await injected.list();
-    } else {
-      // We constructed this store ourselves (it eagerly opens a Redis
-      // connection), so we alone own closing it once we're done listing —
-      // an injected deps.records is the caller's connection to manage.
-      const store = new RedisRecordStore(env.REDIS_URL);
-      grpcRecs = await store.list();
-      await store.close();
-    }
+    grpcRecs = injected ? await injected.list() : await sharedRecords(env.REDIS_URL).list();
   }
   const grpcById = new Map(grpcRecs.map((r) => [r.sandboxId, r]));
 

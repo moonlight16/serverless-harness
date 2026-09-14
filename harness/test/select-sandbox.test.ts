@@ -4,6 +4,7 @@ import {
   selectPoolSandbox,
   SandboxPoolSaturatedError,
   resolveDiscoverySource,
+  resetSharedRecords,
 } from '../src/select-sandbox.js';
 import type { LeaseStore } from '../src/sandbox-lease.js';
 import type { RecordStore, SandboxRecord } from '../src/pool-records.js';
@@ -214,17 +215,52 @@ describe('selectPoolSandbox remote dispatch: ad-hoc RedisRecordStore lifecycle',
     ({ KAGENTI_SANDBOX_POOL_SELECTOR: 'app=sbx', ...extra }) as NodeJS.ProcessEnv;
   const opts = { cap: 4, ttlMs: 60000, remoteSandbox: true };
 
-  it('closes the RedisRecordStore it constructs itself (no deps.records injected)', async () => {
+  it('REUSES one RedisRecordStore across selections instead of one per call', async () => {
+    // This replaces an assertion that the store was constructed and closed per call. That was
+    // harmless while only prompt leaves reached this path -- a leaf is a process -- but once /turn
+    // began selecting from the pool it meant a Redis connect and disconnect PER TURN. Measured on a
+    // real run: ~10k turns produced 35,654 connections, Redis answered
+    // `ERR max number of clients reached` (11 rejected against maxclients 10000, closes lagging
+    // opens), node-redis raised that as an 'error' on a client with no listener, and all four
+    // workers exited code 1 SIMULTANEOUSLY mid-rung, stranding their in-flight turns.
+    resetSharedRecords();
+    createdRecordStores.length = 0;
+    const lease = fakeLease({ 'sandbox-0-0': 0, 'sandbox-0-1': 0 }, opts.cap);
+    const deps = { listPods: async () => ['sandbox-0-0', 'sandbox-0-1'], lease };
+
+    await selectPoolSandbox(env(), '/head', 'run-1', opts, deps);
+    await selectPoolSandbox(env(), '/head', 'run-2', opts, deps);
+    await selectPoolSandbox(env(), '/head', 'run-3', opts, deps);
+
+    // One store for three selections is the whole point; three would be the defect.
+    expect(createdRecordStores).toHaveLength(1);
+    expect(createdRecordStores[0].list).toHaveBeenCalledTimes(3);
+    // And it is NOT closed between uses: it is process-lived by design, so closing it after each
+    // selection is what forced the reconnect-per-turn in the first place.
+    expect(createdRecordStores[0].close).not.toHaveBeenCalled();
+  });
+
+  it('drops the cached store when a list fails, so one blip is not permanent', async () => {
+    // Memoising a broken client would turn a transient Redis failure into a permanent "no
+    // sandboxes" verdict for the life of the process -- selection would then throw
+    // `no Running pods for pool selector` forever, which reads as a misconfigured pool.
+    resetSharedRecords();
     createdRecordStores.length = 0;
     const lease = fakeLease({ 'sandbox-0-0': 0 }, opts.cap);
-    await selectPoolSandbox(env(), '/head', 'run-1', opts, {
-      listPods: async () => ['sandbox-0-0'],
-      lease,
-      // deps.records intentionally omitted: this exercises the not-injected branch.
-    });
+    const deps = { listPods: async () => ['sandbox-0-0'], lease };
+
+    await selectPoolSandbox(env(), '/head', 'run-1', opts, deps);
     expect(createdRecordStores).toHaveLength(1);
-    expect(createdRecordStores[0].list).toHaveBeenCalledTimes(1);
-    expect(createdRecordStores[0].close).toHaveBeenCalledTimes(1);
+    createdRecordStores[0].list.mockRejectedValueOnce(
+      new Error('ERR max number of clients reached'),
+    );
+
+    await expect(selectPoolSandbox(env(), '/head', 'run-2', opts, deps)).rejects.toThrow(
+      /max number of clients/,
+    );
+    // The next selection must build a fresh store rather than reuse the poisoned one.
+    await selectPoolSandbox(env(), '/head', 'run-3', opts, deps);
+    expect(createdRecordStores).toHaveLength(2);
   });
 
   it('does not construct (or close) a RedisRecordStore when deps.records is injected', async () => {

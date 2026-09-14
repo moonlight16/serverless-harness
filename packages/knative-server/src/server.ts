@@ -182,7 +182,7 @@ async function handleTurn(req: IncomingMessage, res: ServerResponse): Promise<vo
     res.writeHead(200, JSON_HEADERS).end(JSON.stringify(result));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    const status = message.includes('no session in backend') ? 404 : 500;
+    const status = turnErrorStatus(err);
     res.writeHead(status, JSON_HEADERS).end(
       JSON.stringify({
         error: status === 404 ? 'session_not_found' : message,
@@ -190,6 +190,35 @@ async function handleTurn(req: IncomingMessage, res: ServerResponse): Promise<vo
       }),
     );
   }
+}
+
+/**
+ * HTTP status for a failed turn. Shared by the sync path and the SSE pre-first-frame window
+ * because §3.4 regime 2 requires the two to be byte-identical, and they were two duplicated
+ * blocks — which is exactly how such a pair drifts the moment one of them grows a case.
+ *
+ * 503 for pool saturation, not 500: every candidate sandbox being at its cap is transient, and a
+ * 500 tells the caller the turn can never succeed. `/runs` already treats it this way (it
+ * bounded-waits then 503s), and `classifyOutcome` keeps it retryable for the async queue — so
+ * returning 500 here would make one signal mean two different things depending on the route.
+ *
+ * Matched on the error's own `name` marker rather than `instanceof`, and rather than another
+ * message substring. `name` is set by SandboxPoolSaturatedError's constructor, so it is class
+ * identity and not prose — a reworded message cannot change an HTTP status, which is the trap the
+ * `no session in backend` line below already sits in and which is not worth extending.
+ *
+ * `instanceof` would be the idiom (run-leaf.ts uses it for this very class) but it is only sound
+ * WITHIN the harness package. Reaching across the workspace boundary makes the status depend on
+ * both packages resolving the identical module instance — which is false whenever a test mocks
+ * `@sh/harness/run-turn` wholesale, as server.test.ts does: the import then yields vitest's
+ * "no export" stub and `instanceof` throws, turning three unrelated turn errors into 500s. That
+ * was observed, not hypothesised. The paired test constructs the REAL class, so this string stays
+ * pinned to the class rather than drifting from it.
+ */
+export function turnErrorStatus(err: unknown): number {
+  if (err instanceof Error && err.name === 'SandboxPoolSaturatedError') return 503;
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes('no session in backend') ? 404 : 500;
 }
 
 // Serialize frames to the SSE wire form, flushing SSE headers on the FIRST frame (lazy flush →
@@ -260,7 +289,7 @@ async function handleTurnStream(
       // Pre-first-frame: nothing streamed yet, so reuse the EXACT sync mapping — a bad sessionId
       // still returns real 404 JSON, byte-identical to the sync path (§3.4 regime 2).
       const message = err instanceof Error ? err.message : String(err);
-      const status = message.includes('no session in backend') ? 404 : 500;
+      const status = turnErrorStatus(err);
       res.writeHead(status, JSON_HEADERS).end(
         JSON.stringify({
           error: status === 404 ? 'session_not_found' : message,
