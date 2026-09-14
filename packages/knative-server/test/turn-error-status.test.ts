@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { SandboxPoolSaturatedError } from '@sh/harness/run-turn';
+import { SandboxPoolSaturatedError, SandboxPoolEmptyError } from '@sh/harness/run-turn';
 import { turnErrorStatus } from '../src/server.js';
 
 // /turn now leases a sandbox from the pool (it used to run tool calls in the harness process), so
@@ -14,6 +14,14 @@ import { turnErrorStatus } from '../src/server.js';
 describe('turnErrorStatus', () => {
   it('maps pool saturation to 503, not 500', () => {
     expect(turnErrorStatus(new SandboxPoolSaturatedError('app=sandbox'))).toBe(503);
+  });
+
+  it('maps an EMPTY pool to 503 too, not 500', () => {
+    // The behaviour change that made /turn lease from the pool also made a momentarily empty pool
+    // newly fatal on this route: selectPoolSandbox threw a plain Error, so "the sandboxes are still
+    // starting" got a code meaning "never retry" while "every sandbox is busy" got Retry-After. Same
+    // cause (no capacity yet), so the same advice.
+    expect(turnErrorStatus(new SandboxPoolEmptyError('app=sandbox'))).toBe(503);
   });
 
   it('keeps the legacy 404 for a missing session', () => {
@@ -32,10 +40,11 @@ describe('turnErrorStatus', () => {
     expect(turnErrorStatus(new Error('sandbox pool saturated for selector app=sandbox'))).toBe(500);
   });
 
-  it('pins the name string to the real class', () => {
+  it('pins the name strings to the real classes', () => {
     // This is the case that makes the `name` comparison safe: turnErrorStatus hard-codes the
-    // string, so if the class ever renamed itself this assertion fails rather than the status
+    // strings, so if either class ever renamed itself this assertion fails rather than the status
     // silently degrading to 500 in production.
     expect(new SandboxPoolSaturatedError('app=sandbox').name).toBe('SandboxPoolSaturatedError');
+    expect(new SandboxPoolEmptyError('app=sandbox').name).toBe('SandboxPoolEmptyError');
   });
 });

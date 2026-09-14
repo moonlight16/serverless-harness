@@ -27,6 +27,10 @@ import { describe, expect, it } from 'vitest';
 const src = (rel: string) =>
   readFileSync(fileURLToPath(new URL(`../src/${rel}`, import.meta.url)), 'utf8');
 
+/** Same, for a sibling workspace package. */
+const pkgSrc = (rel: string) =>
+  readFileSync(fileURLToPath(new URL(`../../packages/${rel}`, import.meta.url)), 'utf8');
+
 /** Strip block and line comments, so the prose above (and in the sources) cannot satisfy a check. */
 function code(text: string): string {
   return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
@@ -62,6 +66,28 @@ describe('no Redis client is constructed per turn', () => {
     expect(body).toMatch(/function guard</);
     expect(body).toMatch(/recordsMemo = null/);
     expect(body).toMatch(/leaseMemo = null/);
+    // The eviction must be identity-checked, or a rejection arriving after the memo was rebuilt
+    // discards a store that never failed (and orphans it, connected and unreferenced).
+    expect(body).toMatch(/read\(\)\?\.store !== store/);
+  });
+
+  it('the memoised SESSION store cannot cache a client that never connected either', () => {
+    // This case used to assert the drop-guard against select-sandbox.ts alone, which exempted the one
+    // store built WITHOUT a guard -- run-turn.ts's sharedSessionStore. That store is safe for a
+    // different reason, so assert the property where it actually lives or the two drift apart again:
+    // RedisSessionBackend re-arms its own connect, which fixes every caller of the class rather than
+    // this one memo. The behavioural pin is packages/session-backend/test/redis-backend-rearm.test.ts;
+    // this is the structural half, next to the memo whose safety depends on it.
+    const memo = code(src('run-turn.ts'));
+    expect(memo).toMatch(/const store = sharedSessionStore\(redisUrl\)/);
+
+    const backend = code(pkgSrc('session-backend/src/redis-backend.ts'));
+    // A failed attempt clears itself...
+    expect(backend).toMatch(/this\.ready = null/);
+    // ...and the next caller starts a fresh one rather than awaiting the rejected promise.
+    expect(backend).toMatch(/this\.ready \?\?= this\.arm\(\)/);
+    // Nothing may reintroduce a once-assigned field that can never be re-armed.
+    expect(backend).not.toMatch(/private ready: Promise<void>;/);
   });
 
   it('proves the guard can fail: the forbidden pattern is detectable', () => {

@@ -197,14 +197,19 @@ async function handleTurn(req: IncomingMessage, res: ServerResponse): Promise<vo
  * because §3.4 regime 2 requires the two to be byte-identical, and they were two duplicated
  * blocks — which is exactly how such a pair drifts the moment one of them grows a case.
  *
- * 503 for pool saturation, not 500: every candidate sandbox being at its cap is transient, and a
- * 500 tells the caller the turn can never succeed. `/runs` already treats it this way (it
- * bounded-waits then 503s), and `classifyOutcome` keeps it retryable for the async queue — so
+ * 503 for a pool with no capacity, not 500: whether every candidate sandbox is at its cap
+ * (`SandboxPoolSaturatedError`) or there is no candidate yet (`SandboxPoolEmptyError` — pods
+ * rolling, an HPA scaling from zero, presence records not re-mirrored after a restart), the turn can
+ * succeed on a retry, and a 500 tells the caller it never can. `/runs` already treats saturation this
+ * way (it bounded-waits then 503s) and `classifyOutcome` keeps BOTH retryable for the async queue, so
  * returning 500 here would make one signal mean two different things depending on the route.
  *
+ * The two are deliberately not distinguished: from the caller's side "no capacity right now, retry"
+ * is one fact, and splitting it would only invite a client to treat one as fatal.
+ *
  * Matched on the error's own `name` marker rather than `instanceof`, and rather than another
- * message substring. `name` is set by SandboxPoolSaturatedError's constructor, so it is class
- * identity and not prose — a reworded message cannot change an HTTP status, which is the trap the
+ * message substring. `name` is set in each class's constructor, so it is class identity and not
+ * prose — a reworded message cannot change an HTTP status, which is the trap the
  * `no session in backend` line below already sits in and which is not worth extending.
  *
  * `instanceof` would be the idiom (run-leaf.ts uses it for this very class) but it is only sound
@@ -215,8 +220,10 @@ async function handleTurn(req: IncomingMessage, res: ServerResponse): Promise<vo
  * was observed, not hypothesised. The paired test constructs the REAL class, so this string stays
  * pinned to the class rather than drifting from it.
  */
+const NO_CAPACITY = new Set(['SandboxPoolSaturatedError', 'SandboxPoolEmptyError']);
+
 export function turnErrorStatus(err: unknown): number {
-  if (err instanceof Error && err.name === 'SandboxPoolSaturatedError') return 503;
+  if (err instanceof Error && NO_CAPACITY.has(err.name)) return 503;
   const message = err instanceof Error ? err.message : String(err);
   return message.includes('no session in backend') ? 404 : 500;
 }

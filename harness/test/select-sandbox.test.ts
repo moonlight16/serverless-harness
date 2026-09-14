@@ -4,7 +4,7 @@ import {
   selectPoolSandbox,
   SandboxPoolSaturatedError,
   resolveDiscoverySource,
-  resetSharedRecords,
+  resetSharedStores,
 } from '../src/select-sandbox.js';
 import type { LeaseStore } from '../src/sandbox-lease.js';
 import type { RecordStore, SandboxRecord } from '../src/pool-records.js';
@@ -223,7 +223,7 @@ describe('selectPoolSandbox remote dispatch: ad-hoc RedisRecordStore lifecycle',
     // `ERR max number of clients reached` (11 rejected against maxclients 10000, closes lagging
     // opens), node-redis raised that as an 'error' on a client with no listener, and all four
     // workers exited code 1 SIMULTANEOUSLY mid-rung, stranding their in-flight turns.
-    resetSharedRecords();
+    resetSharedStores();
     createdRecordStores.length = 0;
     const lease = fakeLease({ 'sandbox-0-0': 0, 'sandbox-0-1': 0 }, opts.cap);
     const deps = { listPods: async () => ['sandbox-0-0', 'sandbox-0-1'], lease };
@@ -244,7 +244,7 @@ describe('selectPoolSandbox remote dispatch: ad-hoc RedisRecordStore lifecycle',
     // Memoising a broken client would turn a transient Redis failure into a permanent "no
     // sandboxes" verdict for the life of the process -- selection would then throw
     // `no Running pods for pool selector` forever, which reads as a misconfigured pool.
-    resetSharedRecords();
+    resetSharedStores();
     createdRecordStores.length = 0;
     const lease = fakeLease({ 'sandbox-0-0': 0 }, opts.cap);
     const deps = { listPods: async () => ['sandbox-0-0'], lease };
@@ -261,6 +261,49 @@ describe('selectPoolSandbox remote dispatch: ad-hoc RedisRecordStore lifecycle',
     // The next selection must build a fresh store rather than reuse the poisoned one.
     await selectPoolSandbox(env(), '/head', 'run-3', opts, deps);
     expect(createdRecordStores).toHaveLength(2);
+    // And the dropped one must be CLOSED, not merely forgotten: the memo was its last reference, so
+    // nulling it alone abandons a live connection -- one per distinct failure, in the code whose
+    // whole purpose is keeping connections from reaching maxclients. Safe while concurrent callers
+    // still hold it, because redis 6's close() waits for pending commands (destroy() is the abrupt
+    // one), and no new caller can reach it once the memo is cleared.
+    expect(createdRecordStores[0].close).toHaveBeenCalledTimes(1);
+  });
+
+  it('a LATE failure does not evict the store that superseded it', async () => {
+    // `drop` used to close over nothing and null the memo unconditionally, so a rejection arriving
+    // after the memo had been rebuilt discarded a store that never failed -- orphaning it (connected,
+    // unreferenced, never closed) and spending the guard's rebuild on something already healthy.
+    resetSharedStores();
+    createdRecordStores.length = 0;
+    const lease = fakeLease({ 'sandbox-0-0': 0 }, opts.cap);
+    const deps = { listPods: async () => ['sandbox-0-0'], lease };
+    const other = env({ REDIS_URL: 'redis://other:6379' });
+
+    await selectPoolSandbox(env(), '/head', 'run-1', opts, deps);
+    expect(createdRecordStores).toHaveLength(1);
+
+    // Hold store₁'s command open and leave a selection awaiting it.
+    let failStore1: (e: Error) => void = () => {};
+    createdRecordStores[0].list.mockReturnValueOnce(
+      new Promise<SandboxRecord[]>((_resolve, reject) => {
+        failStore1 = reject;
+      }),
+    );
+    const inflight = selectPoolSandbox(env(), '/head', 'run-2', opts, deps).catch((e: Error) => e);
+
+    // Meanwhile REDIS_URL changes, so the memo is rebuilt around a healthy store₂.
+    await selectPoolSandbox(other, '/head', 'run-3', opts, deps);
+    expect(createdRecordStores).toHaveLength(2);
+
+    // store₁'s command now rejects, long after it stopped being the memoised store.
+    failStore1(new Error('ERR max number of clients reached'));
+    await expect(inflight).resolves.toBeInstanceOf(Error);
+
+    // store₂ never failed, so it must still be the memoised store and must not have been closed.
+    // Without the identity check this selection builds a THIRD store and store₂ leaks.
+    await selectPoolSandbox(other, '/head', 'run-4', opts, deps);
+    expect(createdRecordStores).toHaveLength(2);
+    expect(createdRecordStores[1].close).not.toHaveBeenCalled();
   });
 
   it('does not construct (or close) a RedisRecordStore when deps.records is injected', async () => {

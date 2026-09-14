@@ -18,19 +18,63 @@ const seqKey = (sid: string) => `session:${sid}:seq`;
  */
 export class RedisSessionBackend<E = unknown> implements LogStore<E> {
   private client: RedisClientType;
-  private ready: Promise<void>;
+  private ready: Promise<void> | null;
   constructor(url = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379') {
     this.client = createClient({ url });
-    this.ready = this.client.connect().then(() => undefined);
+    this.ready = this.arm();
+  }
+
+  /**
+   * Connect, and RE-ARM on failure so a transient outage costs one call rather than the process.
+   *
+   * `ready` used to be assigned once here and never reassigned, so a single rejected `connect()` left
+   * a permanently REJECTED promise that every method awaited. Redis coming back changed nothing; only
+   * a restart cleared it.
+   *
+   * Worth being precise about which failures reach that path, because it is not the obvious one. With
+   * node-redis's defaults a REFUSED connect does not reject at all -- `defaultReconnectStrategy`
+   * answers with an exponential backoff, so the attempt retries forever and callers simply wait. The
+   * rejecting shape is the 5s default `connectTimeout`, which raises `SocketTimeoutError`: the one
+   * cause that strategy answers `false` to, abandoning the attempt. In a cluster that is the COMMON
+   * transient shape -- a Service with no ready endpoints, or a NetworkPolicy drop, black-holes the SYN
+   * rather than refusing it.
+   *
+   * That was survivable while callers built one backend per turn: a blip cost exactly one turn and
+   * the next turn built a fresh client that connected. It stops being survivable the moment one is
+   * memoised process-wide (run-turn.ts's `sharedSessionStore`), where the same unlucky moment --
+   * most likely the FIRST turn after boot, the window the old per-turn leak never mattered in --
+   * would poison every remaining turn for the worker's lifetime. The async path makes that worse
+   * than a stall: the failure classifies as retryable (classify-outcome.ts), so the queue entry is
+   * redelivered to the same poisoned process and fails instantly again -- a hot retry loop with no
+   * backoff and no terminal state.
+   *
+   * Clearing the memo on rejection is what lets the next call retry instead of replaying the
+   * original error. The identity check keeps a late failure from clearing a NEWER attempt, and the
+   * side `.catch` is bookkeeping only -- callers still see the real rejection through the promise
+   * they awaited, while a rejected connect that nobody is awaiting yet can no longer surface as an
+   * unhandled rejection (node-redis raising `'error'` on a client with no listener is how four
+   * workers exited code 1 simultaneously).
+   */
+  private arm(): Promise<void> {
+    const attempt = this.client.connect().then(() => undefined);
+    void attempt.catch(() => {
+      if (this.ready === attempt) this.ready = null;
+    });
+    return attempt;
+  }
+
+  /** Await the live connect attempt, starting a fresh one if the last one failed. */
+  private open(): Promise<void> {
+    return (this.ready ??= this.arm());
   }
 
   async nextPosition(sid: string): Promise<number> {
-    await this.ready;
+    await this.open();
     return this.client.incr(seqKey(sid));
   }
 
   async append(sid: string, entry: E, piType: string): Promise<StoredEntry<E>> {
-    await this.ready;
+    await this.open();
     const position = await this.nextPosition(sid);
     const stored = makeStoredEntry({
       position,
@@ -50,7 +94,7 @@ export class RedisSessionBackend<E = unknown> implements LogStore<E> {
   }
 
   async read(sid: string, fromPosition = 1): Promise<StoredEntry<E>[]> {
-    await this.ready;
+    await this.open();
     const start = fromPosition <= 1 ? '-' : `${fromPosition}-0`;
     const rows = await this.client.xRange(streamKey(sid), start, '+');
     return rows.map((r): StoredEntry<E> => ({
@@ -78,20 +122,26 @@ export class RedisSessionBackend<E = unknown> implements LogStore<E> {
   }
 
   async list(): Promise<string[]> {
-    await this.ready;
+    await this.open();
     const keys = await this.client.keys('session:*');
     return keys.filter((k) => !k.endsWith(':seq')).map((k) => k.slice('session:'.length));
   }
 
   /** Test helper: delete a session's stream + sequence counter. */
   async reset(sid: string): Promise<void> {
-    await this.ready;
+    await this.open();
     await this.client.del([streamKey(sid), seqKey(sid)]);
   }
 
-  /** Close the connection (call in test teardown). */
+  /**
+   * Close the connection (call in test teardown).
+   *
+   * Deliberately does NOT propagate a failed connect: `await this.ready` meant a client that never
+   * connected could not be closed AT ALL -- close() rejected, callers swallowed it with
+   * `.catch(() => {})`, and the socket was left dangling. Swallow it here and close what is open.
+   */
   async close(): Promise<void> {
-    await this.ready;
-    await this.client.quit();
+    await this.ready?.catch(() => {});
+    if (this.client.isOpen) await this.client.quit();
   }
 }

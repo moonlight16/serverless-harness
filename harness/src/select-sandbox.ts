@@ -48,9 +48,12 @@ function sharedRecords(url: string | undefined): RecordStore {
     recordsMemo = { url, store: new RedisRecordStore(url) };
   }
   const store = recordsMemo.store;
-  const drop = () => {
-    recordsMemo = null;
-  };
+  const drop = () =>
+    dropMemo(
+      store,
+      () => recordsMemo,
+      () => (recordsMemo = null),
+    );
   return {
     put: (rec) => guard(store.put(rec), drop),
     remove: (id) => guard(store.remove(id), drop),
@@ -64,15 +67,54 @@ function sharedLease(url: string | undefined): LeaseStore {
     leaseMemo = { url, store: new RedisLeaseStore(url) };
   }
   const store = leaseMemo.store;
-  const drop = () => {
-    leaseMemo = null;
-  };
+  const drop = () =>
+    dropMemo(
+      store,
+      () => leaseMemo,
+      () => (leaseMemo = null),
+    );
   return {
     load: (pod) => guard(store.load(pod), drop),
     acquire: (pod, cap, runId, ttlMs) => guard(store.acquire(pod, cap, runId, ttlMs), drop),
     heartbeat: (pod, runId, ttlMs) => guard(store.heartbeat(pod, runId, ttlMs), drop),
     release: (pod, runId) => guard(store.release(pod, runId), drop),
   };
+}
+
+/**
+ * Evict `store` from its memo, but ONLY if it is still the memoised one.
+ *
+ * `guard` can call this long after the call was issued, and unconditionally nulling the memo has two
+ * failure modes that a two-line check removes:
+ *
+ *  - **It could drop a healthy store.** A command on store₁ hangs; `REDIS_URL` changes (or
+ *    `resetSharedStores` runs) and the memo is rebuilt with a healthy store₂; store₁'s command
+ *    finally rejects and the drop discards **store₂**, which never failed. The next call builds
+ *    store₃ and store₂ is orphaned — connected, unreferenced, never closed. The window is small, but
+ *    it is exactly the situation the guard exists for (Redis misbehaving, commands in flight), and
+ *    under a flapping Redis it chains.
+ *  - **It leaked the store it dropped.** The memo was the last reference, so nulling it alone
+ *    abandons a live connection — one per distinct failure, permanently, in the code whose purpose is
+ *    keeping connections from accumulating to `maxclients`. The URL-change path four lines up already
+ *    closes for this reason; the failure path deserves it more, being the one that can fire
+ *    repeatedly.
+ *
+ * Closing is safe even though the store is SHARED with concurrent callers: redis 6's `close()` is
+ * documented as "Close the client. Wait for pending commands" (`destroy()` is the one that rejects
+ * them), so in-flight commands drain rather than failing. And no NEW caller can reach this store —
+ * the memo is cleared first, so the next `shared*()` builds a fresh one.
+ *
+ * Clearing before closing is deliberate, and reuses the shape settled on in #249 (`turn-auth.ts:318`):
+ * a throwing close must not be able to skip the rebuild.
+ */
+function dropMemo<S extends Closable>(
+  store: S,
+  read: () => { store: S } | null,
+  clear: () => void,
+): void {
+  if (read()?.store !== store) return;
+  clear();
+  void store.close().catch(() => {});
 }
 
 /** Run `p`, and drop the shared store's memo if it rejects so the next call rebuilds it. */
@@ -85,8 +127,13 @@ async function guard<T>(p: Promise<T>, drop: () => void): Promise<T> {
   }
 }
 
-/** Test-only: drop the cached stores so a test can inject its own or force a reconnect. */
-export function resetSharedRecords(): void {
+/**
+ * Test-only: drop the cached stores so a test can inject its own or force a reconnect.
+ *
+ * Named for BOTH memos, not just records — it always reset the lease store too, and the old
+ * `resetSharedRecords` left the next reader to assume leases survived it.
+ */
+export function resetSharedStores(): void {
   if (recordsMemo) void recordsMemo.store.close().catch(() => {});
   if (leaseMemo) void leaseMemo.store.close().catch(() => {});
   recordsMemo = null;
@@ -136,6 +183,26 @@ export class SandboxPoolSaturatedError extends Error {
   constructor(selector: string) {
     super(`sandbox pool '${selector}' saturated: all pods at capacity`);
     this.name = 'SandboxPoolSaturatedError';
+  }
+}
+
+/**
+ * Thrown when a pool is configured but has no candidate sandbox YET — pods rolling, an HPA scaling
+ * from zero, presence records not re-mirrored after a restart.
+ *
+ * A named class purely so callers can tell this apart from a generic failure. It used to be a plain
+ * `Error`, which since /turn started leasing from the pool meant an empty pool surfaced as a 500 —
+ * "this can never succeed" — while a FULL pool got the 503 it deserves. Same underlying fact from the
+ * caller's side (no capacity available right now, retry), so the two now map identically
+ * (`turnErrorStatus`). The async path already agreed: `classifyOutcome` keeps both retryable.
+ *
+ * The message is unchanged from the plain Error it replaces, so existing log greps and the
+ * `/pool selector/` assertions still match.
+ */
+export class SandboxPoolEmptyError extends Error {
+  constructor(selector: string) {
+    super(`no Running pods for pool selector '${selector}'`);
+    this.name = 'SandboxPoolEmptyError';
   }
 }
 
@@ -220,7 +287,7 @@ export async function selectPoolSandbox(
   const grpcById = new Map(grpcRecs.map((r) => [r.sandboxId, r]));
 
   const candidates = [...pods, ...grpcRecs.map((r) => r.sandboxId)];
-  if (candidates.length === 0) throw new Error(`no Running pods for pool selector '${selector}'`);
+  if (candidates.length === 0) throw new SandboxPoolEmptyError(selector);
 
   const loads = await Promise.all(
     candidates.map(async (name) => ({ pod: name, active: await lease.load(name) })),

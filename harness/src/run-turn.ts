@@ -20,7 +20,12 @@ import { randomUUID } from 'node:crypto';
 import { k8sSandboxExtension, type K8sSandboxConfig, type SandboxTransport } from '@sh/k8s-sandbox';
 // Value import, and safe: select-sandbox.ts imports nothing from run-turn.js, so unlike the
 // run-leaf↔run-turn pair below there is no cycle to avoid here.
-import { selectPoolSandbox, SandboxPoolSaturatedError, type SelectDeps } from './select-sandbox.js';
+import {
+  selectPoolSandbox,
+  SandboxPoolSaturatedError,
+  SandboxPoolEmptyError,
+  type SelectDeps,
+} from './select-sandbox.js';
 import { checkpointExtension } from './checkpoint-extension.js';
 import { budgetVoterExtension, branchSpend } from './budget-voter.js';
 import { toolChoiceExtension } from './tool-choice-extension.js';
@@ -30,11 +35,11 @@ import type { LeafUsage } from './run-leaf.js';
 import { sseExtension, type TurnStreamFrame } from './turn-stream.js';
 import { promotedLoaderOptions, type PromotedConfig } from './config-resolver.js';
 
-// Re-exported because it is now part of executeTurn's CONTRACT: since /turn leases from the pool,
-// every caller of executeTurn can be handed this error and needs to distinguish it from a generic
-// failure (it is transient — a 503, not a 500). harness/package.json exposes no ./select-sandbox
+// Re-exported because they are now part of executeTurn's CONTRACT: since /turn leases from the pool,
+// every caller of executeTurn can be handed these errors and needs to distinguish them from a generic
+// failure (both are transient — a 503, not a 500). harness/package.json exposes no ./select-sandbox
 // subpath, and this is the module those callers already import.
-export { SandboxPoolSaturatedError };
+export { SandboxPoolSaturatedError, SandboxPoolEmptyError };
 
 /**
  * One session store per process, not per turn.
@@ -50,9 +55,23 @@ export { SandboxPoolSaturatedError };
  *
  * Sharing is safe because the store is stateless per session — the URL is the only construction
  * input and every method takes the session id — and node-redis multiplexes concurrent commands over
- * one connection. Unlike the stores in select-sandbox.ts there is no drop-on-failure wrapper here:
- * node-redis reconnects a live client by itself, and the failure mode that wrapper guards against is
- * caching a client that never connected in the first place.
+ * one connection.
+ *
+ * Unlike the stores in select-sandbox.ts there is no drop-on-failure wrapper here, and the reason is
+ * that the hazard such a wrapper guards against — memoising a client that never connected — is now
+ * fixed at its source instead of worked around at each call site. `RedisSessionBackend` used to
+ * assign `ready` once in its constructor and never reassign it, so a rejected `connect()` poisoned
+ * every later method call on that instance forever; memoising one process-wide would then have
+ * traded a bounded per-turn leak for an unbounded outage, and in the very window the leak never
+ * mattered in (the first turn after boot). It now RE-ARMS: a failed attempt clears itself so the
+ * next call reconnects (packages/session-backend/src/redis-backend.ts, `arm()`), which fixes it for
+ * every caller of the class rather than for this memo alone.
+ *
+ * Worth knowing which failures reach that path, because it is not the obvious one: with node-redis's
+ * defaults a REFUSED connect retries forever rather than rejecting, so the rejecting shape is the 5s
+ * `connectTimeout` raising `SocketTimeoutError` — the one cause `defaultReconnectStrategy` declines
+ * to retry. In a cluster that is the common one: a Service with no ready endpoints, or a
+ * NetworkPolicy drop, black-holes the SYN instead of refusing it.
  */
 let sessionStoreMemo: { url: string; store: RedisSessionBackend<FileEntry> } | null = null;
 
@@ -95,6 +114,33 @@ export interface AcquiredTurnSandbox {
   heartbeat: () => Promise<void>;
   /** Return this call's lease. A no-op unless `leased`. */
   release: () => Promise<void>;
+}
+
+/**
+ * The runId a turn holds its sandbox lease under. Unique per TURN — never the session id.
+ *
+ * The runId is the ZSET *member* in `ACQUIRE_LUA` (sandbox-lease.ts), not a payload, so a repeated
+ * value is one lease rather than two: `ZADD` on an existing member updates its score and leaves
+ * `ZCARD` unchanged. A session id is stable across every turn of a session by design (that is what
+ * lets `:openFromCheckpoint` reopen one), so deriving the runId from it would have made the RESUME
+ * path — the one the supervisor exists to serve — the path that shares leases, and broken the pool
+ * two ways:
+ *
+ *  - **The cap undercounts.** N concurrent turns of one session occupy ONE slot, so with
+ *    `KAGENTI_SANDBOX_CAP=20` a single session can pile arbitrarily many turns onto one pod while the
+ *    pool still reports headroom — deflating the very saturation accounting `SandboxPoolSaturatedError`
+ *    and its new 503 are computed from.
+ *  - **The first turn to finish releases a sandbox another is still using.** `release` is `zRem`, so
+ *    one turn's `finally` removes the shared member while its sibling is mid-execution; the pod then
+ *    reads as free for new work, and the sibling's heartbeat (`zAdd`) resurrects the member seconds
+ *    later, so `load()` returns a different answer depending on where in the heartbeat interval it is
+ *    sampled.
+ *
+ * The session id is prefixed for greppability only — nothing reads the runId back, and the UUID is
+ * what carries the uniqueness.
+ */
+export function turnRunId(sessionId?: string): string {
+  return `${sessionId ?? 'anon'}:${randomUUID()}`;
 }
 
 /**
@@ -554,9 +600,7 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<TurnResult> 
     input.sandbox,
     process.env,
     cwd,
-    // The lease's runId identifies the HOLDER, not the session, so a generated id is correct when
-    // the caller supplied none — and it must be unique per turn or two turns would share a lease.
-    input.sessionId ?? randomUUID(),
+    turnRunId(input.sessionId),
   );
 
   let leaseRenewal: ReturnType<typeof setInterval> | undefined;
