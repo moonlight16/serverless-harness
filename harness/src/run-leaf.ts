@@ -13,6 +13,7 @@ import {
   SandboxPoolSaturatedError,
   type SelectedSandbox,
 } from './select-sandbox.js';
+import { leaseTimings } from './lease-timings.js';
 import { convergeWorkspace, cleanupWorkspace, captureWorkspaceDiff } from './converge.js';
 import {
   setupSwebenchWorkspace,
@@ -387,9 +388,10 @@ async function runPromptLeaf(
   // single-pod resolution and returns null when nothing is configured.
   let selected: SelectedSandbox | null;
   try {
+    const { cap, ttlMs } = leaseTimings(process.env);
     selected = await selectPoolSandbox(sandboxEnvironment(env), cwd, sid, {
-      cap: Number(process.env.KAGENTI_SANDBOX_CAP ?? '20'),
-      ttlMs: Number(process.env.KAGENTI_SANDBOX_LEASE_TTL_MS ?? '60000'),
+      cap,
+      ttlMs,
       remoteSandbox: process.env.SH_REMOTE_SANDBOX === '1',
     });
   } catch (err) {
@@ -420,7 +422,7 @@ async function runPromptLeaf(
   let overlayDigest: string | undefined;
   try {
     if (selected) {
-      const hbMs = Number(process.env.KAGENTI_SANDBOX_HEARTBEAT_MS ?? '20000');
+      const hbMs = leaseTimings(process.env).heartbeatMs;
       const lease = selected;
       heartbeat = setInterval(() => {
         void lease.heartbeat();
@@ -572,9 +574,10 @@ export const realProduceSolve: ProduceSolve = async (env, config, capture) => {
 
   // A solve leaf MUST have a real sandbox worktree — fail fast (before any Redis/session work) if the
   // pool is unconfigured. selectPoolSandbox returns null when no sandbox is configured (see select-sandbox.ts).
+  const solveTimings = leaseTimings(process.env);
   const selected = await selectPoolSandbox(sandboxEnvironment(env), cwd, sid, {
-    cap: Number(process.env.KAGENTI_SANDBOX_CAP ?? '20'),
-    ttlMs: Number(process.env.KAGENTI_SANDBOX_LEASE_TTL_MS ?? '60000'),
+    cap: solveTimings.cap,
+    ttlMs: solveTimings.ttlMs,
   });
   if (!selected) throw new Error('solve leaf requires a configured sandbox pool');
 
@@ -609,7 +612,7 @@ export const realProduceSolve: ProduceSolve = async (env, config, capture) => {
     // A solve leaf edits files in its worktree; point the agent's sandbox cwd at that worktree so the
     // model's edits (relative or absolute) land where captureWorkspaceDiff reads them.
     const agentConfig = { ...selected.config, podCwd: workspaceRef };
-    const hbMs = Number(process.env.KAGENTI_SANDBOX_HEARTBEAT_MS ?? '20000');
+    const hbMs = leaseTimings(process.env).heartbeatMs;
     heartbeat = setInterval(() => {
       void selected.heartbeat();
     }, hbMs);
@@ -719,9 +722,10 @@ export const realProduceVerdict: ProduceVerdict = async (item, env, config, capt
   // verdict fast-path so a recovered verdict does not lease a pod. Returns null ⇒ no sandbox
   // configured (local tools). Throws SandboxPoolSaturatedError when a configured pool is full.
   const remoteSandbox = process.env.SH_REMOTE_SANDBOX === '1';
+  const promptTimings = leaseTimings(process.env);
   const selected = await selectPoolSandbox(sandboxEnvironment(env), cwd, sid, {
-    cap: Number(process.env.KAGENTI_SANDBOX_CAP ?? '20'),
-    ttlMs: Number(process.env.KAGENTI_SANDBOX_LEASE_TTL_MS ?? '60000'),
+    cap: promptTimings.cap,
+    ttlMs: promptTimings.ttlMs,
     remoteSandbox,
   });
   const converging = selected != null && !!env.repoUrl && !!env.ref;
@@ -746,7 +750,7 @@ export const realProduceVerdict: ProduceVerdict = async (item, env, config, capt
       }
     }
     if (selected) {
-      const hbMs = Number(process.env.KAGENTI_SANDBOX_HEARTBEAT_MS ?? '20000');
+      const hbMs = leaseTimings(process.env).heartbeatMs;
       heartbeat = setInterval(() => {
         void selected.heartbeat();
       }, hbMs);

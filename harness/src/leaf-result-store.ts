@@ -1,4 +1,5 @@
 import { createClient, type RedisClientType } from 'redis';
+import { swallowRedisErrors } from '@sh/session-backend';
 import type { Verdict } from './verdict.js';
 import type { LeafResult, LeafUsage } from './run-leaf.js';
 
@@ -89,6 +90,10 @@ export class RedisResultStore implements RedisLike {
   private ready: Promise<void>;
   constructor(url = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379') {
     this.client = createClient({ url }) as RedisClientType;
+    // A socket error on an established connection is re-emitted on the client, and no listener means
+    // the process exits 1. See swallowRedisErrors (@sh/session-backend) for the proof and why this
+    // store's process-lifetime memoisation is what makes it reachable with no turn in flight.
+    swallowRedisErrors(this.client, 'leaf result store');
     this.ready = this.client.connect().then(() => undefined);
   }
   async set(key: string, value: string, opts?: { EX?: number }): Promise<unknown> {

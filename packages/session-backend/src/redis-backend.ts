@@ -1,6 +1,7 @@
 // packages/session-backend/src/redis-backend.ts
 import { createClient, type RedisClientType } from 'redis';
 import { makeStoredEntry, type StoredEntry } from './entry';
+import { swallowRedisErrors } from './redis-errors';
 import type { LogStore } from './backend';
 
 const streamKey = (sid: string) => `session:${sid}`;
@@ -21,6 +22,7 @@ export class RedisSessionBackend<E = unknown> implements LogStore<E> {
   private ready: Promise<void> | null;
   constructor(url = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379') {
     this.client = createClient({ url });
+    swallowRedisErrors(this.client, 'session store');
     this.ready = this.arm();
   }
 
@@ -31,13 +33,12 @@ export class RedisSessionBackend<E = unknown> implements LogStore<E> {
    * a permanently REJECTED promise that every method awaited. Redis coming back changed nothing; only
    * a restart cleared it.
    *
-   * Worth being precise about which failures reach that path, because it is not the obvious one. With
-   * node-redis's defaults a REFUSED connect does not reject at all -- `defaultReconnectStrategy`
-   * answers with an exponential backoff, so the attempt retries forever and callers simply wait. The
-   * rejecting shape is the 5s default `connectTimeout`, which raises `SocketTimeoutError`: the one
-   * cause that strategy answers `false` to, abandoning the attempt. In a cluster that is the COMMON
-   * transient shape -- a Service with no ready endpoints, or a NetworkPolicy drop, black-holes the SYN
-   * rather than refusing it.
+   * Worth being precise about which failures reach that path. Both common shapes do: probed against
+   * the pinned `redis@6.2.1`, a REFUSED connect rejects with `ECONNREFUSED` and a black-holed SYN
+   * rejects with `ConnectionTimeoutError` once the 5s default `connectTimeout` fires (the socket
+   * schedules a background retry either way, but the awaited attempt is already lost). In a cluster
+   * the second is the one to expect -- a Service with no ready endpoints, or a NetworkPolicy drop,
+   * black-holes the SYN rather than refusing it.
    *
    * That was survivable while callers built one backend per turn: a blip cost exactly one turn and
    * the next turn built a fresh client that connected. It stops being survivable the moment one is
@@ -52,8 +53,10 @@ export class RedisSessionBackend<E = unknown> implements LogStore<E> {
    * original error. The identity check keeps a late failure from clearing a NEWER attempt, and the
    * side `.catch` is bookkeeping only -- callers still see the real rejection through the promise
    * they awaited, while a rejected connect that nobody is awaiting yet can no longer surface as an
-   * unhandled rejection (node-redis raising `'error'` on a client with no listener is how four
-   * workers exited code 1 simultaneously).
+   * unhandled rejection.
+   *
+   * That `.catch` covers the PROMISE channel only. The event channel -- an `'error'` emitted on the
+   * client itself -- is what `swallowRedisErrors` is for, and it is the one that killed workers.
    */
   private arm(): Promise<void> {
     const attempt = this.client.connect().then(() => undefined);

@@ -196,12 +196,23 @@ export class SandboxPoolSaturatedError extends Error {
  * caller's side (no capacity available right now, retry), so the two now map identically
  * (`turnErrorStatus`). The async path already agreed: `classifyOutcome` keeps both retryable.
  *
- * The message is unchanged from the plain Error it replaces, so existing log greps and the
- * `/pool selector/` assertions still match.
+ * The message is phrased per DISCOVERY SOURCE, because one wording cannot be true of all three. In
+ * `records` mode no pod listing happens at all — `pods` is forced to `[]` — so blaming the pool
+ * selector sent an operator to debug a healthy pool, the exact misdirection `resolveDiscoverySource`'s
+ * own guard was added to prevent. That mode is the shipped VM default
+ * (`env/supervisor.env.example`), where "no sandbox has attached to the relay yet" is the likeliest
+ * first-run state, so it is the message operators actually hit.
+ *
+ * The pods wording is unchanged, which is what keeps existing log greps and the `/pool selector/`
+ * assertions matching; only the source that never produced it truthfully says something else.
  */
 export class SandboxPoolEmptyError extends Error {
-  constructor(selector: string) {
-    super(`no Running pods for pool selector '${selector}'`);
+  constructor(selector: string, source: DiscoverySource = 'both') {
+    super(
+      source === 'records'
+        ? `no sandbox presence records (SH_SANDBOX_DISCOVERY=records — no sandbox has attached to the relay yet)`
+        : `no Running pods for pool selector '${selector}'`,
+    );
     this.name = 'SandboxPoolEmptyError';
   }
 }
@@ -210,6 +221,17 @@ export interface SelectedSandbox {
   config: K8sSandboxConfig;
   /** Present ONLY for a leased grpc presence record; undefined for pods. */
   transport?: SandboxTransport;
+  /**
+   * Whether a lease was actually TAKEN, reported here rather than re-derived by the caller.
+   *
+   * `heartbeat`/`release` cannot answer it: the no-selector branch returns no-op closures that are
+   * indistinguishable from real ones, so `acquireTurnSandbox` used to re-evaluate this function's own
+   * `if (!selector)` condition against the environment to decide whether to arm a renewal timer. That
+   * agreed today and was pinned by a test, but it put one predicate in two files — and a change here
+   * (trimming the selector, say, as `resolveDiscoverySource` already does for its own value) would
+   * have made them disagree silently, arming or skipping a renewal against the truth.
+   */
+  leased: boolean;
   heartbeat: () => Promise<void>;
   release: () => Promise<void>;
 }
@@ -264,7 +286,9 @@ export async function selectPoolSandbox(
   const selector = env.KAGENTI_SANDBOX_POOL_SELECTOR;
   if (!selector) {
     const config = await resolveSandboxConfig(env, headCwd, deps.run);
-    return config ? { config, heartbeat: async () => {}, release: async () => {} } : null;
+    return config
+      ? { config, leased: false, heartbeat: async () => {}, release: async () => {} }
+      : null;
   }
 
   const namespace = env.KAGENTI_SANDBOX_NAMESPACE ?? 'default';
@@ -287,7 +311,7 @@ export async function selectPoolSandbox(
   const grpcById = new Map(grpcRecs.map((r) => [r.sandboxId, r]));
 
   const candidates = [...pods, ...grpcRecs.map((r) => r.sandboxId)];
-  if (candidates.length === 0) throw new SandboxPoolEmptyError(selector);
+  if (candidates.length === 0) throw new SandboxPoolEmptyError(selector, source);
 
   const loads = await Promise.all(
     candidates.map(async (name) => ({ pod: name, active: await lease.load(name) })),
@@ -312,6 +336,7 @@ export async function selectPoolSandbox(
       return {
         config,
         transport,
+        leased: true,
         heartbeat: () => lease.heartbeat(name, sessionId, opts.ttlMs),
         release: () => lease.release(name, sessionId),
       };

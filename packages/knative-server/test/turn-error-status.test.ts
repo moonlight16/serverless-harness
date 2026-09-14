@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { SandboxPoolSaturatedError, SandboxPoolEmptyError } from '@sh/harness/run-turn';
-import { turnErrorStatus } from '../src/server.js';
+import { turnErrorStatus, turnErrorHeaders } from '../src/server.js';
 
 // /turn now leases a sandbox from the pool (it used to run tool calls in the harness process), so
 // SandboxPoolSaturatedError became something a turn can fail with. It is TRANSIENT — every
@@ -46,5 +46,36 @@ describe('turnErrorStatus', () => {
     // silently degrading to 500 in production.
     expect(new SandboxPoolSaturatedError('app=sandbox').name).toBe('SandboxPoolSaturatedError');
     expect(new SandboxPoolEmptyError('app=sandbox').name).toBe('SandboxPoolEmptyError');
+  });
+});
+
+describe('turnErrorHeaders', () => {
+  // 503 took `/runs` as its precedent but originally adopted neither half of what /runs does: it
+  // bounded-waits AND advertises Retry-After. A client that honours the header got nothing from the
+  // one route whose answer is "come back" — the same "one signal, two meanings by route" the status
+  // mapping exists to avoid. The wait is deliberately not carried over (see the doc comment): on
+  // /runs a retry only re-attempts acquisition, whereas on /turn the session is already open.
+  it('advertises Retry-After on a 503, from the same knob /runs uses', () => {
+    expect(turnErrorHeaders(503)).toMatchObject({ 'Retry-After': '5' });
+  });
+
+  it('honours KAGENTI_SYNC_SATURATION_RETRY_AFTER_S, read per request', () => {
+    process.env.KAGENTI_SYNC_SATURATION_RETRY_AFTER_S = '17';
+    try {
+      expect(turnErrorHeaders(503)).toMatchObject({ 'Retry-After': '17' });
+    } finally {
+      delete process.env.KAGENTI_SYNC_SATURATION_RETRY_AFTER_S;
+    }
+  });
+
+  it('adds no Retry-After to a 404 or a 500 — neither is worth retrying', () => {
+    expect(turnErrorHeaders(404)).not.toHaveProperty('Retry-After');
+    expect(turnErrorHeaders(500)).not.toHaveProperty('Retry-After');
+  });
+
+  it('keeps the JSON content type on every status, so the error body still parses', () => {
+    for (const status of [404, 500, 503]) {
+      expect(turnErrorHeaders(status)).toMatchObject({ 'Content-Type': 'application/json' });
+    }
   });
 });

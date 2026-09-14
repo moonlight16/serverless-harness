@@ -9,22 +9,28 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
  * fresh client -- but run-turn.ts now memoises ONE backend process-wide, which turns the same
  * transient failure into a permanent outage for every remaining turn the worker serves.
  *
- * `connect()` really can reject, though NOT for the reason one would guess. With node-redis's
- * default options an ECONNREFUSED retries forever (`defaultReconnectStrategy` returns an
- * exponential backoff), so a refused connect HANGS rather than failing. The rejecting path is the
- * 5s default `connectTimeout`: it raises `SocketTimeoutError`, and that is the one cause
- * `defaultReconnectStrategy` answers `false` to -- so the attempt is abandoned and `connect()`
- * rejects with no retry. In a cluster that is the COMMON transient shape: a Service with no ready
- * endpoints, or a NetworkPolicy drop, black-holes the SYN instead of refusing it.
+ * `connect()` really can reject, and both common shapes do: probed against the pinned redis@6.2.1, a
+ * refused connect rejects with `ECONNREFUSED` and a black-holed SYN rejects with
+ * `ConnectionTimeoutError` once the 5s default `connectTimeout` fires. (The socket schedules its own
+ * background retry in both cases, but the attempt this promise represents is already lost, which is
+ * what the re-arm is about.) In a cluster the second is the COMMON transient shape: a Service with no
+ * ready endpoints, or a NetworkPolicy drop, black-holes the SYN instead of refusing it.
  *
- * The `redis` module is mocked rather than pointed at a dead port because both real failure modes
- * are bad tests -- a refused connect retries forever (the test hangs), and a black-holed address
- * costs 5s per attempt and depends on the network answering with silence rather than ICMP.
+ * The `redis` module is mocked rather than pointed at a dead port because a black-holed address costs
+ * 5s per attempt and depends on the network answering with silence rather than ICMP.
+ *
+ * This file proves the BOOKKEEPING only. Its mock is a plain object, so it cannot emit -- the crash
+ * this re-arm was once thought to prevent lives on the event channel and is pinned separately, in
+ * `redis-error-listener.test.ts`.
  */
 const connect = vi.fn<() => Promise<void>>();
 const quit = vi.fn(async () => 'OK');
 const keys = vi.fn(async () => [] as string[]);
-const client = { connect, quit, keys, isOpen: false };
+// `on` is a stub, not an emitter: the constructor registers its 'error' listener through it, and
+// nothing here ever fires one. That is the boundary between the two files -- the crash on the event
+// channel is `redis-error-listener.test.ts`, which mocks a real EventEmitter for it.
+const on = vi.fn();
+const client = { connect, quit, keys, on, isOpen: false };
 
 vi.mock('redis', () => ({
   createClient: () => client,
@@ -35,6 +41,7 @@ const { RedisSessionBackend } = await import('../src/redis-backend');
 beforeEach(() => {
   connect.mockReset();
   quit.mockClear();
+  on.mockClear();
   client.isOpen = false;
 });
 

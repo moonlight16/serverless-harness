@@ -183,7 +183,7 @@ async function handleTurn(req: IncomingMessage, res: ServerResponse): Promise<vo
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const status = turnErrorStatus(err);
-    res.writeHead(status, JSON_HEADERS).end(
+    res.writeHead(status, turnErrorHeaders(status)).end(
       JSON.stringify({
         error: status === 404 ? 'session_not_found' : message,
         ...(sessionId ? { sessionId } : {}),
@@ -226,6 +226,26 @@ export function turnErrorStatus(err: unknown): number {
   if (err instanceof Error && NO_CAPACITY.has(err.name)) return 503;
   const message = err instanceof Error ? err.message : String(err);
   return message.includes('no session in backend') ? 404 : 500;
+}
+
+/**
+ * Response headers for a failed turn — i.e. `Retry-After` on the 503s, from the same knob `/runs`
+ * advertises (`KAGENTI_SYNC_SATURATION_RETRY_AFTER_S`).
+ *
+ * The 503 above takes `/runs` as its precedent, and `/runs` does two things with saturation: it
+ * bounded-waits, and it tells the client when to come back. Adopting the status without the header
+ * left a client that honours `Retry-After` with no hint from the one route whose answer is "retry" —
+ * so the reasoning about not letting one signal mean two things by route argued for carrying it.
+ *
+ * The bounded wait is deliberately NOT carried over. On `/runs` it is sound because
+ * `selectPoolSandbox` throws before taking a lease or doing agent work, so re-running `runLeaf` only
+ * re-attempts acquisition (see §4.3 above); on `/turn` the session is already open by the time the
+ * acquire runs, and re-entering `executeTurn` to retry would re-open it. That asymmetry is real and
+ * E8 reads the region it shows up in, so it is worth stating rather than quietly matching.
+ */
+export function turnErrorHeaders(status: number): Record<string, string> {
+  if (status !== 503) return JSON_HEADERS;
+  return { ...JSON_HEADERS, 'Retry-After': String(saturationWaitConfig().retryAfterS) };
 }
 
 // Serialize frames to the SSE wire form, flushing SSE headers on the FIRST frame (lazy flush →
@@ -297,7 +317,7 @@ async function handleTurnStream(
       // still returns real 404 JSON, byte-identical to the sync path (§3.4 regime 2).
       const message = err instanceof Error ? err.message : String(err);
       const status = turnErrorStatus(err);
-      res.writeHead(status, JSON_HEADERS).end(
+      res.writeHead(status, turnErrorHeaders(status)).end(
         JSON.stringify({
           error: status === 404 ? 'session_not_found' : message,
           ...(sessionId ? { sessionId } : {}),

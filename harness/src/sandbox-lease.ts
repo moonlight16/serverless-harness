@@ -1,4 +1,5 @@
 import { createClient, type RedisClientType } from 'redis';
+import { swallowRedisErrors } from '@sh/session-backend';
 
 /** Redis key holding the per-pod lease set (member = leaf id, score = expiry ms). */
 export function leaseKey(pod: string): string {
@@ -44,6 +45,10 @@ export class RedisLeaseStore implements LeaseStore {
     private now: () => number = Date.now,
   ) {
     this.client = createClient({ url }) as RedisClientType;
+    // A socket error on an established connection is re-emitted on the client, and no listener means
+    // the process exits 1. See swallowRedisErrors (@sh/session-backend) for the proof and why this
+    // store's process-lifetime memoisation is what makes it reachable with no turn in flight.
+    swallowRedisErrors(this.client, 'sandbox lease store');
     this.ready = this.client.connect().then(() => undefined);
   }
   async load(pod: string): Promise<number> {

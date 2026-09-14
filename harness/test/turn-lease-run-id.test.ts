@@ -17,10 +17,47 @@ import { turnRunId } from '../src/run-turn.js';
  * not see this — the defect was in the ONE expression feeding that seam, inside `executeTurn`, which
  * no test drove. Hence the wiring case below.
  */
-const { seen } = vi.hoisted(() => ({ seen: [] as string[] }));
+const { seen, FakeRedisSessionBackend } = vi.hoisted(() => {
+  class FakeRedisSessionBackend {
+    async read() {
+      return [];
+    }
+    async latestWhere() {
+      return null;
+    }
+    async append() {
+      return {};
+    }
+    async list() {
+      return [];
+    }
+    async close() {}
+  }
+  return { seen: [] as string[], FakeRedisSessionBackend };
+});
+
+// The session is opened BEFORE the sandbox is acquired (so a missing session 404s ahead of any pool
+// work — turn-session-before-lease.test.ts pins that ordering), which is why this test has to stand a
+// session up at all: it is on the path to the seam being observed here. Both fakes are inert; no Redis.
+vi.mock('@sh/session-backend', () => ({
+  RedisSessionBackend: FakeRedisSessionBackend,
+  swallowRedisErrors: () => {},
+}));
+vi.mock('@earendil-works/pi-coding-agent', () => ({
+  createAgentSession: async () => ({ session: { prompt: async () => {} } }),
+  DefaultResourceLoader: class {},
+  getAgentDir: () => '/fake/agent-dir',
+  SessionManager: {
+    create: (_cwd: string, _snapshot: unknown, opts?: { id: string }) => ({
+      getSessionId: () => opts?.id ?? 'sess-created',
+    }),
+    openFromCheckpoint: async (sid: string) => ({ getSessionId: () => sid }),
+  },
+  SettingsManager: { create: () => ({}) },
+}));
 
 // Intercept at selectPoolSandbox so executeTurn's real derivation runs and is observable, while the
-// turn stops before executeTurnCore — no Redis, no Pi session, no model.
+// turn stops before executeTurnCore — no model, no prompt.
 vi.mock('../src/select-sandbox.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/select-sandbox.js')>();
   return {

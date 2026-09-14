@@ -35,6 +35,15 @@ export class RedisWorkQueue implements WorkQueue {
     private readonly group = 'leaf-workers',
   ) {
     this.client = createClient({ url }) as RedisClientType;
+    // A socket error on an established connection is re-emitted on the client, and with no listener
+    // Node exits 1 -- proven with `CLIENT KILL` on the pinned redis@6.2.1, where a listener instead
+    // lets node-redis reconnect on its own. Inline rather than shared: the equivalent helper lives in
+    // @sh/session-backend (`swallowRedisErrors`, with the full rationale), and a queue taking a
+    // dependency on the session store to reach it would invert the layering for eight lines.
+    this.client.on('error', (err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[redis] work queue: ${message} (node-redis will reconnect)`);
+    });
     this.ready = this.client.connect().then(() => undefined);
   }
 

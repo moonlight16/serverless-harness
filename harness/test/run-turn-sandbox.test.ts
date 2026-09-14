@@ -152,8 +152,9 @@ describe('acquireTurnSandbox', () => {
   });
 
   it('treats an empty-string selector as no pool, matching selectPoolSandbox exactly', async () => {
-    // selectPoolSandbox branches on `if (!selector)`, so '' takes its no-lease path. If `leased`
-    // were computed as `!== undefined` it would disagree, arming a renewal for a no-op lease.
+    // selectPoolSandbox branches on `if (!selector)`, so '' takes its no-lease path and now REPORTS
+    // that through `SelectedSandbox.leased`. This used to be re-derived here from the environment,
+    // which agreed only as long as both copies of the predicate did.
     const got = await acquireTurnSandbox(
       undefined,
       { KAGENTI_SANDBOX_POOL_SELECTOR: '', KAGENTI_SANDBOX_POD: 'sandbox-0' },

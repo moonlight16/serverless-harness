@@ -410,7 +410,11 @@ describe('selectPoolSandbox discovery source', () => {
     expect(sel?.config.pod).toBe('sandbox-0-0');
   });
 
-  it('records with an empty record set reports the pool, not a kubectl error', async () => {
+  it('records with an empty record set blames the records, not the pool selector', async () => {
+    // `pods` is forced to [] in this mode, so no pod was ever matched against the selector -- naming
+    // it sends an operator to debug a healthy pool, which is the same misdirection
+    // resolveDiscoverySource's own guard exists to prevent. This is also the likeliest first-run state
+    // on the shipped VM default (SH_SANDBOX_DISCOVERY=records), so it is the message operators hit.
     const lease = fakeLease({}, 4);
     await expect(
       selectPoolSandbox(
@@ -420,6 +424,48 @@ describe('selectPoolSandbox discovery source', () => {
         { cap: 4, ttlMs: 60000, remoteSandbox: true },
         { listPods: async () => ['sandbox-0-0'], lease, records: fakeRecords([]) },
       ),
-    ).rejects.toThrow("no Running pods for pool selector 'app=sbx'");
+    ).rejects.toThrow('no sandbox presence records');
+  });
+
+  it('keeps the pods wording for the pod paths, so existing log greps still match', async () => {
+    const lease = fakeLease({}, 4);
+    for (const discovery of ['pods', 'both'] as const) {
+      await expect(
+        selectPoolSandbox(
+          env({ SH_SANDBOX_DISCOVERY: discovery }),
+          '/head',
+          'run-1',
+          { cap: 4, ttlMs: 60000 },
+          { listPods: async () => [], lease },
+        ),
+      ).rejects.toThrow("no Running pods for pool selector 'app=sbx'");
+    }
+  });
+
+  it('reports whether a lease was taken, so the caller need not re-read the environment', async () => {
+    // acquireTurnSandbox arms its renewal timer off this flag. It used to re-evaluate this function's
+    // own `if (!selector)` against the env instead, putting one predicate in two files.
+    const lease = fakeLease({}, 4);
+    const leasedSel = await selectPoolSandbox(
+      env({}),
+      '/head',
+      'run-1',
+      { cap: 4, ttlMs: 60000 },
+      {
+        listPods: async () => ['sandbox-0-0'],
+        lease,
+      },
+    );
+    expect(leasedSel?.leased).toBe(true);
+
+    const singlePod = await selectPoolSandbox(
+      { KAGENTI_SANDBOX_POOL_SELECTOR: '', KAGENTI_SANDBOX_POD: 'sandbox-0' },
+      '/head',
+      'run-1',
+      { cap: 4, ttlMs: 60000 },
+      { lease },
+    );
+    expect(singlePod?.config.pod).toBe('sandbox-0');
+    expect(singlePod?.leased).toBe(false);
   });
 });
