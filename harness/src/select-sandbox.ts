@@ -10,6 +10,7 @@ import {
   type ExecClientLike,
 } from '@sh/k8s-sandbox';
 import { RedisLeaseStore, type LeaseStore } from './sandbox-lease.js';
+import { RedisRecordStore, type RecordStore, type SandboxRecord } from './pool-records.js';
 
 /**
  * Process-wide Redis-backed stores, reused across selections instead of built per call.
@@ -91,7 +92,6 @@ export function resetSharedRecords(): void {
   recordsMemo = null;
   leaseMemo = null;
 }
-import { RedisRecordStore, type RecordStore, type SandboxRecord } from './pool-records.js';
 
 /** Pure: pods ordered ascending by active load (stable — ties keep input order). */
 export function orderByLoad(loads: { pod: string; active: number }[]): string[] {
