@@ -34,12 +34,23 @@ export class RedisWorkQueue implements WorkQueue {
     private readonly stream = 'leaf-queue',
     private readonly group = 'leaf-workers',
   ) {
-    this.client = createClient({ url }) as RedisClientType;
-    // A socket error on an established connection is re-emitted on the client, and with no listener
-    // Node exits 1 -- proven with `CLIENT KILL` on the pinned redis@6.2.1, where a listener instead
-    // lets node-redis reconnect on its own. Inline rather than shared: the equivalent helper lives in
-    // @sh/session-backend (`swallowRedisErrors`, with the full rationale), and a queue taking a
-    // dependency on the session store to reach it would invert the layering for eight lines.
+    // Listener + bounded reconnect, and they only work as a pair. With no listener, an 'error' on an
+    // established connection exits the process (proven with `CLIENT KILL` on the pinned redis@6.2.1).
+    // With a listener but node-redis's DEFAULT strategy, the listener consumes the error that makes a
+    // failed connect() reject, so an absent Redis leaves connect() pending forever instead — a silent
+    // wedge in place of a loud crash. The bound keeps a transient blip recoverable and a genuinely
+    // absent Redis loud. Inline rather than shared: the equivalent helper is `resilientClientOptions` /
+    // `swallowRedisErrors` in @sh/session-backend (with the full rationale and the probe numbers), and
+    // a queue depending on the session store to reach it would invert the layering.
+    this.client = createClient({
+      url,
+      socket: {
+        reconnectStrategy: (retries: number) =>
+          retries > 10
+            ? new Error(`redis at ${url} unreachable after ${retries} attempts`)
+            : Math.min(retries * 100, 1000),
+      },
+    }) as RedisClientType;
     this.client.on('error', (err: unknown) => {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[redis] work queue: ${message} (node-redis will reconnect)`);

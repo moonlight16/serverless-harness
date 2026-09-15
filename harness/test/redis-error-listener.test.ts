@@ -13,6 +13,11 @@ import { EventEmitter } from 'node:events';
  *
  * These three stores are all memoised for the process's life (`select-sandbox.ts` for two of them),
  * so no turn need be in flight for a Redis restart to reach them.
+ *
+ * `RedisRecordStore` is included even though #251 gave it its own inline copy of the pairing: this is
+ * the cross-cutting pin that a NEW long-lived store cannot be added without one, and it is cheap.
+ * The bound that must accompany the listener is pinned separately, in
+ * `packages/session-backend/test/redis-resilient-client.test.ts`.
  */
 class FakeClient extends EventEmitter {
   isOpen = false;

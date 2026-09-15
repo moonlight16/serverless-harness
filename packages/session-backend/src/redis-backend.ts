@@ -1,7 +1,7 @@
 // packages/session-backend/src/redis-backend.ts
 import { createClient, type RedisClientType } from 'redis';
 import { makeStoredEntry, type StoredEntry } from './entry';
-import { swallowRedisErrors } from './redis-errors';
+import { resilientClientOptions, swallowRedisErrors } from './redis-errors';
 import type { LogStore } from './backend';
 
 const streamKey = (sid: string) => `session:${sid}`;
@@ -21,7 +21,10 @@ export class RedisSessionBackend<E = unknown> implements LogStore<E> {
   private client: RedisClientType;
   private ready: Promise<void> | null;
   constructor(url = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379') {
-    this.client = createClient({ url });
+    // Bounded reconnect + listener as a pair: the listener alone would consume the error that makes a
+    // failed connect() REJECT, and arm() re-arms precisely by catching that rejection — so without the
+    // bound this store would not merely crash less, it would never re-arm. See redis-errors.ts.
+    this.client = createClient(resilientClientOptions(url));
     swallowRedisErrors(this.client, 'session store');
     this.ready = this.arm();
   }
@@ -33,12 +36,17 @@ export class RedisSessionBackend<E = unknown> implements LogStore<E> {
    * a permanently REJECTED promise that every method awaited. Redis coming back changed nothing; only
    * a restart cleared it.
    *
-   * Worth being precise about which failures reach that path. Both common shapes do: probed against
-   * the pinned `redis@6.2.1`, a REFUSED connect rejects with `ECONNREFUSED` and a black-holed SYN
-   * rejects with `ConnectionTimeoutError` once the 5s default `connectTimeout` fires (the socket
-   * schedules a background retry either way, but the awaited attempt is already lost). In a cluster
-   * the second is the one to expect -- a Service with no ready endpoints, or a NetworkPolicy drop,
-   * black-holes the SYN rather than refusing it.
+   * Worth being precise about which failures reach that path, and about what KEEPS them reaching it.
+   * Probed against the pinned `redis@6.2.1`: a REFUSED connect rejects with `ECONNREFUSED` and a
+   * black-holed SYN rejects with `ConnectionTimeoutError` once the 5s default `connectTimeout` fires.
+   * In a cluster the second is the one to expect -- a Service with no ready endpoints, or a
+   * NetworkPolicy drop, black-holes the SYN rather than refusing it.
+   *
+   * Both of those rejections were previously a SIDE EFFECT of having no `'error'` listener, and this
+   * class now has one. That is why the client is built with `resilientClientOptions`: its bounded
+   * reconnect strategy is what still abandons a hopeless attempt (as `ReconnectStrategyError`) once the
+   * listener has consumed the error that used to do it. Without the bound, `connect()` would retry
+   * forever, never settle, and this re-arm would never fire -- a wedge in place of a crash.
    *
    * That was survivable while callers built one backend per turn: a blip cost exactly one turn and
    * the next turn built a fresh client that connected. It stops being survivable the moment one is
