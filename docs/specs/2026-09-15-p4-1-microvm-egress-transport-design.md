@@ -59,8 +59,8 @@ gates the mechanism; the verification gate.
 - **Per-user credential provisioning.** MU2 owns `sandbox-egress` credential delivery (registry, `MU` table).
 - **Session-scoped working memory.** P4 keys the workspace on the **run** (`workspace_key` is "populated by
   the harness from the lease's run id", P4 §3.4), so short-term memory cannot span a session's turns. P4 §9
-  sidesteps this by keeping interactive `/turn` on the container tier. A real gap, filed separately, not
-  fixed here.
+  sidesteps this by keeping interactive `/turn` on the container tier. A real gap, filed as
+  [#267](https://github.com/rossoctl/serverless-harness/issues/267), not fixed here.
 - **Non-HTTP protocols.** `ssh` and anything on raw sockets do not work on this tier, by construction (§7).
 
 ## 4. Key decisions
@@ -166,17 +166,44 @@ is not mitigated.**
 **E12 gates everything and can invalidate T1.** P4 §2.4 establishes that _listening_ vsock sockets survive
 restore in the _host-initiated_ direction. This design adds a **second port** in the **guest-initiated**
 direction across restore, and neither the repo nor Firecracker's docs establish that it works. If E12
-fails, T1 is dead and the NIC option in §2 returns. **Build nothing before E12 answers.** The golden
-snapshot on the P4 box is still provisioned, so it is a probe, not a rebuild.
+fails, T1 is dead and the NIC option in §2 returns. **Build nothing before E12 answers.**
 
-| #       | Question                                                                                                           | Falsifiable prediction, to seal before running                                                                                                                                        |
-| ------- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **E12** | Does a guest-initiated connection on a second vsock port work after restore, and after N restores of one snapshot? | **Works for all N.** Guest-initiated needs no handshake and no host-side state beyond the socket file, so there is strictly less to reset than in the direction already known to work |
-| **E13** | Added latency per HTTP request through the proxy vs. the container tier's direct call                              | **< 5 ms p50 added.** The hop is host-local; E10 puts `run` at 2.85 ms of a 55.32 ms warm action                                                                                      |
-| **E14** | Does one shared proxy with 128 listeners move E11's knee?                                                          | **Knee stays at c=8 and `bound` stays `replenishment`.** E11 measured `hostCpuFraction` 0.001 flat and Σ PSS 0.41 GB at 128 VMs                                                       |
+| #       | Question                                                                                                           | Substrate                          | Falsifiable prediction, to seal before running                                                                                                                                        |
+| ------- | ------------------------------------------------------------------------------------------------------------------ | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **E12** | Does a guest-initiated connection on a second vsock port work after restore, and after N restores of one snapshot? | `nested-m8i` (§9.1)                | **Works for all N.** Guest-initiated needs no handshake and no host-side state beyond the socket file, so there is strictly less to reset than in the direction already known to work |
+| **E13** | Added latency per HTTP request through the proxy vs. the container tier's direct call                              | `metal`, or nested × #266's ratio  | **< 5 ms p50 added.** The hop is host-local; E10 puts `run` at 2.85 ms of a 55.32 ms warm action                                                                                      |
+| **E14** | Does one shared proxy with 128 listeners move E11's knee?                                                          | `metal`, or nested once #266 lands | **Knee stays at c=8 and `bound` stays `replenishment`.** E11 measured `hostCpuFraction` 0.001 flat and Σ PSS 0.41 GB at 128 VMs                                                       |
 
 E13 and E14 reuse E10's and E11's drivers and P4 §7.1's `bound` vocabulary unchanged. Predictions are
 sealed in `deploy/microvm/predictions.json` before the first rung, per P4's practice.
+
+### 9.1 Why E12 belongs on the nested rig, and must not share metal's snapshot
+
+**E12 is a boolean, not a measurement.** It has no threshold, no baseline and no ladder — so it needs
+neither metal's absolute fidelity nor an E10/E11 re-run to compare against. `e10-lifecycle.sh` prints a
+STOP/MANDATORY verdict only when `SH_SUBSTRATE` is exactly `"metal"`, which is the right structure here:
+E12 has no verdict to print, only a yes or a no.
+
+**Sharing metal's snapshot would silently break someone else's result.** E12's guest needs a
+vsock-_initiating_ client in the rootfs, and that changes the rootfs digest. The authoritative E10/E11
+numbers were legitimised precisely by that digest being verified identical before and after every run
+(`sha256:668af5893e9c70ef`). Folding E12's helper into the snapshot a repeat metal run uses would
+invalidate the comparison that run exists to make — and it would do so invisibly. [#266](https://github.com/rossoctl/serverless-harness/issues/266)
+reaches the same conclusion from the other side (its open question 4: Firecracker restores only on
+identical hardware, so a nested rig needs its own snapshot regardless). Building E12's snapshot on
+`nested-m8i` therefore contaminates nothing, and costs no metal time on a box that is currently contended.
+
+**Nested is the harsher substrate for this specific question**, since it "taxes exactly the VM-exit-heavy
+work restore consists of" (`EXPERIMENTS.md`) — so a pass there is a _stronger_ result than a pass on metal,
+not a weaker one. **Residual, stated rather than buried:** restore requires identical hardware, so a nested
+pass does not _prove_ the metal case. It makes it very likely; metal confirmation rides along with whichever
+later run builds a metal snapshot anyway, and is not worth booking metal time for on its own.
+
+**E14 acquires a dependency from this.** Its prediction is that the knee stays at `c=8` _because of the
+proxy_ — which presumes a known knee on whatever substrate it runs. #266's open question 3 asks whether the
+knee moves under nesting at all. So E14 on nested is only interpretable **after** #266 establishes the
+nested knee; on metal it is interpretable immediately. E13 is the milder case: an absolute millisecond claim
+wants metal, or nested scaled by #266's ratio.
 
 ## 10. Verification gate
 
@@ -211,6 +238,8 @@ Z5 §9's criteria 1, 2, 5 and 6 apply **unchanged** and are not restated. This s
 - [RC1 — AuthBridge egress control-plane PoC](2026-07-10-authbridge-egress-control-plane-poc-design.md) — Profile B, the per-sandbox sidecar T3 replaces; fail-closed `token-broker`; the deferred Z1 note §5 acts on
 - [P4 — MicroVM sandbox tier](2026-09-09-p4-microvm-sandbox-design.md) — §2.4 platform facts incl. no virtio-fs; §3.4 `workspace_key`; §3.5 and §5.3 the jail as confinement; §5.2 nothing unique in the snapshot; §8 the bleed gate
 - [Milestone registry](README.md) — P-track, Z-track, MU2's `sandbox-egress` ownership
+- [#266](https://github.com/rossoctl/serverless-harness/issues/266) — metal/nested ratio for the E10/E11 ladders; its open question 3 (does the knee move under nesting?) gates E14 on nested, and its question 4 (a nested rig needs its own snapshot) is why §9.1's snapshot separation is free
+- [#267](https://github.com/rossoctl/serverless-harness/issues/267) — the session-scoped working-memory gap §3 puts out of scope
 - Firecracker [`vsock.md`](https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md) — guest-initiated `<uds>_<PORT>` convention, no handshake, `vsock_override`, "vsock snapshot support is currently limited"
 - Firecracker [`network-for-clones.md`](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/network-for-clones.md) — the netns/veth/MASQUERADE recipe §2 rejects, and its own disclaimer
 - `packages/control-plane/src/credential-store.ts:13` — `sandbox-egress` as an existing `Consumer`
