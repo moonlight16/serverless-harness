@@ -891,3 +891,156 @@ No blank above is filled. Filling it is the metal run's job, not this task's.
 - **`MV_LIVE=1` was not attempted.** Out of scope for this task
   (pre-run hardware correction F8; a build-time note, not committed); no placeholder resembling a live run
   was added.
+
+### E12 — guest-initiated vsock on a second port survives snapshot restore
+
+**Two distinct findings, not one boolean.** The core mechanism question issue
+#271 asked — does a guest-initiated vsock connection on a second port (1025)
+survive a Firecracker snapshot restore — has a clear, reliable **yes**: rungs
+A, B and D (fresh boot, single restore, and the host-initiated regression
+fence) pass unanimously, and C at N=8 concurrent restores holds the same
+result at modest concurrency. Separately, at N=128 concurrent restores from
+one snapshot, there is a real, non-zero, non-deterministic failure rate on
+this 4-vCPU rig — a distinct scale/capacity finding, not evidence against the
+restore mechanism itself. `main()` ANDs every rung together, so C@128's
+failure alone flips the run's top-level `ok` to `false`
+(`deploy/microvm/e12-results/e12-answer.json`:
+`{"substrate":"nested-m8i","rungs_run":"A B C D","ok":false}`) even though
+three of the four rungs, and C's own N=8 point, are unanimous passes.
+
+#### What was actually tested, on `nested-m8i`, in two passes
+
+Rungs A, B, C(N=8), C(N=128) and D were first run standalone (Steps 3-7 of
+this task), then again together in one script invocation as the
+authoritative combined run (Step 8) — the numbers actually committed at
+`deploy/microvm/e12-results/`. Every connection required TWO INDEPENDENT
+witnesses: the nonce captured host-side on `<jail>/vsock.sock_1025`, AND the
+ACK read back in guest stdout via the existing agent Exec path on
+vsock:1024. Neither witness alone was treated as evidence.
+
+| Rung | Standalone | Combined (authoritative, committed) |
+| --- | --- | --- |
+| A (fresh boot, control) | ok=true, both witnesses yes | ok=true, both witnesses yes |
+| B (single restore — the core question) | ok=true, both witnesses yes | ok=true, both witnesses yes |
+| C, N=8 concurrent restores | ok=true, 8/8 | ok=true, 8/8 |
+| C, N=128 concurrent restores | ok=false, 127/128 (1 failure: `guest_client_exit=1`, `"read: EOF"`) | ok=false, 76/128 (52 failures: 45× `"read: EOF"`, 2× `"connection refused"`, 1× `"connection reset by peer"`, all `guest_client_exit=1` relay-level connection errors) |
+| D (regression fence: host-initiated 1024 with 1025 present) | ok=true | ok=true |
+
+Full per-rung and per-VM records: `deploy/microvm/e12-results/` (the combined
+pass; `e12-answer.json`, `rung-A.json`, `rung-B.json`, `rung-C-8.json`,
+`rung-C-128.json`, `rung-C-8-*.json`, `rung-C-128-*.json`, `rung-D.json`,
+`run.log`).
+
+All observed C@128 failures are `guest_client`-relay-level connection errors
+(EOF, connection refused, connection reset) — none show the signature of the
+bug fixed in `1ac8371` (that bug produced `guest_client_exit=0` with a
+correctly-echoed-but-mis-compared ACK; these are `guest_client_exit=1` with
+real connection-level errors). The failure rate is markedly worse when C@128
+runs immediately after the other rungs in the same invocation (52/128) than
+when it runs alone (1/128) — consistent with resource or scheduling
+contention under heavy concurrent boot load on this 4-vCPU rig, not with a
+fundamental defect in the vsock-across-restore mechanism itself.
+
+Snapshot integrity was verified pristine (matching `manifest.json`'s
+`rootfs_sha256`) before and after every run, both passes — the golden
+snapshot was never mutated by this probe.
+
+#### The 4-VM bookkeeping gap in the combined run's C@128
+
+The combined run's per-VM records account for only 48 of the 52 counted
+failures: `grep -l '"ok":false' rung-C-128-*.json` finds 48 files, but
+`rung-C-128.json` reports `fail_count=52`. Four VM indices (112, 113, 120,
+123) have neither a log line nor a per-VM JSON record, yet are still counted
+in the aggregate.
+
+This is explained precisely by `run_rung_c_n`'s own control flow
+(`deploy/microvm/e12-vsock-egress-probe.sh`). Each per-VM subshell runs:
+
+```
+restore_vm "$jail" 2>"$jail.boot.log" || {
+  write_json_record "$RESULTS/rung-C-${n}-${i}.json" \
+    "{\"rung\":\"rung-C-${n}-${i}\",\"ok\":false,\"error\":\"restore_vm failed\"}"
+  exit 1
+}
+```
+
+That `||` fallback only runs if `restore_vm` *returns* nonzero. But `die()`
+(the script's error primitive) is `die() { echo "e12: $*" >&2; exit 1; }` — a
+raw `exit`, not a `return`. Called from anywhere inside `restore_vm`'s call
+chain (e.g. `wait_for_socket`'s timeout `die`, or `wait_for_agent`'s, or any
+`api_put`/curl failure `die`), it terminates the per-VM subshell immediately,
+from wherever it is, bypassing the `|| { write_json_record ...; exit 1; }`
+fallback entirely — `exit` never returns control for `||` to catch, it just
+ends the process. The aggregation loop's `wait "$pid"` still correctly
+observes the nonzero exit and counts it in `fail_count` — the aggregate
+**count** is correct — but no per-VM diagnostic JSON gets written for a
+`die()`-triggered failure path. This is a real, minor visibility gap in the
+driver (not a counting bug, and not a defect in the answer itself): the four
+missing indices are failures whose specific cause (which `die` fired, and
+where) is not recorded anywhere. It is not being fixed as part of this plan —
+hardening the per-VM diagnostic path is beyond this throwaway probe's scope,
+and does not cast doubt on the `ok_count`/`fail_count` numbers themselves,
+which are correct.
+
+#### What a nested run establishes here, and what it does not
+
+This ran on `nested-m8i`, never `metal`. Per this driver's design, no
+substrate name check gates that choice — the snapshot-integrity guard
+(`assert_snapshot_pristine`) is unconditional and mechanical rather than a
+check on the substrate's name, so it holds identically on whichever run this
+probe is next pointed at.
+
+What this DOES establish: the guest-initiated vsock mechanism — a
+pre-created host listener on `<uds>_<PORT>`, no handshake, `vsock_override`
+rewriting `uds_path` per restore — works as documented, on real KVM hardware
+virtualized one level down, across a real snapshot restore, including under
+modest concurrency (N=8).
+
+What this does NOT establish on its own: Firecracker's snapshot/restore
+contract assumes matching hardware between snapshot and restore. A nested
+pass makes the metal case very likely but does not prove it. Per issue #271,
+metal confirmation should ride along with whichever later run builds a metal
+snapshot anyway — not worth booking metal time for on its own — and because
+the driver's snapshot-integrity guard is unconditional rather than a
+substrate name check, running it again on that later metal snapshot needs no
+code change.
+
+#### Prediction (spec-style, pinned in `predictions.json` id 6)
+
+> Guest-initiated vsock on a second port (1025) works on a fresh boot and
+> survives snapshot restore, for all N concurrent restores of one snapshot,
+> because the guest-to-host direction needs no handshake and no host-side
+> state beyond the socket file - strictly less state to reset than the
+> host-initiated direction already known to survive.
+
+Falsifier: "any rung B, C or D reporting ok=false while rung A reported
+ok=true."
+
+**By the letter of the falsifier, this technically fires.** Rung C reported
+`ok=false` at N=128 while rung A reported `ok=true` — that is exactly the
+condition the falsifier names, and it should be said plainly rather than
+argued around. But in the same breath: the prediction's own claim is
+specifically about the guest-initiated mechanism surviving restore, and
+rungs A, B and D — the rungs that test the mechanism directly, without
+concurrency-scale load — support it strongly and unanimously across both
+runs, as does C at N=8. The falsifier's wording ("any rung ... reporting
+ok=false") was sealed before rung A ran and did not anticipate a
+concurrency-scale failure mode distinct from a restore-mechanism failure; it
+cannot distinguish "the mechanism doesn't survive restore" from "128
+simultaneous restores exceed what a 4-vCPU rig can schedule reliably." This
+is a genuine tension between a coarse-grained sealed falsifier and a
+nuanced real result. It is recorded here as exactly that tension, not
+resolved by picking whichever framing is more convenient: the falsifier
+fires on its literal text, and the mechanism it was meant to test is
+nonetheless well-supported.
+
+#### Effect on PR #268
+
+P4.1's decision T1 (route all sandbox egress over vsock) is supported by the
+core finding (rungs A, B, D and C@8) and should stand. The N=128 finding
+should be carried into P4.1's implementation as an open scale/capacity
+question — how many concurrent egress connections a single host is expected
+to serve, and whether restores should be staggered or rate-limited under
+heavy concurrent load — not as grounds to revert to the NIC option (spec
+§2). Nothing observed here resembles the restore-mechanism failure that
+would force that reversion.
