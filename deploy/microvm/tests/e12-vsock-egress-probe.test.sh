@@ -256,6 +256,18 @@ check "run_rung_a calls teardown_jail" \
 check "run_rung_a labels its record rung-A" \
   "$([ "$(echo "$ra_body" | grep -c 'rung-A')" -ge 1 ] && echo yes || echo no)" "yes"
 
+echo "== run_rung_b restores (not fresh-boots), runs the probe, and tears down"
+rb_body="$(extract_fn run_rung_b || true)"
+check "run_rung_b exists" "$([ -n "$rb_body" ] && echo yes || echo no)" "yes"
+check "run_rung_b calls restore_vm" \
+  "$([ "$(echo "$rb_body" | grep -c 'restore_vm')" -ge 1 ] && echo yes || echo no)" "yes"
+check "run_rung_b does NOT call boot_fresh_vm" \
+  "$(echo "$rb_body" | grep -c 'boot_fresh_vm')" "0"
+check "run_rung_b calls run_probe_once" \
+  "$([ "$(echo "$rb_body" | grep -c 'run_probe_once')" -ge 1 ] && echo yes || echo no)" "yes"
+check "run_rung_b labels its record rung-B" \
+  "$([ "$(echo "$rb_body" | grep -c 'rung-B')" -ge 1 ] && echo yes || echo no)" "yes"
+
 echo
 if [ "$fails" -ne 0 ]; then
   echo "FAILED: $fails check(s)"

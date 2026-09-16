@@ -530,6 +530,19 @@ run_rung_a() {
   return "$ok"
 }
 
+# --- rung B: restore once, then connect (the actual question) ----------------
+run_rung_b() {
+  local jail="$JAIL_BASE/rung-b"
+  rm -rf "$jail"
+  # Plain statement, not $(...) - see Task 5's comment on why (the function
+  # this calls sets globals a subshell would otherwise swallow).
+  restore_vm "$jail" || die "rung-B: restore_vm failed"
+  local ok=0
+  run_probe_once "$jail" "$VM_UDS" "rung-B" || ok=1
+  teardown_jail "$jail" "$CLEANUP_PID"
+  return "$ok"
+}
+
 # --- entrypoint --------------------------------------------------------------
 main() {
   preflight
