@@ -121,6 +121,31 @@ check "write_json_record exits non-zero on malformed JSON" "$?" "1"
 check "write_json_record accepts valid JSON" "$?" "0"
 rm -rf "$rec_tmp"
 
+echo "== jail helpers exist and are named after what they copy"
+for fn in api_put wait_for_socket prepare_jail link_snapshot_into_jail teardown_jail; do
+  body="$(extract_fn "$fn" || true)"
+  check "$fn exists" "$([ -n "$body" ] && echo yes || echo no)" "yes"
+done
+
+echo "== wait_for_socket polls with a real HTTP round trip, not a bare existence check"
+wfs_body="$(extract_fn wait_for_socket || true)"
+check "wait_for_socket uses curl, not just [ -S ]" \
+  "$([ "$(echo "$wfs_body" | grep -c 'curl')" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "== link_snapshot_into_jail never opens the snapshot for writing"
+link_body="$(extract_fn link_snapshot_into_jail || true)"
+check "no O_WRONLY-shaped redirection into \$SNAPSHOT_DIR" \
+  "$(echo "$link_body" | grep -cE '>\s*"?\$SNAPSHOT_DIR')" "0"
+check "uses ln (hardlink), with a cp fallback" \
+  "$([ "$(echo "$link_body" | grep -c '\bln\b')" -ge 1 ] && [ "$(echo "$link_body" | grep -c '\bcp\b')" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "== teardown_jail kills the VMM and does not leave the jail behind"
+td_body="$(extract_fn teardown_jail || true)"
+check "teardown_jail sends a kill" \
+  "$([ "$(echo "$td_body" | grep -c '\bkill\b')" -ge 1 ] && echo yes || echo no)" "yes"
+check "teardown_jail removes the jail dir" \
+  "$([ "$(echo "$td_body" | grep -c 'rm -rf')" -ge 1 ] && echo yes || echo no)" "yes"
+
 echo
 if [ "$fails" -ne 0 ]; then
   echo "FAILED: $fails check(s)"

@@ -161,6 +161,113 @@ preflight() {
   log "preflight ok: substrate=$SUBSTRATE snapshot=$SNAPSHOT_DIR results=$RESULTS"
 }
 
+# --- jail lifecycle -----------------------------------------------------------
+# Copied from deploy/microvm/build-snapshot.sh's api_put / wait_for_socket /
+# prepare_jail / teardown_jail rather than shared: build-snapshot.test.sh greps
+# write_guest_client's body for statement ORDERING, and extracting a shared lib
+# out of that 1928-line source-order-coupled script for a throwaway probe would
+# break that test for no benefit to either script. Behavior here matches the
+# original; only the vsock/probe pieces are new (Task 4 onward).
+
+api_put() {
+  local sock="$1" path="$2" body="$3"
+  curl -s -S --unix-socket "$sock" -X PUT "http://localhost$path" \
+    -H 'Content-Type: application/json' -d "$body" >/dev/null
+}
+
+# Matches build-snapshot.sh's own wait_for_socket: a bare `[ -e "$sock" ]` races,
+# because Firecracker creates the socket file before it is actually accept()ing
+# on it (confirmed on this rig: cloud-hypervisor lost that exact race). Poll with
+# a real HTTP round trip instead; any response, even a 404, proves the daemon is
+# accepting connections, which is the only thing this loop needs to prove.
+wait_for_socket() {
+  local sock="$1" console_log="$2" timeout_s="${3:-5}"
+  local attempts=$((timeout_s * 10)) i=0
+  while [ "$i" -lt "$attempts" ]; do
+    if curl -s -S --unix-socket "$sock" -o /dev/null "http://localhost/" 2>/dev/null; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 0.1
+  done
+  log "console log for the timed-out socket $sock:"
+  cat "$console_log" >&2 2>/dev/null || true
+  die "timed out after ${timeout_s}s waiting for $sock to accept connections"
+}
+
+CLEANUP_JAIL=""
+CLEANUP_PID=""
+
+jail_mount_dev() {
+  local jail="$1"
+  mkdir -p "$jail/dev"
+  : >"$jail/dev/kvm"
+  mount --bind /dev/kvm "$jail/dev/kvm" ||
+    die "could not bind-mount /dev/kvm into the jail at $jail"
+  : >"$jail/dev/urandom" 2>/dev/null || true
+  mount --bind /dev/urandom "$jail/dev/urandom" 2>/dev/null || true
+}
+
+jail_unmount_dev() {
+  local jail="$1"
+  umount "$jail/dev/urandom" 2>/dev/null || true
+  umount "$jail/dev/kvm" 2>/dev/null || true
+}
+
+prepare_jail() {
+  local jail="$1"
+  mkdir -p "$jail/run" || die "could not create $jail/run"
+  # Always hardlinked in under the FIXED jail-relative name "firecracker",
+  # regardless of what $FIRECRACKER_BIN resolves to on the host (e.g.
+  # SH_FIRECRACKER_BIN=/opt/fc-1.17/firecracker-x86_64) - every caller below
+  # execs "chroot \"$jail\" /firecracker", and that path must never depend on
+  # the source binary's own basename. Matches build-snapshot.sh's
+  # prepare_jail, which takes the jail-relative name as an explicit argument
+  # for exactly this reason (its two arms hardlink to "firecracker" and
+  # "cloud-hypervisor" respectively, never to the source path's basename).
+  ln "$(command -v "$FIRECRACKER_BIN")" "$jail/firecracker" 2>/dev/null ||
+    cp -p "$(command -v "$FIRECRACKER_BIN")" "$jail/firecracker"
+  CLEANUP_JAIL="$jail"
+  jail_mount_dev "$jail"
+}
+
+# link_snapshot_into_jail hardlinks the golden snapshot's four files into the
+# jail. Hardlinking (not copying) is what keeps this cheap AND what keeps the
+# guard in assert_snapshot_pristine meaningful -- a hardlink cannot be opened for
+# writing by this process without ALSO changing the file every other hardlink
+# (including the one under $SNAPSHOT_DIR) points at, which is exactly the drift
+# assert_snapshot_pristine is watching for.
+link_snapshot_into_jail() {
+  local jail="$1" f
+  for f in kernel rootfs memfile vmstate; do
+    if ! ln "$SNAPSHOT_DIR/$f" "$jail/$f" 2>/dev/null; then
+      log "WARNING: cross-device or no hardlink support - COPYING $f into $jail (last resort, not the normal path)"
+      cp -p "$SNAPSHOT_DIR/$f" "$jail/$f"
+    fi
+  done
+}
+
+teardown_jail() {
+  local jail="$1" pid="$2"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  jail_unmount_dev "$jail"
+  rm -rf "$jail"
+  CLEANUP_JAIL=""
+  CLEANUP_PID=""
+}
+
+cleanup_on_exit() {
+  if [ -n "$CLEANUP_PID" ]; then
+    kill "$CLEANUP_PID" 2>/dev/null || true
+  fi
+  if [ -n "$CLEANUP_JAIL" ]; then
+    jail_unmount_dev "$CLEANUP_JAIL"
+    rm -rf "$CLEANUP_JAIL" 2>/dev/null || true
+  fi
+}
+trap cleanup_on_exit EXIT
+
 # --- entrypoint --------------------------------------------------------------
 main() {
   preflight
