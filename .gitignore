@@ -41,3 +41,9 @@ experiments/.results/
 # Workspace-only checksums. Redundant with each module go.sum, and the checksum
 # database still verifies downloads without it -- one less sum file to keep in sync.
 go.work.sum
+
+# E13 rig diagnostics (deploy/microvm/e13-*.sh) - throwaway rig output, not
+# source, per PR #272's own late fix removing the equivalent e12-results/.
+deploy/microvm/e13-results/
+deploy/microvm/e13-control-results/
+deploy/microvm/e13-telemetry/
