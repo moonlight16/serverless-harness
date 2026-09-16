@@ -166,7 +166,9 @@ is not mitigated.**
 **E12 gates everything and can invalidate T1.** P4 §2.4 establishes that _listening_ vsock sockets survive
 restore in the _host-initiated_ direction. This design adds a **second port** in the **guest-initiated**
 direction across restore, and neither the repo nor Firecracker's docs establish that it works. If E12
-fails, T1 is dead and the NIC option in §2 returns. **Build nothing before E12 answers.**
+fails, T1 is dead and the NIC option in §2 returns. **Build nothing before E12 answers.** E12 is tracked
+independently as [#271](https://github.com/rossoctl/serverless-harness/issues/271), written to be picked
+up without implementing any of this spec.
 
 | #       | Question                                                                                                           | Substrate                          | Falsifiable prediction, to seal before running                                                                                                                                        |
 | ------- | ------------------------------------------------------------------------------------------------------------------ | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -240,6 +242,7 @@ Z5 §9's criteria 1, 2, 5 and 6 apply **unchanged** and are not restated. This s
 - [Milestone registry](README.md) — P-track, Z-track, MU2's `sandbox-egress` ownership
 - [#266](https://github.com/rossoctl/serverless-harness/issues/266) — metal/nested ratio for the E10/E11 ladders; its open question 3 (does the knee move under nesting?) gates E14 on nested, and its question 4 (a nested rig needs its own snapshot) is why §9.1's snapshot separation is free
 - [#267](https://github.com/rossoctl/serverless-harness/issues/267) — the session-scoped working-memory gap §3 puts out of scope
+- [#271](https://github.com/rossoctl/serverless-harness/issues/271) — E12, the gating probe, specified to be executable independently of this spec
 - Firecracker [`vsock.md`](https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md) — guest-initiated `<uds>_<PORT>` convention, no handshake, `vsock_override`, "vsock snapshot support is currently limited"
 - Firecracker [`network-for-clones.md`](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/network-for-clones.md) — the netns/veth/MASQUERADE recipe §2 rejects, and its own disclaimer
 - `packages/control-plane/src/credential-store.ts:13` — `sandbox-egress` as an existing `Consumer`
