@@ -234,7 +234,51 @@ Z5 §9's criteria 1, 2, 5 and 6 apply **unchanged** and are not restated. This s
 6. **No claim the proxy cannot be escaped.** Same posture as P4 §1's refusal to claim the VMM cannot be: we
    claim the credential moved, not that the boundary is unbreakable.
 
-## 12. References
+## 12. Implementation notes for a fresh session
+
+Mirrors P4 §10's purpose: decide what can be decided, so a planner starting cold does not have to guess.
+**Nothing here should be built before [#271](https://github.com/rossoctl/serverless-harness/issues/271)
+(E12) answers.**
+
+### 12.1 Files this slice touches — settled
+
+| Path                                                                 | Change                                                                                                                                                                                                                                                                                                                                                |
+| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `remote-worker/cmd/guest-agent`, `remote-worker/internal/guestagent` | T2: the guest agent gains a **loopback TCP listener** on `127.0.0.1:3128` that splices each accepted connection to `CID 2:1025`. The existing framed vsock protocol in `internal/guestagent/protocol.go` is **not** involved — egress is opaque byte-splicing, not framed requests. Built static (`CGO_ENABLED=0`) exactly as now                     |
+| `remote-worker/internal/vmpool/`                                     | Replenishment creates `<jail>/run/v.sock_1025` **before** restore and marks the VM standby only once the listener verifies (fail-closed); restore passes `vsock_override` for the jail's prefix; teardown SIGKILLs the VM **then** unlinks the socket (§6's ordering)                                                                                 |
+| `deploy/microvm/build-snapshot.sh`                                   | Rootfs additions: the host CA **public** cert into the trust store (T6), and the constant inert placeholder plus `HTTPS_PROXY=http://127.0.0.1:3128` / empty `NO_PROXY` as image-shipped env (T5). All three are constants, so none violates P4 §5.2. The script's `--agent` flow and its heredoc `guest_client.go` build-time verifier are untouched |
+| `deploy/microvm/predictions.json`                                    | E13/E14 predictions, sealed before their first rung (E12's is #271's)                                                                                                                                                                                                                                                                                 |
+| `deploy/microvm/EXPERIMENTS.md`                                      | E13/E14 sections                                                                                                                                                                                                                                                                                                                                      |
+| `docs/specs/README.md`                                               | Registry row — **already done in this PR**                                                                                                                                                                                                                                                                                                            |
+
+**Language follows location:** everything above is Go, because jail creation and the guest agent already
+are. No `packages/` (TypeScript) change is implied by anything in §12.1.
+
+### 12.2 The proxy component — an owed decision, not a deferral
+
+§6 calls it "the shared egress proxy" without saying what it _is_, and that is deliberate: the choice
+changes the file list, the language and whether a second repository is in play, and it should be made
+with a planner's view rather than pre-empted here. Recorded in the shape P4 §4.5 uses for the repo-cache
+shapes — the options and what discriminates them, so the decision is bounded rather than open.
+
+The complication: **RC1's Profile B is a Kubernetes sidecar** (`deploy/knative/sandbox-pool-ab2.yaml`,
+`deploy/knative/authbridge/`), "co-located, ships WITH the sandbox." This tier has no pods and no
+sidecars, and T3 makes the proxy shared rather than co-located, so RC1's deployment shape does not
+transfer even though its plugin semantics do.
+
+| Option                                                                                                                                                               | Gains                                                                                                                | Costs                                                                                                                                                                                                      |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1. AuthBridge as a plain host process** — RC1's `mcp-parser → SPARC → token-broker` chain plus `static-broker`, under systemd instead of a sidecar                 | Z5 semantics, fail-closed `token-broker` and the audit shape inherited unmodified; no second implementation to drift | AuthBridge is outside this repo and its deployment model is Kubernetes-shaped; it must learn vsock listeners **and** the socket-path `CallerIdentity` — changes in someone else's codebase                 |
+| **2. A new host-side proxy here** — a Go package beside `remote-worker`                                                                                              | Host-native, no cross-repo dependency, `CallerIdentity` is natural, full control of the vsock listener lifecycle     | Re-implements allowlist, placeholder swap, audit and cap — which Z5 E9 assigns to the proxy it already specified. Two implementations of one security boundary is the failure mode Z5 E1 exists to prevent |
+| **3. Thin host shim in front of AuthBridge** — a small Go shim owns the vsock listeners and socket-path identity, forwards to an unmodified AuthBridge over loopback | Z5's brain untouched; all new code stays in this repo; the density win of T3 is preserved                            | An extra hop, and the identity header between shim and AuthBridge becomes a trust boundary that **must not** be settable by the guest — the shim has to strip it from inbound requests                     |
+
+**What discriminates them:** whether AuthBridge can accept a vsock listener and a non-header identity
+source without forking it. If yes, option 1. If no, option 3 is option 1 with the incompatibility
+isolated in this repo, and it is the presumptive answer. Option 2 only wins if Z5's semantics turn out
+not to fit a shared, non-Kubernetes proxy at all — which would be a finding about Z5, and should be
+written up as one rather than absorbed silently.
+
+## 13. References
 
 - [Z5 / M13 — Generalized credentialed egress](2026-06-19-m13-generalized-credentialed-egress-design.md) — E1–E11; §4.3 placeholder mechanics; §5.1 the proxy is the only boundary; §5.2 why TLS interception is acceptable; §8.6 the NetworkPolicy dependency T7 removes
 - [RC1 — AuthBridge egress control-plane PoC](2026-07-10-authbridge-egress-control-plane-poc-design.md) — Profile B, the per-sandbox sidecar T3 replaces; fail-closed `token-broker`; the deferred Z1 note §5 acts on
