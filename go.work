@@ -7,7 +7,7 @@
 // modules can be bumped independently. See issue #212.
 //
 // Keep this `go` line in sync with both go.mod files (and CI's go-version-file).
-go 1.25.0
+go 1.26.0
 
 use (
 	./gen/go
