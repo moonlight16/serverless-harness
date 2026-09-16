@@ -16,11 +16,11 @@ const FILE = resolve(REPO_ROOT, 'deploy/microvm/predictions.json');
  * (b) update this digest in the SAME commit that says in its message why a prediction
  * was legitimately restated. Both leave a trace; a silent edit does not.
  */
-// Moved once, deliberately: issue #271 (E12) seals a sixth prediction here BEFORE its
-// first rung, which is the same discipline §7.4 introduced rather than an exception to it.
-// The five §7.4 entries are byte-identical; only an append happened. E12's own driver has
-// no verdict machinery, so nothing it measures can feed back into this file.
-const PINNED_SHA256 = '0d1a6369da2793c19bc4ec1b63c20474e57aff34cb98ea10fb56685edb4128b2';
+// Moved twice, deliberately: issue #271 (E12) sealed a sixth prediction, and this
+// follow-up (E13, diagnosing PR #272's rung C@128 failures) seals a seventh, BEFORE
+// either diagnostic runs - the same discipline §7.4 introduced. All six earlier
+// entries are byte-identical; only an append happened.
+const PINNED_SHA256 = '3f7809407e5c157f6647fbb5ff9b9cde7ae0da1648de48f00b983017759c68b7';
 
 describe('microVM predictions are recorded before the rungs and pinned', () => {
   it('has not been edited', () => {
@@ -38,9 +38,9 @@ describe('microVM predictions are recorded before the rungs and pinned', () => {
     ).toBe(PINNED_SHA256);
   });
 
-  it('records §7.4s five predictions plus E12s, each with a falsifier', () => {
+  it('records §7.4s five predictions plus E12s and E13s, each with a falsifier', () => {
     const doc = JSON.parse(readFileSync(FILE, 'utf8'));
-    expect(doc.predictions).toHaveLength(6);
+    expect(doc.predictions).toHaveLength(7);
     for (const p of doc.predictions) {
       expect(p.claim.length).toBeGreaterThan(20);
       // A prediction with no stated falsifier is not falsifiable, which is the whole
