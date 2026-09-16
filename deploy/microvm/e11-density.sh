@@ -751,6 +751,29 @@ shuffle_e11_arms() {
   printf 'container\nmicrovm\n' | awk -v seed="$(($$ + $(date +%s)))" 'BEGIN{srand(seed)} {print rand()"\t"$0}' | sort -n | cut -f2-
 }
 
+# kill_relay_by_port kills whatever is listening on $1, BY PORT rather than by
+# E11_RELAY_PID. That PID comes from `pnpm ... start & echo $!` inside a subshell, and on
+# this host pnpm stays running as a supervisor over a separate node child rather than
+# exec-ing into it -- so killing E11_RELAY_PID kills pnpm and leaves its child holding the
+# port. The next arm's own relay then dies with EADDRINUSE, and because a worker's startup
+# check only confirms SOMETHING answers on the port, never which relay it is, that arm's
+# worker silently attaches to the STALE relay from the PREVIOUS arm instead -- the same
+# "silently wrong data" failure METAL-RUNBOOK.md section 3a already documents for a leaked
+# relay across separate invocations, except this is within a single e11-density.sh run,
+# between its own two arms. Verified against the port with ss, same as the runbook's own
+# manual cleanup recipe -- never against a process name or a captured PID.
+kill_relay_by_port() {
+  local port="$1" pid
+  # shellcheck disable=SC2034 # loop variable is the retry count itself, not read
+  for tries in 1 2 3 4 5 6 7 8 9 10; do
+    pid="$(ss -ltnp "sport = :${port}" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1)"
+    [ -z "$pid" ] && return 0
+    kill -9 "$pid" 2>/dev/null
+    sleep 0.5
+  done
+  die "port $port is still held by pid $pid after 10 kill attempts - the next arm's relay would bind onto a stale listener or fail with EADDRINUSE (see kill_relay_by_port's comment)"
+}
+
 # start_redis_loopback publishes this driver's scratch redis on LOOPBACK ONLY, and is
 # the single place either arm starts one (both arms had the same `docker run` line).
 #
@@ -808,6 +831,7 @@ stop_container_stack() {
   # assigned (build-snapshot.sh's cleanup_on_exit documents that exact failure).
   [ -n "${E11_WORKER_PID:-}" ] && kill "${E11_WORKER_PID:-}" 2>/dev/null
   [ -n "${E11_RELAY_PID:-}" ] && kill "${E11_RELAY_PID:-}" 2>/dev/null
+  kill_relay_by_port "$E11_RELAY_PORT"
   docker rm -f "sh-e11-redis-$$" >/dev/null 2>&1 || true
   E11_WORKER_PID=""
   E11_RELAY_PID=""
@@ -862,6 +886,7 @@ stop_microvm_stack() {
   # assigned (build-snapshot.sh's cleanup_on_exit documents that exact failure).
   [ -n "${E11_WORKER_PID:-}" ] && kill "${E11_WORKER_PID:-}" 2>/dev/null
   [ -n "${E11_RELAY_PID:-}" ] && kill "${E11_RELAY_PID:-}" 2>/dev/null
+  kill_relay_by_port "$E11_RELAY_PORT"
   docker rm -f "sh-e11-redis-$$" >/dev/null 2>&1 || true
   E11_WORKER_PID=""
   E11_RELAY_PID=""
