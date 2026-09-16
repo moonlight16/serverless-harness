@@ -291,6 +291,31 @@ check "run_rung_c iterates \$C_LADDER" \
 check "run_rung_c calls run_rung_c_n" \
   "$([ "$(echo "$rc_body" | grep -c 'run_rung_c_n')" -ge 1 ] && echo yes || echo no)" "yes"
 
+echo "== run_rung_d confirms port 1024 still works with 1025 present"
+rd_body="$(extract_fn run_rung_d || true)"
+check "run_rung_d exists" "$([ -n "$rd_body" ] && echo yes || echo no)" "yes"
+check "run_rung_d starts the 1025 listener (so it is PRESENT, per the rung's own name)" \
+  "$([ "$(echo "$rd_body" | grep -c 'start_host_listener')" -ge 1 ] && echo yes || echo no)" "yes"
+check "run_rung_d exercises port \$AGENT_PORT directly (not via run_probe_once)" \
+  "$([ "$(echo "$rd_body" | grep -c 'AGENT_PORT')" -ge 1 ] && echo yes || echo no)" "yes"
+check "run_rung_d labels its record rung-D" \
+  "$([ "$(echo "$rd_body" | grep -c 'rung-D')" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "== main dispatches every requested rung and prints exactly one boolean answer line"
+main_body="$(extract_fn main || true)"
+check "main checks wants_rung A" "$([ "$(echo "$main_body" | grep -c "wants_rung A")" -ge 1 ] && echo yes || echo no)" "yes"
+check "main checks wants_rung B" "$([ "$(echo "$main_body" | grep -c "wants_rung B")" -ge 1 ] && echo yes || echo no)" "yes"
+check "main checks wants_rung C" "$([ "$(echo "$main_body" | grep -c "wants_rung C")" -ge 1 ] && echo yes || echo no)" "yes"
+check "main checks wants_rung D" "$([ "$(echo "$main_body" | grep -c "wants_rung D")" -ge 1 ] && echo yes || echo no)" "yes"
+check "main prints an E12 ANSWER line" \
+  "$([ "$(echo "$main_body" | grep -c 'E12 ANSWER')" -ge 1 ] && echo yes || echo no)" "yes"
+check "main still verifies the snapshot pristine before AND after" \
+  "$([ "$(echo "$main_body" | grep -c 'assert_snapshot_pristine')" -eq 2 ] && echo yes || echo no)" "yes"
+
+echo "== still structurally incapable of a verdict, even after wiring in the rungs"
+check "no STOP token (full source)" "$(grep -c '\bSTOP\b' "$SCRIPT")" "0"
+check "no MANDATORY token (full source)" "$(grep -c '\bMANDATORY\b' "$SCRIPT")" "0"
+
 echo
 if [ "$fails" -ne 0 ]; then
   echo "FAILED: $fails check(s)"

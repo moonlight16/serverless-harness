@@ -624,11 +624,61 @@ run_rung_c() {
   return "$overall"
 }
 
-# --- entrypoint --------------------------------------------------------------
+# --- rung D: host-initiated 1024 still works with 1025 present (regression fence) --
+# The worst outcome the issue names: adding a second port breaks the mechanism
+# P4 already ships on. This does NOT reuse run_probe_once (that exercises
+# GUEST-initiated 1025) - it exercises the EXISTING host-initiated Exec path on
+# 1024 directly, with the 1025 listener present but unused by this rung, so a
+# regression here is unambiguously about interference from the second port.
+run_rung_d() {
+  local jail="$JAIL_BASE/rung-d"
+  rm -rf "$jail"
+  # Plain statement, not $(...) - see Task 5's comment on why (the function
+  # this calls sets globals a subshell would otherwise swallow).
+  restore_vm "$jail" || die "rung-D: restore_vm failed"
+
+  local listener_out lpid
+  listener_out="$(start_host_listener "$jail" "rung-d-unused")"
+  lpid="${listener_out#pid:}"; lpid="${lpid%% capture:*}"
+
+  local exit_code=0
+  "$GUEST_CLIENT" -uds "$VM_UDS" -port "$AGENT_PORT" -timeout-s 15 -command true >/dev/null 2>&1 ||
+    exit_code=$?
+
+  stop_host_listener "$lpid"
+  teardown_jail "$jail" "$CLEANUP_PID"
+
+  local ok=false
+  [ "$exit_code" -eq 0 ] && ok=true
+  write_json_record "$RESULTS/rung-D.json" \
+    "$(printf '{"rung":"rung-D","ok":%s,"guest_client_exit":%s}' "$ok" "$exit_code")"
+  log "rung-D: host-initiated 1024 with 1025 present -> exit=$exit_code ok=$ok"
+  [ "$ok" = true ]
+}
+
+# --- entrypoint ----------------------------------------------------------------
 main() {
   preflight
   assert_snapshot_pristine "$SNAPSHOT_DIR" before
+
+  local overall_ok=true
+  wants_rung A && { run_rung_a || overall_ok=false; }
+  wants_rung B && { run_rung_b || overall_ok=false; }
+  wants_rung C && { run_rung_c || overall_ok=false; }
+  wants_rung D && { run_rung_d || overall_ok=false; }
+
   assert_snapshot_pristine "$SNAPSHOT_DIR" after
+
+  write_json_record "$RESULTS/e12-answer.json" \
+    "$(printf '{"substrate":%s,"rungs_run":%s,"ok":%s}' \
+      "$(json_escape "$SUBSTRATE")" "$(json_escape "$RUNGS")" "$overall_ok")"
+
+  if [ "$overall_ok" = true ]; then
+    log "E12 ANSWER: guest-initiated vsock on a second port SURVIVES restore (rungs: $RUNGS, substrate: $SUBSTRATE)"
+  else
+    log "E12 ANSWER: guest-initiated vsock on a second port DOES NOT SURVIVE restore (rungs: $RUNGS, substrate: $SUBSTRATE) - see $RESULTS for the failing rung's record"
+  fi
+  [ "$overall_ok" = true ]
 }
 
 # e10-lifecycle.sh uses the same escape hatch, for the same reason: the tests
