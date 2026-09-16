@@ -681,7 +681,7 @@ main() {
   if [ "$overall_ok" = true ]; then
     log "E12 ANSWER: guest-initiated vsock on a second port SURVIVES restore (rungs: $RUNGS, substrate: $SUBSTRATE)"
   else
-    log "E12 ANSWER: guest-initiated vsock on a second port DOES NOT SURVIVE restore (rungs: $RUNGS, substrate: $SUBSTRATE) - see $RESULTS for the failing rung's record"
+    log "E12 ANSWER: not all rungs passed (rungs: $RUNGS, substrate: $SUBSTRATE) - see $RESULTS for which; a rung-C-only failure is a concurrency-scale finding, not a restore-mechanism failure"
   fi
   [ "$overall_ok" = true ]
 }

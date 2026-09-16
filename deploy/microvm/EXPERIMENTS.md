@@ -918,13 +918,13 @@ witnesses: the nonce captured host-side on `<jail>/vsock.sock_1025`, AND the
 ACK read back in guest stdout via the existing agent Exec path on
 vsock:1024. Neither witness alone was treated as evidence.
 
-| Rung | Standalone | Combined (authoritative, committed) |
-| --- | --- | --- |
-| A (fresh boot, control) | ok=true, both witnesses yes | ok=true, both witnesses yes |
-| B (single restore — the core question) | ok=true, both witnesses yes | ok=true, both witnesses yes |
-| C, N=8 concurrent restores | ok=true, 8/8 | ok=true, 8/8 |
-| C, N=128 concurrent restores | ok=false, 127/128 (1 failure: `guest_client_exit=1`, `"read: EOF"`) | ok=false, 76/128 (52 failures: 45× `"read: EOF"`, 2× `"connection refused"`, 1× `"connection reset by peer"`, all `guest_client_exit=1` relay-level connection errors) |
-| D (regression fence: host-initiated 1024 with 1025 present) | ok=true | ok=true |
+| Rung                                                        | Standalone                                                          | Combined (authoritative, committed)                                                                                                                                    |
+| ----------------------------------------------------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A (fresh boot, control)                                     | ok=true, both witnesses yes                                         | ok=true, both witnesses yes                                                                                                                                            |
+| B (single restore — the core question)                      | ok=true, both witnesses yes                                         | ok=true, both witnesses yes                                                                                                                                            |
+| C, N=8 concurrent restores                                  | ok=true, 8/8                                                        | ok=true, 8/8                                                                                                                                                           |
+| C, N=128 concurrent restores                                | ok=false, 127/128 (1 failure: `guest_client_exit=1`, `"read: EOF"`) | ok=false, 76/128 (52 failures: 45× `"read: EOF"`, 2× `"connection refused"`, 1× `"connection reset by peer"`, all `guest_client_exit=1` relay-level connection errors) |
+| D (regression fence: host-initiated 1024 with 1025 present) | ok=true                                                             | ok=true                                                                                                                                                                |
 
 Full per-rung and per-VM records: `deploy/microvm/e12-results/` (the combined
 pass; `e12-answer.json`, `rung-A.json`, `rung-B.json`, `rung-C-8.json`,
@@ -949,8 +949,7 @@ snapshot was never mutated by this probe.
 
 The combined run's per-VM records account for only 48 of the 52 counted
 failures: `grep -l '"ok":false' rung-C-128-*.json` finds 48 files, but
-`rung-C-128.json` reports `fail_count=52`. Four VM indices (112, 113, 120,
-123) have neither a log line nor a per-VM JSON record, yet are still counted
+`rung-C-128.json` reports `fail_count=52`. Four VM indices (112, 113, 120, 123) have neither a log line nor a per-VM JSON record, yet are still counted
 in the aggregate.
 
 This is explained precisely by `run_rung_c_n`'s own control flow
@@ -964,7 +963,7 @@ restore_vm "$jail" 2>"$jail.boot.log" || {
 }
 ```
 
-That `||` fallback only runs if `restore_vm` *returns* nonzero. But `die()`
+That `||` fallback only runs if `restore_vm` _returns_ nonzero. But `die()`
 (the script's error primitive) is `die() { echo "e12: $*" >&2; exit 1; }` — a
 raw `exit`, not a `return`. Called from anywhere inside `restore_vm`'s call
 chain (e.g. `wait_for_socket`'s timeout `die`, or `wait_for_agent`'s, or any
@@ -977,8 +976,12 @@ observes the nonzero exit and counts it in `fail_count` — the aggregate
 `die()`-triggered failure path. This is a real, minor visibility gap in the
 driver (not a counting bug, and not a defect in the answer itself): the four
 missing indices are failures whose specific cause (which `die` fired, and
-where) is not recorded anywhere. It is not being fixed as part of this plan —
-hardening the per-VM diagnostic path is beyond this throwaway probe's scope,
+where) was captured at run time in each VM's own `.boot.log` file (the
+redirect target of `restore_vm`'s stderr above), named
+`$JAIL_BASE/rung-c-128-<i>.boot.log` for the failing index `<i>` — it is just
+not archived in the committed results directory (`deploy/microvm/e12-results/`).
+It is not being fixed as part of this plan — hardening the per-VM diagnostic path
+and archiving these logs is beyond this throwaway probe's scope,
 and does not cast doubt on the `ok_count`/`fail_count` numbers themselves,
 which are correct.
 

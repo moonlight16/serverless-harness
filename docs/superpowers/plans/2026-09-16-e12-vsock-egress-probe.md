@@ -4,7 +4,7 @@
 
 **Goal:** Answer one boolean — does a guest-initiated vsock connection on a second port (1025) survive Firecracker snapshot restore, and survive N concurrent restores of one snapshot — with a driver, a KVM-free contract test, a sealed prediction, per-rung JSON records, and a recorded answer.
 
-**Architecture:** A self-contained bash driver (`e12-vsock-egress-probe.sh`) that drives Firecracker directly over its API socket inside a `chroot` jail (not the jailer), in E10's instrumentation style: required `SH_SUBSTRATE`, fail-closed preflight, one JSON record per rung, `die` on an empty record. Four rungs: **A** fresh boot (control), **B** restore once, **C** N concurrent restores (8, then 128), **D** host-initiated 1024 regression fence. Every rung asserts **two independent witnesses** — the nonce arrived host-side on `<jail>/vsock.sock_1025` *and* the ACK came back in guest stdout. Host-side is authoritative; guest stdout is corroboration, never a timing source.
+**Architecture:** A self-contained bash driver (`e12-vsock-egress-probe.sh`) that drives Firecracker directly over its API socket inside a `chroot` jail (not the jailer), in E10's instrumentation style: required `SH_SUBSTRATE`, fail-closed preflight, one JSON record per rung, `die` on an empty record. Four rungs: **A** fresh boot (control), **B** restore once, **C** N concurrent restores (8, then 128), **D** host-initiated 1024 regression fence. Every rung asserts **two independent witnesses** — the nonce arrived host-side on `<jail>/vsock.sock_1025` _and_ the ACK came back in guest stdout. Host-side is authoritative; guest stdout is corroboration, never a timing source.
 
 **Tech Stack:** bash (`set -uo pipefail`, no `-e`), Firecracker v1.17.0 API over `curl --unix-socket`, python3 with `AF_VSOCK` on both host and guest (already present in the golden rootfs), Go (for `guest_client`, built on the rig; `GOTOOLCHAIN=auto` fetches go1.26.0 as `remote-worker/go.mod` requires), vitest 2.1.9 for the prediction pin.
 
@@ -12,29 +12,29 @@
 
 ## Verified facts this plan is built on
 
-Established by reading the rig and the repo before planning. Do not re-derive; **do** re-check the three marked *re-verify* at Task 9 time.
+Established by reading the rig and the repo before planning. Do not re-derive; **do** re-check the three marked _re-verify_ at Task 9 time.
 
-| # | Fact | Consequence |
-| --- | --- | --- |
-| 1 | The golden guest rootfs has **python3.12 with working `AF_VSOCK`** (`socket.VMADDR_CID_HOST == 2`, socket creation succeeds under `chroot`). `manifest.json` declares `"capabilities": ["curl","python3"]`. | **The snapshot rebuild the issue budgeted for is cancelled.** No rootfs change, so no digest change. |
-| 2 | The nested snapshot's `rootfs_sha256` is `sha256:833401a161b75cd43ea3dc231efa01d039dd23d3e8e73eddf63fd88bbcec54d4`, built `2026-09-15T23:35:34Z` — **not** metal's `sha256:668af589…`. | The contamination hazard the issue's substrate section guards against is *structurally absent*: this is already a separate snapshot. |
-| 3 | The guest rootfs also has **working socat 1.8.0.0** (`>= 1.7.4`, so `VSOCK-CONNECT` is supported). | Corrects an earlier note claiming socat was broken with `libwrap.so.0`. python3 remains the primary mechanism (finer control of the two-witness protocol); socat is the documented fallback in Task 4. |
-| 4 | `deploy/microvm/predictions.json` is SHA-256 tamper-sealed by `experiments/test/microvm-predictions.test.ts`, which also hard-asserts `toHaveLength(5)`. | Adding prediction 6 **requires** editing that test in the same commit (Task 1). The test's own docstring authorizes exactly this for a pre-measurement append. |
-| 5 | `deploy/microvm/tests/build-snapshot.test.sh:245-259` greps `write_guest_client`'s body and asserts **statement ordering** inside it. | **Do not refactor `build-snapshot.sh`.** E12 carries its own copies of the jail/API helpers, each with a comment naming its origin. |
-| 6 | E11 ran a density ladder to **128 concurrent** microVMs on this same `nested-m8i` rig with Sigma PSS <= 0.41 GB. | Rung C at N=128 is feasible on 15 GiB. Firecracker's memfile is lazily mapped; 128 x 256 MiB does not commit 32 GiB. |
-| 7 | `build-snapshot.sh` launches Firecracker with plain `chroot "$jail" /firecracker`, **as root, not via the jailer**. | Firecracker's `uds_path: /vsock.sock` maps to host `$jail/vsock.sock`, so the guest-initiated listener is `$jail/vsock.sock_1025`, root-owned. No uid/permission juggling. |
-| 8 | Per `vsock.md`, the guest-initiated direction has **no handshake**: Firecracker connects to `<uds>_<PORT>` and the stream is raw immediately. The socket need only exist at *connect* time, not at config time. | The host listener is a plain `AF_UNIX` accept loop, and it can be started any time before the guest connects. |
-| 9 | The rig (`3.235.29.220`) has Firecracker v1.17.0, `/dev/kvm`, 4 vCPU / 15 GiB, kernel `6.18.44-99.149.amzn2023.x86_64`, Go 1.25.1 with `GOTOOLCHAIN=auto` and working access to `proxy.golang.org`. **No repo checkout exists on it.** | Task 9 must rsync the repo before building `guest_client`. *(re-verify)* |
-| 10 | `Makefile:25`'s `test-deploy` target globs `deploy/microvm/tests/*.test.sh`. | The new test auto-registers. **No Makefile or CI edit is needed.** |
-| 11 | The agent runs commands as `exec.Command(shell, "-c", req.Command)` (`remote-worker/internal/guestagent/agent.go:424`). | `guest_client -command` takes a full shell command line, so a base64-decode pipeline is legal. |
-| 12 | The rig's `/srv/snapshots/default` is present, root-owned, mode `0444`, containing `agent kernel manifest.json memfile rootfs vmstate`. | Every rung hardlinks from it and never writes to it. *(re-verify)* |
-| 13 | `remote-worker/go.mod` declares `go 1.26.0` while the rig's `go` is 1.25.1. `GOTOOLCHAIN=auto` plus reachable `proxy.golang.org` means `go build` self-upgrades. | Not a blocker, but Task 9 asserts the build succeeded rather than assuming it. *(re-verify)* |
+| #   | Fact                                                                                                                                                                                                                                   | Consequence                                                                                                                                                                                            |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1   | The golden guest rootfs has **python3.12 with working `AF_VSOCK`** (`socket.VMADDR_CID_HOST == 2`, socket creation succeeds under `chroot`). `manifest.json` declares `"capabilities": ["curl","python3"]`.                            | **The snapshot rebuild the issue budgeted for is cancelled.** No rootfs change, so no digest change.                                                                                                   |
+| 2   | The nested snapshot's `rootfs_sha256` is `sha256:833401a161b75cd43ea3dc231efa01d039dd23d3e8e73eddf63fd88bbcec54d4`, built `2026-09-15T23:35:34Z` — **not** metal's `sha256:668af589…`.                                                 | The contamination hazard the issue's substrate section guards against is _structurally absent_: this is already a separate snapshot.                                                                   |
+| 3   | The guest rootfs also has **working socat 1.8.0.0** (`>= 1.7.4`, so `VSOCK-CONNECT` is supported).                                                                                                                                     | Corrects an earlier note claiming socat was broken with `libwrap.so.0`. python3 remains the primary mechanism (finer control of the two-witness protocol); socat is the documented fallback in Task 4. |
+| 4   | `deploy/microvm/predictions.json` is SHA-256 tamper-sealed by `experiments/test/microvm-predictions.test.ts`, which also hard-asserts `toHaveLength(5)`.                                                                               | Adding prediction 6 **requires** editing that test in the same commit (Task 1). The test's own docstring authorizes exactly this for a pre-measurement append.                                         |
+| 5   | `deploy/microvm/tests/build-snapshot.test.sh:245-259` greps `write_guest_client`'s body and asserts **statement ordering** inside it.                                                                                                  | **Do not refactor `build-snapshot.sh`.** E12 carries its own copies of the jail/API helpers, each with a comment naming its origin.                                                                    |
+| 6   | E11 ran a density ladder to **128 concurrent** microVMs on this same `nested-m8i` rig with Sigma PSS <= 0.41 GB.                                                                                                                       | Rung C at N=128 is feasible on 15 GiB. Firecracker's memfile is lazily mapped; 128 x 256 MiB does not commit 32 GiB.                                                                                   |
+| 7   | `build-snapshot.sh` launches Firecracker with plain `chroot "$jail" /firecracker`, **as root, not via the jailer**.                                                                                                                    | Firecracker's `uds_path: /vsock.sock` maps to host `$jail/vsock.sock`, so the guest-initiated listener is `$jail/vsock.sock_1025`, root-owned. No uid/permission juggling.                             |
+| 8   | Per `vsock.md`, the guest-initiated direction has **no handshake**: Firecracker connects to `<uds>_<PORT>` and the stream is raw immediately. The socket need only exist at _connect_ time, not at config time.                        | The host listener is a plain `AF_UNIX` accept loop, and it can be started any time before the guest connects.                                                                                          |
+| 9   | The rig (`3.235.29.220`) has Firecracker v1.17.0, `/dev/kvm`, 4 vCPU / 15 GiB, kernel `6.18.44-99.149.amzn2023.x86_64`, Go 1.25.1 with `GOTOOLCHAIN=auto` and working access to `proxy.golang.org`. **No repo checkout exists on it.** | Task 9 must rsync the repo before building `guest_client`. _(re-verify)_                                                                                                                               |
+| 10  | `Makefile:25`'s `test-deploy` target globs `deploy/microvm/tests/*.test.sh`.                                                                                                                                                           | The new test auto-registers. **No Makefile or CI edit is needed.**                                                                                                                                     |
+| 11  | The agent runs commands as `exec.Command(shell, "-c", req.Command)` (`remote-worker/internal/guestagent/agent.go:424`).                                                                                                                | `guest_client -command` takes a full shell command line, so a base64-decode pipeline is legal.                                                                                                         |
+| 12  | The rig's `/srv/snapshots/default` is present, root-owned, mode `0444`, containing `agent kernel manifest.json memfile rootfs vmstate`.                                                                                                | Every rung hardlinks from it and never writes to it. _(re-verify)_                                                                                                                                     |
+| 13  | `remote-worker/go.mod` declares `go 1.26.0` while the rig's `go` is 1.25.1. `GOTOOLCHAIN=auto` plus reachable `proxy.golang.org` means `go build` self-upgrades.                                                                       | Not a blocker, but Task 9 asserts the build succeeded rather than assuming it. _(re-verify)_                                                                                                           |
 
 ## Global Constraints
 
 - `SH_SUBSTRATE` is **required** and must be rig-labelled. Reject bare `nested` explicitly — `EXPERIMENTS.md`/E9 requires the rig label, not the class. The run substrate is `nested-m8i`.
 - **Never write to the golden snapshot.** Hardlink files in, mount rootfs `is_read_only: true`, boot with `ro` in `boot_args`, and verify `rootfs_sha256` against `manifest.json` **before and after every run**, dying on drift. This is the mechanical guard that replaces the issue's "never pass `SH_SUBSTRATE=metal`" name check — see Task 2 Step 7.
-- **No verdict machinery.** E12 has no threshold, no baseline, no ladder analysis. It prints a boolean. It must be *structurally* incapable of printing `STOP` or `MANDATORY` — asserted in the test, not promised in a comment.
+- **No verdict machinery.** E12 has no threshold, no baseline, no ladder analysis. It prints a boolean. It must be _structurally_ incapable of printing `STOP` or `MANDATORY` — asserted in the test, not promised in a comment.
 - `set -uo pipefail`, **not** `-e` — matching both existing drivers.
 - `die()`/`log()` defined **above the first caller** (`e10-lifecycle.sh:128`'s comment explains the failure mode: `die: command not found`, and the script carries on).
 - Every rung writes a JSON record; an empty or unparseable record is a `die` naming the rung and its log (#266's `mem_available_bytes` class of bug).
@@ -47,25 +47,27 @@ Established by reading the rig and the repo before planning. Do not re-derive; *
 
 ## File Structure
 
-| File | Responsibility |
-| --- | --- |
-| `deploy/microvm/predictions.json` | **Modify.** Append prediction id 6 (E12). Sealed before rung A runs. |
-| `experiments/test/microvm-predictions.test.ts` | **Modify.** Bump `PINNED_SHA256`; `toHaveLength(5)` -> `6`; keep every per-prediction falsifier assertion. |
-| `deploy/microvm/e12-vsock-egress-probe.sh` | **Create.** The driver: env contract, preflight, snapshot integrity guard, jail lifecycle, two-witness probe, four rungs, per-rung records, boolean answer. |
+| File                                                  | Responsibility                                                                                                                                               |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `deploy/microvm/predictions.json`                     | **Modify.** Append prediction id 6 (E12). Sealed before rung A runs.                                                                                         |
+| `experiments/test/microvm-predictions.test.ts`        | **Modify.** Bump `PINNED_SHA256`; `toHaveLength(5)` -> `6`; keep every per-prediction falsifier assertion.                                                   |
+| `deploy/microvm/e12-vsock-egress-probe.sh`            | **Create.** The driver: env contract, preflight, snapshot integrity guard, jail lifecycle, two-witness probe, four rungs, per-rung records, boolean answer.  |
 | `deploy/microvm/tests/e12-vsock-egress-probe.test.sh` | **Create.** KVM-free contract tests in `e10-lifecycle.test.sh`'s style (`extract_fn`, `check`, `E12_PROBE_SOURCE_ONLY=1`). Auto-registered by `Makefile:25`. |
-| `deploy/microvm/EXPERIMENTS.md` | **Modify.** Add the E12 section: the answer, and what a nested run can and cannot establish. |
+| `deploy/microvm/EXPERIMENTS.md`                       | **Modify.** Add the E12 section: the answer, and what a nested run can and cannot establish.                                                                 |
 
 ---
 
 ### Task 1: Seal the prediction (must land before any rung runs)
 
-This task exists first and alone because a prediction sealed *after* a result is not a prediction. Nothing in this task touches the driver.
+This task exists first and alone because a prediction sealed _after_ a result is not a prediction. Nothing in this task touches the driver.
 
 **Files:**
+
 - Modify: `deploy/microvm/predictions.json`
 - Modify: `experiments/test/microvm-predictions.test.ts:19` (`PINNED_SHA256`), `:41` (`toHaveLength`)
 
 **Interfaces:**
+
 - Consumes: nothing.
 - Produces: prediction id `6`, read by `pinnedPredictionIds()` in `experiments/src/microvm-density.ts`. `scorePrediction`'s `default` branch already returns `'inconclusive'` for unrecognised ids, so E11's analysis will not crash — an E11 report will simply list `6: inconclusive`. That is a known cosmetic artifact, accepted, and recorded in Task 10's EXPERIMENTS.md text.
 
@@ -84,14 +86,14 @@ Expected: `EXIT:0`, 3 passed. If it is already red, stop — something else is w
 In `deploy/microvm/predictions.json`, append this object to the `predictions` array, after the object with `"id": 5`. Add a comma after id 5's closing brace.
 
 ```json
-    {
-      "id": 6,
-      "experiment": "E12",
-      "claim": "Guest-initiated vsock on a second port (1025) works on a fresh boot and survives snapshot restore, for all N concurrent restores of one snapshot, because the guest-to-host direction needs no handshake and no host-side state beyond the socket file - strictly less state to reset than the host-initiated direction already known to survive.",
-      "metric": "per-rung boolean: the VM's unique nonce captured host-side on <jail>/vsock.sock_1025 AND 'ACK <nonce>' returned in that VM's guest stdout, for rungs A, B, C(N=8), C(N=128), D",
-      "falsifiedBy": "any rung B, C or D reporting ok=false while rung A reported ok=true",
-      "note": "Rung A failing falsifies nothing about Firecracker - it indicts our own plumbing or socket naming, and the probe is retried. Recorded before rung A ran, per issue #271."
-    }
+{
+  "id": 6,
+  "experiment": "E12",
+  "claim": "Guest-initiated vsock on a second port (1025) works on a fresh boot and survives snapshot restore, for all N concurrent restores of one snapshot, because the guest-to-host direction needs no handshake and no host-side state beyond the socket file - strictly less state to reset than the host-initiated direction already known to survive.",
+  "metric": "per-rung boolean: the VM's unique nonce captured host-side on <jail>/vsock.sock_1025 AND 'ACK <nonce>' returned in that VM's guest stdout, for rungs A, B, C(N=8), C(N=128), D",
+  "falsifiedBy": "any rung B, C or D reporting ok=false while rung A reported ok=true",
+  "note": "Rung A failing falsifies nothing about Firecracker - it indicts our own plumbing or socket naming, and the probe is retried. Recorded before rung A ran, per issue #271."
+}
 ```
 
 - [ ] **Step 3: Run the pin test to watch it fail for exactly two reasons**
@@ -177,10 +179,12 @@ MSG
 Builds the driver's skeleton and its test file. No VM is started yet. At the end of this task the driver refuses to run for every wrong reason, correctly.
 
 **Files:**
+
 - Create: `deploy/microvm/e12-vsock-egress-probe.sh`
 - Create: `deploy/microvm/tests/e12-vsock-egress-probe.test.sh`
 
 **Interfaces:**
+
 - Consumes: nothing from Task 1.
 - Produces, for Tasks 3-8:
   - `die(msg)` / `log(msg)` — print to stderr prefixed `e12: `; `die` exits 1.
@@ -292,25 +296,13 @@ pristine_body="$(extract_fn assert_snapshot_pristine || true)"
 check "assert_snapshot_pristine exists" \
   "$([ -n "$pristine_body" ] && echo yes || echo no)" "yes"
 check "it compares against manifest rootfs_sha256" \
-  "$(echo "$pristine_body" | grep -c 'rootfs_sha256')" "1"
+  "$(echo "$pristine_body" | grep -c 'rootfs_sha256')" "2"
 check "it dies on drift" \
   "$([ "$(echo "$pristine_body" | grep -c 'die')" -ge 1 ] && echo yes || echo no)" "yes"
 check "called with a 'before' phase" \
   "$([ "$(grep -c 'assert_snapshot_pristine "\$SNAPSHOT_DIR" before' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 check "called with an 'after' phase" \
   "$([ "$(grep -c 'assert_snapshot_pristine "\$SNAPSHOT_DIR" after' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
-
-echo "== rootfs is mounted read-only and booted ro, so the digest cannot drift by accident"
-# .* skips over however the JSON's quotes happen to be escaped in the bash
-# source (they are backslash-escaped here, since the JSON is embedded inside a
-# double-quoted bash string) - these checks intentionally do not pin the exact
-# escaping, only that each field is set to true on some line of the source.
-check "rootfs drive is_root_device true" \
-  "$([ "$(grep -c 'is_root_device.*true' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
-check "rootfs drive is_read_only true" \
-  "$([ "$(grep -c 'is_read_only.*true' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
-check "boot_args contain ro" \
-  "$([ "$(grep -c 'boot_args.*[^a-z]ro[^a-z]' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 
 echo "== write_json_record dies on an empty or unparseable record (#266's bug class)"
 rec_body="$(extract_fn write_json_record || true)"
@@ -517,7 +509,7 @@ preflight() {
 
 - [ ] **Step 4: Add the source-only guard and a placeholder main at the very end of the driver**
 
-Append to `deploy/microvm/e12-vsock-egress-probe.sh`. Tasks 3-8 insert their functions *above* this block.
+Append to `deploy/microvm/e12-vsock-egress-probe.sh`. Tasks 3-8 insert their functions _above_ this block.
 
 ```bash
 # --- entrypoint --------------------------------------------------------------
@@ -597,10 +589,12 @@ MSG
 Adds the jail primitives every rung needs: prepare, mount `/dev/kvm`, wait for the API socket, teardown. No Firecracker boot yet.
 
 **Files:**
+
 - Modify: `deploy/microvm/e12-vsock-egress-probe.sh` (insert above the `# --- entrypoint ---` block from Task 2 Step 4)
 - Modify: `deploy/microvm/tests/e12-vsock-egress-probe.test.sh` (append)
 
 **Interfaces:**
+
 - Consumes: `die`, `log`, `JAIL_BASE`, `FIRECRACKER_BIN` from Task 2.
 - Produces, for Task 4 onward:
   - `api_put(sock, path, json_body)` — PUT over `curl --unix-socket`.
@@ -631,7 +625,7 @@ link_body="$(extract_fn link_snapshot_into_jail || true)"
 check "no O_WRONLY-shaped redirection into \$SNAPSHOT_DIR" \
   "$(echo "$link_body" | grep -cE '>\s*"?\$SNAPSHOT_DIR')" "0"
 check "uses ln (hardlink), with a cp fallback" \
-  "$([ "$(echo "$link_body" | grep -c '\bln \b')" -ge 1 ] && [ "$(echo "$link_body" | grep -c '\bcp \b')" -ge 1 ] && echo yes || echo no)" "yes"
+  "$([ "$(echo "$link_body" | grep -c '\bln\b')" -ge 1 ] && [ "$(echo "$link_body" | grep -c '\bcp\b')" -ge 1 ] && echo yes || echo no)" "yes"
 
 echo "== teardown_jail kills the VMM and does not leave the jail behind"
 td_body="$(extract_fn teardown_jail || true)"
@@ -801,10 +795,12 @@ MSG
 This is the task that answers the "is this even possible" question. Writes the host-side listener plus the guest-side python3 probe script, both embedded in the driver.
 
 **Files:**
+
 - Modify: `deploy/microvm/e12-vsock-egress-probe.sh` (insert above `# --- entrypoint ---`)
 - Modify: `deploy/microvm/tests/e12-vsock-egress-probe.test.sh` (append)
 
 **Interfaces:**
+
 - Consumes: `PROBE_PORT`, `AGENT_PORT`, `GUEST_CLIENT`, `die`, `log`, `json_escape` from Tasks 2-3.
 - Produces, for Task 5 onward:
   - `start_host_listener(jail, nonce) -> prints "pid:<pid> capture:<path>"` — backgrounds a python3 `AF_UNIX` accept loop on `$jail/vsock.sock_1025`, writes the first line it reads to `<path>`, replies `ACK <nonce>`, then exits.
@@ -813,6 +809,8 @@ This is the task that answers the "is this even possible" question. Writes the h
   - `run_probe_once(jail, vsock_uds, label) -> writes $RESULTS/<label>.json, returns 0/1` — the single-VM two-witness check reused by every rung.
 
 - [ ] **Step 1: Append the failing test section**
+
+Append to `deploy/microvm/tests/e12-vsock-egress-probe.test.sh`, just above the final `echo` / `if [ "$fails" -ne 0 ]` block:
 
 ```bash
 echo "== the two-witness probe: host listener, guest command, and the combining check"
@@ -872,6 +870,33 @@ check "listener replied with the expected ACK" \
 check "listener captured the nonce to its capture file" \
   "$(cat "$listener_tmp/vsock.sock_1025.captured" 2>/dev/null)" "testnonce123"
 rm -rf "$listener_tmp"
+
+echo "== guest_probe_command's wire format matches run_probe_once's own comparisons exactly"
+# The listener test above hand-types "testnonce123" as the client payload,
+# which proves the LISTENER's own accept-reply logic but never exercises what
+# guest_probe_command ACTUALLY tells the guest to send - so a mismatch between
+# the two (e.g. a prefix tag the guest sends that the host-side/run_probe_once
+# comparisons don't expect) would pass every check above while still making
+# every real rung fail. This check decodes guest_probe_command's OWN embedded
+# python source (not a hand-typed stand-in) and confirms it sends the BARE
+# nonce with no prefix, matching run_probe_once's exact-match comparisons
+# (host_nonce = $nonce, and *"ACK $nonce"* against guest_out).
+gpc_body="$(extract_fn guest_probe_command || true)"
+check "guest_probe_command exists" "$([ -n "$gpc_body" ] && echo yes || echo no)" "yes"
+gpc_cmd="$(
+  # guest_probe_command also references $PROBE_PORT (a global normally set
+  # when the whole script is sourced) - same reason as the listener test
+  # above needing it set explicitly in an isolated eval context.
+  PROBE_PORT=1025
+  eval "die() { echo \"e12: \$*\" >&2; exit 1; }"$'\n'"$gpc_body"
+  guest_probe_command "wireformat-check-nonce"
+)"
+gpc_b64="$(printf '%s' "$gpc_cmd" | sed -n 's/^echo \([^ ]*\) | base64 -d.*/\1/p')"
+gpc_decoded="$(printf '%s' "$gpc_b64" | base64 -d 2>/dev/null || true)"
+check "the embedded guest script sends the bare nonce (no tag prefix)" \
+  "$([ "$(echo "$gpc_decoded" | grep -cE 'sendall\(\(nonce \+')" -ge 1 ] && echo yes || echo no)" "yes"
+check "the embedded guest script does NOT prepend any tag before the nonce" \
+  "$(echo "$gpc_decoded" | grep -cE 'sendall\(\("[^"]+" \+ nonce')" "0"
 ```
 
 - [ ] **Step 2: Run the test to verify the new section fails**
@@ -909,7 +934,15 @@ Insert above `# --- entrypoint ---`:
 # "ACK <line>\n", and exits. Firecracker needs no handshake for this direction:
 # the socket only needs to EXIST at connect time.
 start_host_listener() {
-  local jail="$1" nonce="$2" sock="$jail/vsock.sock_${PROBE_PORT}" pyfile
+  # jail/nonce and sock are split into two `local` statements deliberately: a
+  # single `local a="$1" b="$a/x"` does NOT let b see the freshly-assigned a -
+  # bash expands every word of a command (local included) before the command
+  # runs, so "$a" in b's assignment would resolve against whatever a held in
+  # the ENCLOSING scope, not the value just set moments earlier in the same
+  # statement. Under this script's `set -u`, that reads as an unbound
+  # variable rather than merely a wrong value.
+  local jail="$1" nonce="$2" pyfile
+  local sock="$jail/vsock.sock_${PROBE_PORT}"
   pyfile="$jail/.e12-listener.py"
   cat >"$pyfile" <<'PYEOF'
 import socket, sys, os
@@ -931,7 +964,15 @@ conn.sendall(("ACK " + line + "\n").encode())
 conn.close()
 srv.close()
 PYEOF
-  python3 "$pyfile" "$sock" "$sock.captured" &
+  # Redirected, not left to inherit this function's own stdout/stderr: every
+  # caller captures start_host_listener's return value via `out="$(...)"`,
+  # and command substitution does not return until every holder of the
+  # pipe's write end closes it - an unredirected backgrounded child inherits
+  # that write end and keeps it open while blocked in accept(), which hangs
+  # the whole capture forever whenever no client connects in time. Found the
+  # hard way: this masked itself behind an unrelated bug in an earlier round
+  # of this same task, and only surfaced once that bug was fixed.
+  python3 "$pyfile" "$sock" "$sock.captured" >/dev/null 2>&1 &
   local pid=$!
   echo "pid:$pid capture:$sock.captured"
 }
@@ -947,8 +988,12 @@ stop_host_listener() {
 # /tmp via a base64 pipe (the agent runs `sh -c "$req.Command"`, so a pipeline is
 # legal - remote-worker/internal/guestagent/agent.go:424), then runs it. The
 # script connects AF_VSOCK to VMADDR_CID_HOST (2) -- the host, from the guest's
-# point of view, per vsock.md -- on $PROBE_PORT, sends "E12 <nonce>", reads the
-# reply, and prints it to guest stdout so guest_client relays it back to us.
+# point of view, per vsock.md -- on $PROBE_PORT, sends the BARE nonce (no
+# prefix tag - the nonce already starts with "e12-", so a tag would be purely
+# redundant AND would break run_probe_once's own exact-match comparisons
+# below, which compare the captured host-side value and the ACK reply against
+# $nonce verbatim), reads the reply, and prints it to guest stdout so
+# guest_client relays it back to us.
 guest_probe_command() {
   local nonce="$1" b64
   b64="$(cat <<'PYEOF' | base64 | tr -d '\n'
@@ -957,7 +1002,7 @@ nonce, port = sys.argv[1], int(sys.argv[2])
 s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
 s.settimeout(10)
 s.connect((socket.VMADDR_CID_HOST, port))
-s.sendall(("E12 " + nonce + "\n").encode())
+s.sendall((nonce + "\n").encode())
 reply = s.recv(4096).decode(errors="replace").strip()
 print(reply)
 s.close()
@@ -1054,19 +1099,22 @@ MSG
 Adds the two VM-bringup recipes every rung after this one reuses (fresh boot, restore-once), matching `build-snapshot.sh`'s own known-working `boot_quiesce_snapshot_firecracker`/`verify_restore_firecracker` configs exactly, so this task introduces no new risk in the recipe itself — only in what happens after the agent is reachable. Then wires up rung A: fresh boot, no restore, run the two-witness probe, teardown.
 
 **Files:**
+
 - Modify: `deploy/microvm/e12-vsock-egress-probe.sh` (insert above `# --- entrypoint ---`)
 - Modify: `deploy/microvm/tests/e12-vsock-egress-probe.test.sh` (append)
 
 **Interfaces:**
+
 - Consumes: `prepare_jail`, `link_snapshot_into_jail`, `teardown_jail`, `api_put`, `wait_for_socket`, `run_probe_once`, `GUEST_RAM_MB`, `GUEST_CID`, `SNAPSHOT_DIR`, `RESULTS`, `JAIL_BASE` from Tasks 2-4.
 - Produces, for Task 6 onward:
   - `ensure_workspace_image(path)` — `truncate` + `mkfs.ext4`.
   - `wait_for_agent(uds, console_log)` — polls `guest_client -probe-only`.
-  - `boot_fresh_vm(jail) -> prints "uds:<path> pid:<pid> console:<path>"`.
-  - `restore_vm(jail) -> prints "uds:<path> pid:<pid> console:<path>"`.
+  - `boot_fresh_vm(jail)` / `restore_vm(jail)` — called as plain statements, NEVER via `$(...)` (command substitution forks a subshell, and `CLEANUP_PID`/`CLEANUP_JAIL` set inside the call would never propagate back out of it - see the driver's own comment on this at `boot_fresh_vm`'s end). On success, sets `VM_UDS` (the vsock uds path) directly, and leaves `CLEANUP_PID`/`CLEANUP_JAIL` (Task 3) pointing at the just-started process/jail for the caller's own `teardown_jail` call.
   - `run_rung_a()` — the first entry in `RUNGS`' dispatch, called from `main`.
 
 - [ ] **Step 1: Append the failing test section**
+
+Append to `deploy/microvm/tests/e12-vsock-egress-probe.test.sh`, just above the final `echo` / `if [ "$fails" -ne 0 ]` block:
 
 ```bash
 echo "== VM lifecycle helpers exist"
@@ -1083,6 +1131,21 @@ check "boot_fresh_vm calls /actions InstanceStart" \
   "$([ "$(echo "$bfv_body" | grep -c 'InstanceStart')" -ge 1 ] && echo yes || echo no)" "yes"
 check "boot_fresh_vm does NOT call /snapshot/load" \
   "$(echo "$bfv_body" | grep -c '/snapshot/load')" "0"
+
+echo "== boot_fresh_vm mounts rootfs read-only and boots ro, so the digest cannot drift by accident"
+# .* skips over however the JSON's quotes happen to be escaped in the bash
+# source (they are backslash-escaped here, since the JSON is embedded inside a
+# double-quoted bash string) - these checks intentionally do not pin the exact
+# escaping, only that each field is set to true on some line of boot_fresh_vm's
+# own body. Scoped to $bfv_body (not the whole script) since this is what
+# boot_fresh_vm itself configures - restore_vm's drives come from the restored
+# snapshot state instead and carry no boot-source config to check here.
+check "boot_fresh_vm's rootfs drive is_root_device true" \
+  "$([ "$(echo "$bfv_body" | grep -c 'is_root_device.*true')" -ge 1 ] && echo yes || echo no)" "yes"
+check "boot_fresh_vm's rootfs drive is_read_only true" \
+  "$([ "$(echo "$bfv_body" | grep -c 'is_read_only.*true')" -ge 1 ] && echo yes || echo no)" "yes"
+check "boot_fresh_vm's boot_args contain ro" \
+  "$([ "$(echo "$bfv_body" | grep -c 'boot_args.*[^a-z]ro[^a-z]')" -ge 1 ] && echo yes || echo no)" "yes"
 
 echo "== restore_vm loads a snapshot with vsock_override and resume_vm true, and does NOT re-declare boot-source"
 rv_body="$(extract_fn restore_vm || true)"
@@ -1184,7 +1247,17 @@ boot_fresh_vm() {
   api_put "$api_sock" /actions '{"action_type":"InstanceStart"}'
 
   wait_for_agent "$vsock_uds" "$console_log"
-  echo "uds:$vsock_uds pid:$CLEANUP_PID console:$console_log"
+  # Set a global, NOT echoed for the caller to capture via $(...): command
+  # substitution always forks a subshell, and CLEANUP_PID/CLEANUP_JAIL (set a
+  # few lines up, inside THIS call) would never propagate back out of that
+  # subshell to the caller - the caller's own $CLEANUP_PID would stay at
+  # whatever it was BEFORE this call, and teardown_jail would be handed an
+  # empty pid, silently failing to kill the VM while still rm -rf-ing the jail
+  # out from under it. Calling this function as a plain statement (no `$()`)
+  # keeps CLEANUP_PID/CLEANUP_JAIL/VM_UDS in the CALLER's own shell, where the
+  # top-level `trap cleanup_on_exit EXIT` (Task 3) can also see them if the
+  # script dies before an explicit teardown_jail call runs.
+  VM_UDS="$vsock_uds"
 }
 
 # restore_vm loads the golden vmstate+memfile into a fresh jail. vsock_override
@@ -1212,7 +1285,9 @@ restore_vm() {
     "{\"snapshot_path\":\"/vmstate\",\"mem_backend\":{\"backend_path\":\"/memfile\",\"backend_type\":\"File\"},\"vsock_override\":{\"uds_path\":\"/vsock.sock\"},\"resume_vm\":true}"
 
   wait_for_agent "$vsock_uds" "$console_log"
-  echo "uds:$vsock_uds pid:$CLEANUP_PID console:$console_log"
+  # See boot_fresh_vm's identical comment above: a global, not an echoed
+  # value, for exactly the same subshell-scoping reason.
+  VM_UDS="$vsock_uds"
 }
 
 # --- rung A: fresh boot, no restore (the control) -----------------------------
@@ -1222,11 +1297,12 @@ restore_vm() {
 run_rung_a() {
   local jail="$JAIL_BASE/rung-a"
   rm -rf "$jail"
-  local vm_out uds
-  vm_out="$(boot_fresh_vm "$jail")" || die "rung-A: boot_fresh_vm failed"
-  uds="${vm_out#uds:}"; uds="${uds%% pid:*}"
+  # Called as a plain statement, NOT captured via $(...) - see boot_fresh_vm's
+  # own comment on why: this keeps VM_UDS/CLEANUP_PID in THIS function's own
+  # shell rather than losing them to a vanished subshell.
+  boot_fresh_vm "$jail" || die "rung-A: boot_fresh_vm failed"
   local ok=0
-  run_probe_once "$jail" "$uds" "rung-A" || ok=1
+  run_probe_once "$jail" "$VM_UDS" "rung-A" || ok=1
   teardown_jail "$jail" "$CLEANUP_PID"
   return "$ok"
 }
@@ -1259,6 +1335,14 @@ restore_vm's vsock_override rewrites uds_path to the CALLING jail's own
 additional socket-naming scheme: chroot already gives every jail its own
 filesystem namespace.
 
+Both functions return their vsock uds path via a global (VM_UDS), never via
+`echo` captured through $(...): command substitution forks a subshell, and
+CLEANUP_PID/CLEANUP_JAIL (set inside the call, a few lines up) would never
+propagate back out of it to the caller - teardown_jail would then be handed
+an empty pid, failing to kill the VM while still rm -rf-ing the jail out from
+under it. Every caller (rung A here; rungs B/C/D in later tasks) calls these
+as plain statements for exactly this reason.
+
 Rung A: fresh boot, run the two-witness probe, teardown. This is the control -
 if it fails, the failure is our plumbing, not Firecracker's restore mechanism,
 because no restore has happened yet.
@@ -1274,14 +1358,18 @@ MSG
 The rung the whole issue is about: does the guest-initiated second port survive a single restore.
 
 **Files:**
+
 - Modify: `deploy/microvm/e12-vsock-egress-probe.sh` (insert above `# --- entrypoint ---`)
 - Modify: `deploy/microvm/tests/e12-vsock-egress-probe.test.sh` (append)
 
 **Interfaces:**
-- Consumes: `restore_vm`, `run_probe_once`, `teardown_jail`, `JAIL_BASE` from Tasks 2-5.
+
+- Consumes: `restore_vm` (called as a plain statement, never via `$(...)` — it sets `VM_UDS`/`CLEANUP_PID`/`CLEANUP_JAIL` directly, which a command-substitution subshell would swallow), `run_probe_once`, `teardown_jail`, `JAIL_BASE` from Tasks 2-5.
 - Produces: `run_rung_b()`, called from `main` (wired in Task 8).
 
 - [ ] **Step 1: Append the failing test section**
+
+Append to `deploy/microvm/tests/e12-vsock-egress-probe.test.sh`, just above the final `echo` / `if [ "$fails" -ne 0 ]` block:
 
 ```bash
 echo "== run_rung_b restores (not fresh-boots), runs the probe, and tears down"
@@ -1315,11 +1403,11 @@ Insert above `# --- entrypoint ---`:
 run_rung_b() {
   local jail="$JAIL_BASE/rung-b"
   rm -rf "$jail"
-  local vm_out uds
-  vm_out="$(restore_vm "$jail")" || die "rung-B: restore_vm failed"
-  uds="${vm_out#uds:}"; uds="${uds%% pid:*}"
+  # Plain statement, not $(...) - see Task 5's comment on why (the function
+  # this calls sets globals a subshell would otherwise swallow).
+  restore_vm "$jail" || die "rung-B: restore_vm failed"
   local ok=0
-  run_probe_once "$jail" "$uds" "rung-B" || ok=1
+  run_probe_once "$jail" "$VM_UDS" "rung-B" || ok=1
   teardown_jail "$jail" "$CLEANUP_PID"
   return "$ok"
 }
@@ -1359,14 +1447,18 @@ MSG
 Catches per-restore collisions and confirms `vsock_override`'s jail-relative rewrite behaves correctly at the ladder top. Concurrent, not sequential (per the design decision): all N microVMs are restored and alive at once, all connecting on 1025, before any is torn down.
 
 **Files:**
+
 - Modify: `deploy/microvm/e12-vsock-egress-probe.sh` (insert above `# --- entrypoint ---`)
 - Modify: `deploy/microvm/tests/e12-vsock-egress-probe.test.sh` (append)
 
 **Interfaces:**
-- Consumes: `restore_vm`, `run_probe_once`, `teardown_jail`, `write_json_record`, `C_LADDER`, `JAIL_BASE`, `RESULTS` from Tasks 2-6.
+
+- Consumes: `restore_vm` (called as a plain statement, or with only a plain `2>` redirect — never via `$(...)`, per Task 5's VM_UDS/CLEANUP_PID comment), `run_probe_once`, `teardown_jail`, `write_json_record`, `C_LADDER`, `JAIL_BASE`, `RESULTS` from Tasks 2-6.
 - Produces: `run_rung_c_n(n)` — restores `n` VMs concurrently, waits for all, aggregates. `run_rung_c()` — loops `run_rung_c_n` over `C_LADDER` ("8 128"), called from `main` (wired in Task 8).
 
 - [ ] **Step 1: Append the failing test section**
+
+Append to `deploy/microvm/tests/e12-vsock-egress-probe.test.sh`, just above the final `echo` / `if [ "$fails" -ne 0 ]` block:
 
 ```bash
 echo "== run_rung_c_n launches N concurrently (background jobs), not sequentially"
@@ -1424,14 +1516,18 @@ run_rung_c_n() {
     rm -rf "$jail"
     jails+=("$jail")
     (
-      local vm_out uds rc=0
-      vm_out="$(restore_vm "$jail" 2>"$jail.boot.log")" || {
+      local rc=0
+      # A plain redirect on a function call (2>"...") does NOT fork a
+      # subshell by itself - only $(...) does - so restore_vm's
+      # VM_UDS/CLEANUP_PID/CLEANUP_JAIL side effects stay visible in THIS
+      # per-VM subshell's own scope below. See boot_fresh_vm's comment
+      # (Task 5) for why $(...) would have broken that.
+      restore_vm "$jail" 2>"$jail.boot.log" || {
         write_json_record "$RESULTS/rung-C-${n}-${i}.json" \
           "{\"rung\":\"rung-C-${n}-${i}\",\"ok\":false,\"error\":\"restore_vm failed\"}"
         exit 1
       }
-      uds="${vm_out#uds:}"; uds="${uds%% pid:*}"
-      run_probe_once "$jail" "$uds" "rung-C-${n}-${i}" || rc=1
+      run_probe_once "$jail" "$VM_UDS" "rung-C-${n}-${i}" || rc=1
       teardown_jail "$jail" "$CLEANUP_PID"
       exit "$rc"
     ) &
@@ -1525,14 +1621,18 @@ MSG
 Rung D confirms adding the 1025 listener does not break the mechanism P4 already ships on (host-initiated Exec over vsock:1024). Then `main` is rewritten from Task 2's placeholder into real dispatch: run every requested rung, aggregate, print the one-line boolean answer, and verify the snapshot digest one final time.
 
 **Files:**
+
 - Modify: `deploy/microvm/e12-vsock-egress-probe.sh` (insert `run_rung_d` above `# --- entrypoint ---`; replace the `main` body inside that block)
 - Modify: `deploy/microvm/tests/e12-vsock-egress-probe.test.sh` (append)
 
 **Interfaces:**
-- Consumes: `restore_vm`, `start_host_listener`, `stop_host_listener`, `teardown_jail`, `write_json_record`, `wants_rung`, `run_rung_a/b/c` from Tasks 2-7.
+
+- Consumes: `restore_vm` (called as a plain statement, never via `$(...)`, per Task 5's VM_UDS/CLEANUP_PID comment), `start_host_listener`, `stop_host_listener`, `teardown_jail`, `write_json_record`, `wants_rung`, `run_rung_a/b/c` from Tasks 2-7.
 - Produces: `run_rung_d()`. Rewritten `main()` — still guarded by `E12_PROBE_SOURCE_ONLY`, still calls `preflight` and `assert_snapshot_pristine ... before/after`, now also dispatches rungs and prints the answer.
 
 - [ ] **Step 1: Append the failing test section**
+
+Append to `deploy/microvm/tests/e12-vsock-egress-probe.test.sh`, just above the final `echo` / `if [ "$fails" -ne 0 ]` block:
 
 ```bash
 echo "== run_rung_d confirms port 1024 still works with 1025 present"
@@ -1582,16 +1682,16 @@ Expected: `FAIL: run_rung_d exists`.
 run_rung_d() {
   local jail="$JAIL_BASE/rung-d"
   rm -rf "$jail"
-  local vm_out uds
-  vm_out="$(restore_vm "$jail")" || die "rung-D: restore_vm failed"
-  uds="${vm_out#uds:}"; uds="${uds%% pid:*}"
+  # Plain statement, not $(...) - see Task 5's comment on why (the function
+  # this calls sets globals a subshell would otherwise swallow).
+  restore_vm "$jail" || die "rung-D: restore_vm failed"
 
   local listener_out lpid
   listener_out="$(start_host_listener "$jail" "rung-d-unused")"
   lpid="${listener_out#pid:}"; lpid="${lpid%% capture:*}"
 
   local exit_code=0
-  "$GUEST_CLIENT" -uds "$uds" -port "$AGENT_PORT" -timeout-s 15 -command true >/dev/null 2>&1 ||
+  "$GUEST_CLIENT" -uds "$VM_UDS" -port "$AGENT_PORT" -timeout-s 15 -command true >/dev/null 2>&1 ||
     exit_code=$?
 
   stop_host_listener "$lpid"
@@ -1656,7 +1756,7 @@ Expected: `EXIT:0`, `all checks passed`.
 
 ```bash
 bash deploy/microvm/tests/e12-vsock-egress-probe.test.sh > "$LOG_DIR/t8-full.log" 2>&1; echo "EXIT:$?"
-shellcheck deploy/microvm/e12-vsock-egress-probe.sh deploy/microvm/tests/e12-vsock-egress-probe.test.sh > "$LOG_DIR/t8-shellcheck.log" 2>&1; echo "SHELLCHECK_EXIT:$?"
+shellcheck -x -S warning deploy/microvm/e12-vsock-egress-probe.sh deploy/microvm/tests/e12-vsock-egress-probe.test.sh > "$LOG_DIR/t8-shellcheck.log" 2>&1; echo "SHELLCHECK_EXIT:$?"
 cat "$LOG_DIR/t8-shellcheck.log"
 pre-commit run --files deploy/microvm/e12-vsock-egress-probe.sh deploy/microvm/tests/e12-vsock-egress-probe.test.sh > "$LOG_DIR/t8-precommit.log" 2>&1; echo "PRECOMMIT_EXIT:$?"
 cat "$LOG_DIR/t8-precommit.log"
@@ -1694,9 +1794,11 @@ MSG
 `build-snapshot.sh` generates `guest_client.go` into a throwaway temp package at run time (its `write_guest_client`, so its own module-internal import of `internal/guestagent` is legal). E12 needs the exact same binary but is not `build-snapshot.sh` — rather than shelling out to that function (which would reach across scripts and reintroduce the coupling Task 2's header explicitly avoids), this task commits the client as its own small `cmd` package, matching how `cmd/vmpoolctl` already sits alongside the library it drives. It builds and `go vet`s with no KVM and no snapshot — pure Go.
 
 **Files:**
+
 - Create: `remote-worker/cmd/e12-guest-client/main.go`
 
 **Interfaces:**
+
 - Consumes: `remote-worker/internal/guestagent` (`ga.Request`, `ga.WriteJSON`, `ga.WriteFrame`, `ga.ReadFrame`, `ga.KindRequest`, `ga.KindStdinEOF`, `ga.KindStdout`, `ga.KindStderr`, `ga.KindEnd`, `ga.KindError`, `ga.End`, `ga.MaxFrame`) — already exported and used identically by `build-snapshot.sh`'s own copy and by `cmd/vmpoolctl`.
 - Produces: the `guest_client` binary Task 10's rig run points `SH_GUEST_CLIENT` at.
 
@@ -1796,9 +1898,16 @@ func main() {
 
 // dialGuest performs the VMM's vsock Unix-socket CONNECT handshake and returns the
 // resulting duplex connection. Copied unchanged from build-snapshot.sh's own
-// guest_client.go (same comment: verify against the VMM's current vsock
-// documentation when this runs for real, since it cannot be exercised without a
-// hypervisor).
+// guest_client.go, INCLUDING its readLine helper below - not simplified to a bulk
+// conn.Read(buf), because a bulk read can consume bytes belonging to the guest
+// agent's OWN first protocol frame if it answers fast enough to already be in
+// flight right behind the ack. remote-worker/internal/vmpool/vsock.go's dialVsock
+// hits this exact race and wraps its connection in a handshakeConn to replay any
+// over-read bytes; build-snapshot.sh instead reads the ack strictly byte-by-byte so
+// there is nothing to over-read in the first place. This file follows that second,
+// simpler approach - never re-simplify readLine back into a bulk conn.Read, and
+// never drop the read deadline around it (an ack that never arrives would
+// otherwise hang this client forever despite -dial-timeout implying it can't).
 func dialGuest(uds string, port uint32, timeout time.Duration) (net.Conn, error) {
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.Dial("unix", uds)
@@ -1809,18 +1918,40 @@ func dialGuest(uds string, port uint32, timeout time.Duration) (net.Conn, error)
 		conn.Close()
 		return nil, fmt.Errorf("send CONNECT: %w", err)
 	}
-	buf := make([]byte, 64)
-	n, err := conn.Read(buf)
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	line, err := readLine(conn)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("read CONNECT ack: %w", err)
 	}
-	line := strings.TrimSpace(string(buf[:n]))
-	if line != "OK "+fmt.Sprint(port) && !strings.HasPrefix(line, "OK") {
+	if !strings.HasPrefix(line, "OK") {
 		conn.Close()
 		return nil, fmt.Errorf("CONNECT %d refused: %q", port, line)
 	}
+	_ = conn.SetReadDeadline(time.Time{})
 	return conn, nil
+}
+
+// readLine reads byte-by-byte until '\n' - copied unchanged from
+// build-snapshot.sh's own helper of the same name. Deliberately NOT a
+// bufio.Reader or a bulk conn.Read: either can read past the '\n' into the
+// guest agent's own first protocol frame, and this connection is handed
+// straight to ga.ReadFrame afterward with no mechanism to replay over-read
+// bytes (unlike remote-worker/internal/vmpool/vsock.go's handshakeConn, which
+// exists specifically to solve that problem for a different caller). Slow by
+// design, on a handshake line of a few bytes this cost is immaterial.
+func readLine(conn net.Conn) (string, error) {
+	buf := make([]byte, 0, 64)
+	one := make([]byte, 1)
+	for {
+		if _, err := conn.Read(one); err != nil {
+			return "", err
+		}
+		if one[0] == '\n' {
+			return string(buf), nil
+		}
+		buf = append(buf, one[0])
+	}
 }
 ```
 
@@ -1889,6 +2020,7 @@ Everything up to here builds and tests without KVM. This task is the first one t
 **Files:** none (this task produces run artifacts under `$SH_E12_RESULTS` on the rig, pulled back into the local repo checkout at `deploy/microvm/e12-results/` for Task 11 — not committed as source, committed as evidence).
 
 **Interfaces:**
+
 - Consumes: the driver and `guest_client` package from Tasks 2-9.
 - Produces: `deploy/microvm/e12-results/*.json` (one file per rung record plus `e12-answer.json`), `deploy/microvm/e12-results/run.log`.
 
@@ -2046,9 +2178,11 @@ MSG
 Writes the E12 section from the **actual** `deploy/microvm/e12-results/*.json` files committed in Task 10 — never from memory of what "should" happen. The two templates below cover both possible answers; use whichever one `e12-answer.json`'s `"ok"` field actually says, filling every bracketed value from the real JSON files, not from this plan.
 
 **Files:**
+
 - Modify: `deploy/microvm/EXPERIMENTS.md` (append after the `## Performance rungs` section, i.e. after E11's "Open items carried into the metal run" subsection)
 
 **Interfaces:**
+
 - Consumes: `deploy/microvm/e12-results/*.json` from Task 10.
 - Produces: nothing further consumes this — it is the terminal deliverable.
 
@@ -2080,13 +2214,13 @@ nonce captured host-side on `<jail>/vsock.sock_1025`, AND the ACK read back in
 guest stdout via the existing agent Exec path on vsock:1024. Neither witness
 alone was treated as evidence.
 
-| Rung | What | Result |
-| --- | --- | --- |
-| A (control, fresh boot) | [host_witness]/[guest_witness] | ok=[value] |
-| B (restore once) | [host_witness]/[guest_witness] | ok=[value] |
-| C (N=8 concurrent restores) | ok_count=[value] fail_count=[value] nonce_collisions=[value] | ok=[value] |
-| C (N=128 concurrent restores) | ok_count=[value] fail_count=[value] nonce_collisions=[value] | ok=[value] |
-| D (host-initiated 1024 with 1025 present) | guest_client_exit=[value] | ok=[value] |
+| Rung                                      | What                                                         | Result     |
+| ----------------------------------------- | ------------------------------------------------------------ | ---------- |
+| A (control, fresh boot)                   | [host_witness]/[guest_witness]                               | ok=[value] |
+| B (restore once)                          | [host_witness]/[guest_witness]                               | ok=[value] |
+| C (N=8 concurrent restores)               | ok_count=[value] fail_count=[value] nonce_collisions=[value] | ok=[value] |
+| C (N=128 concurrent restores)             | ok_count=[value] fail_count=[value] nonce_collisions=[value] | ok=[value] |
+| D (host-initiated 1024 with 1025 present) | guest_client_exit=[value]                                    | ok=[value] |
 
 Full per-rung and per-VM records: `deploy/microvm/e12-results/`.
 
@@ -2142,13 +2276,13 @@ below before generalizing this to "the mechanism does not work").
 
 #### What was actually tested, and where it broke
 
-| Rung | What | Result |
-| --- | --- | --- |
-| A (control, fresh boot) | [host_witness]/[guest_witness] | ok=[value] |
-| B (restore once) | [host_witness]/[guest_witness] | ok=[value] |
-| C (N=8 concurrent restores) | ok_count=[value] fail_count=[value] nonce_collisions=[value] | ok=[value] |
-| C (N=128 concurrent restores) | ok_count=[value] fail_count=[value] nonce_collisions=[value] | ok=[value] |
-| D (host-initiated 1024 with 1025 present) | guest_client_exit=[value] | ok=[value] |
+| Rung                                      | What                                                         | Result     |
+| ----------------------------------------- | ------------------------------------------------------------ | ---------- |
+| A (control, fresh boot)                   | [host_witness]/[guest_witness]                               | ok=[value] |
+| B (restore once)                          | [host_witness]/[guest_witness]                               | ok=[value] |
+| C (N=8 concurrent restores)               | ok_count=[value] fail_count=[value] nonce_collisions=[value] | ok=[value] |
+| C (N=128 concurrent restores)             | ok_count=[value] fail_count=[value] nonce_collisions=[value] | ok=[value] |
+| D (host-initiated 1024 with 1025 present) | guest_client_exit=[value]                                    | ok=[value] |
 
 Full per-rung and per-VM records: `deploy/microvm/e12-results/`.
 
