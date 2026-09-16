@@ -1,0 +1,1 @@
+{"rung":"rung-C-128-102","ok":false,"nonce":"e12-rung-C-128-102-538358-21425","host_witness":"no","guest_witness":"no","guest_client_exit":1,"guest_output":"e12-guest-client: read CONNECT ack: read unix @->/vsock.sock: read: connection reset by peer"}
