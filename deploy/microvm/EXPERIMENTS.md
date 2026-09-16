@@ -904,21 +904,21 @@ one snapshot, there is a real, non-zero, non-deterministic failure rate on
 this 4-vCPU rig — a distinct scale/capacity finding, not evidence against the
 restore mechanism itself. `main()` ANDs every rung together, so C@128's
 failure alone flips the run's top-level `ok` to `false`
-(`deploy/microvm/e12-results/e12-answer.json`:
-`{"substrate":"nested-m8i","rungs_run":"A B C D","ok":false}`) even though
-three of the four rungs, and C's own N=8 point, are unanimous passes.
+(`e12-answer.json` from the run: `{"substrate":"nested-m8i","rungs_run":"A B
+C D","ok":false}`) even though three of the four rungs, and C's own N=8
+point, are unanimous passes.
 
 #### What was actually tested, on `nested-m8i`, in two passes
 
 Rungs A, B, C(N=8), C(N=128) and D were first run standalone (Steps 3-7 of
 this task), then again together in one script invocation as the
-authoritative combined run (Step 8) — the numbers actually committed at
-`deploy/microvm/e12-results/`. Every connection required TWO INDEPENDENT
-witnesses: the nonce captured host-side on `<jail>/vsock.sock_1025`, AND the
-ACK read back in guest stdout via the existing agent Exec path on
-vsock:1024. Neither witness alone was treated as evidence.
+authoritative combined run (Step 8). Every connection required TWO
+INDEPENDENT witnesses: the nonce captured host-side on
+`<jail>/vsock.sock_1025`, AND the ACK read back in guest stdout via the
+existing agent Exec path on vsock:1024. Neither witness alone was treated as
+evidence.
 
-| Rung                                                        | Standalone                                                          | Combined (authoritative, committed)                                                                                                                                    |
+| Rung                                                        | Standalone                                                          | Combined (authoritative)                                                                                                                                               |
 | ----------------------------------------------------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | A (fresh boot, control)                                     | ok=true, both witnesses yes                                         | ok=true, both witnesses yes                                                                                                                                            |
 | B (single restore — the core question)                      | ok=true, both witnesses yes                                         | ok=true, both witnesses yes                                                                                                                                            |
@@ -926,10 +926,9 @@ vsock:1024. Neither witness alone was treated as evidence.
 | C, N=128 concurrent restores                                | ok=false, 127/128 (1 failure: `guest_client_exit=1`, `"read: EOF"`) | ok=false, 76/128 (52 failures: 45× `"read: EOF"`, 2× `"connection refused"`, 1× `"connection reset by peer"`, all `guest_client_exit=1` relay-level connection errors) |
 | D (regression fence: host-initiated 1024 with 1025 present) | ok=true                                                             | ok=true                                                                                                                                                                |
 
-Full per-rung and per-VM records: `deploy/microvm/e12-results/` (the combined
-pass; `e12-answer.json`, `rung-A.json`, `rung-B.json`, `rung-C-8.json`,
-`rung-C-128.json`, `rung-C-8-*.json`, `rung-C-128-*.json`, `rung-D.json`,
-`run.log`).
+The per-rung and per-VM JSON records and the run log are rig artifacts, not
+committed to this repo (`deploy/microvm/e12-results/` is gitignored) — the
+numbers above are the complete record of what they showed.
 
 All observed C@128 failures are `guest_client`-relay-level connection errors
 (EOF, connection refused, connection reset) — none show the signature of the
@@ -978,12 +977,11 @@ driver (not a counting bug, and not a defect in the answer itself): the four
 missing indices are failures whose specific cause (which `die` fired, and
 where) was captured at run time in each VM's own `.boot.log` file (the
 redirect target of `restore_vm`'s stderr above), named
-`$JAIL_BASE/rung-c-128-<i>.boot.log` for the failing index `<i>` — it is just
-not archived in the committed results directory (`deploy/microvm/e12-results/`).
-It is not being fixed as part of this plan — hardening the per-VM diagnostic path
-and archiving these logs is beyond this throwaway probe's scope,
-and does not cast doubt on the `ok_count`/`fail_count` numbers themselves,
-which are correct.
+`$JAIL_BASE/rung-c-128-<i>.boot.log` for the failing index `<i>` — a rig
+artifact this repo does not archive. It is not being fixed as part of this
+plan — hardening the per-VM diagnostic path and archiving these logs is
+beyond this throwaway probe's scope, and does not cast doubt on the
+`ok_count`/`fail_count` numbers themselves, which are correct.
 
 #### What a nested run establishes here, and what it does not
 

@@ -3,6 +3,11 @@ dist/
 *.log
 .pi/
 
+# Raw per-run experiment output - EXPERIMENTS.md carries the numbers that
+# matter; the underlying per-VM JSON/log files are throwaway rig artifacts,
+# not evidence to keep in git.
+deploy/microvm/e12-results/
+
 # Secrets and credentials
 .env
 .env.*
