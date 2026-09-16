@@ -407,6 +407,129 @@ run_probe_once() {
   [ "$ok" = true ]
 }
 
+# --- VM lifecycle: fresh boot and restore -------------------------------------
+# Both recipes below match build-snapshot.sh's own boot_quiesce_snapshot_firecracker
+# and verify_restore_firecracker exactly (drive config, vsock config, machine-config,
+# the vsock_override shape) rather than reinventing them: those recipes are the ones
+# already proven to work on this exact rig, so any failure here is about what E12
+# adds (the second port), not about basic VM bringup.
+
+ensure_workspace_image() {
+  local path="$1"
+  truncate -s $((2 * 1024 * 1024 * 1024)) "$path" ||
+    die "could not truncate workspace image at $path"
+  mkfs.ext4 -q -F "$path" >/dev/null || die "could not mkfs.ext4 the workspace image at $path"
+}
+
+wait_for_agent() {
+  local uds="$1" console_log="$2" waited=0
+  while [ "$waited" -lt 120 ]; do
+    if [ -f "$console_log" ] && grep -q "parked in accept()" "$console_log" 2>/dev/null; then
+      return 0
+    fi
+    if "$GUEST_CLIENT" -uds "$uds" -port "$AGENT_PORT" -probe-only -dial-timeout 1s 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  log "console log for the guest agent that never became reachable:"
+  cat "$console_log" >&2 2>/dev/null || true
+  die "guest agent never became reachable on vsock:$AGENT_PORT within 120s"
+}
+
+# boot_fresh_vm brings up a brand-new VM from the golden kernel+rootfs (no
+# vmstate, no memfile - this is rung A, the control). rootfs is mounted
+# is_read_only:true and boot_args carries `ro`, matching the Global Constraints'
+# "never write to the golden snapshot" guard for the case where the snapshot's
+# rootfs is used directly rather than via restore.
+boot_fresh_vm() {
+  local jail="$1"
+  local api_sock="$jail/run/firecracker.socket" vsock_uds="$jail/vsock.sock" \
+    console_log="$jail/console.log"
+  prepare_jail "$jail"
+  ln "$SNAPSHOT_DIR/kernel" "$jail/kernel" 2>/dev/null || cp -p "$SNAPSHOT_DIR/kernel" "$jail/kernel"
+  ln "$SNAPSHOT_DIR/rootfs" "$jail/rootfs" 2>/dev/null || cp -p "$SNAPSHOT_DIR/rootfs" "$jail/rootfs"
+  ensure_workspace_image "$jail/workspace.img"
+
+  chroot "$jail" /firecracker --api-sock /run/firecracker.socket \
+    </dev/null >"$console_log" 2>&1 &
+  CLEANUP_PID=$!
+
+  wait_for_socket "$api_sock" "$console_log"
+  api_put "$api_sock" /boot-source \
+    "{\"kernel_image_path\":\"/kernel\",\"boot_args\":\"console=ttyS0 ro reboot=k panic=1 pci=off\"}"
+  api_put "$api_sock" /drives/rootfs \
+    "{\"drive_id\":\"rootfs\",\"path_on_host\":\"/rootfs\",\"is_root_device\":true,\"is_read_only\":true}"
+  api_put "$api_sock" /drives/workspace \
+    "{\"drive_id\":\"workspace\",\"path_on_host\":\"/workspace.img\",\"is_root_device\":false,\"is_read_only\":false}"
+  api_put "$api_sock" /vsock \
+    "{\"vsock_id\":\"vsock0\",\"guest_cid\":$GUEST_CID,\"uds_path\":\"/vsock.sock\"}"
+  api_put "$api_sock" /machine-config \
+    "{\"mem_size_mib\":$GUEST_RAM_MB,\"vcpu_count\":1}"
+  api_put "$api_sock" /actions '{"action_type":"InstanceStart"}'
+
+  wait_for_agent "$vsock_uds" "$console_log"
+  # Set a global, NOT echoed for the caller to capture via $(...): command
+  # substitution always forks a subshell, and CLEANUP_PID/CLEANUP_JAIL (set a
+  # few lines up, inside THIS call) would never propagate back out of that
+  # subshell to the caller - the caller's own $CLEANUP_PID would stay at
+  # whatever it was BEFORE this call, and teardown_jail would be handed an
+  # empty pid, silently failing to kill the VM while still rm -rf-ing the jail
+  # out from under it. Calling this function as a plain statement (no `$()`)
+  # keeps CLEANUP_PID/CLEANUP_JAIL/VM_UDS in the CALLER's own shell, where the
+  # top-level `trap cleanup_on_exit EXIT` (Task 3) can also see them if the
+  # script dies before an explicit teardown_jail call runs.
+  VM_UDS="$vsock_uds"
+}
+
+# restore_vm loads the golden vmstate+memfile into a fresh jail. vsock_override
+# rewrites uds_path to this jail's OWN /vsock.sock (jail-relative, so every jail
+# - even N of them concurrently under rung C - gets an independent socket with no
+# collision, since chroot gives each one its own filesystem namespace). No
+# /boot-source, /drives or /machine-config calls: restore carries all of that
+# state already, and repeating them is rejected once InstanceStart has occurred
+# once against those resources - build-snapshot.sh's own comment on this
+# (fix-round-8) is why this function does not attempt it.
+restore_vm() {
+  local jail="$1"
+  local api_sock="$jail/run/firecracker.socket" vsock_uds="$jail/vsock.sock" \
+    console_log="$jail/console.log"
+  prepare_jail "$jail"
+  link_snapshot_into_jail "$jail"
+  ensure_workspace_image "$jail/workspace.img"
+
+  chroot "$jail" /firecracker --api-sock /run/firecracker.socket \
+    </dev/null >"$console_log" 2>&1 &
+  CLEANUP_PID=$!
+
+  wait_for_socket "$api_sock" "$console_log"
+  api_put "$api_sock" /snapshot/load \
+    "{\"snapshot_path\":\"/vmstate\",\"mem_backend\":{\"backend_path\":\"/memfile\",\"backend_type\":\"File\"},\"vsock_override\":{\"uds_path\":\"/vsock.sock\"},\"resume_vm\":true}"
+
+  wait_for_agent "$vsock_uds" "$console_log"
+  # See boot_fresh_vm's identical comment above: a global, not an echoed
+  # value, for exactly the same subshell-scoping reason.
+  VM_UDS="$vsock_uds"
+}
+
+# --- rung A: fresh boot, no restore (the control) -----------------------------
+# If this rung fails, the failure is our plumbing or the socket naming - NOT
+# Firecracker's restore mechanism - because no restore happened yet. Without a
+# passing rung A, a failure at rung B is uninterpretable.
+run_rung_a() {
+  local jail="$JAIL_BASE/rung-a"
+  rm -rf "$jail"
+  # Called as a plain statement, NOT captured via $(...) - see boot_fresh_vm's
+  # own comment on why: this keeps VM_UDS/CLEANUP_PID in THIS function's own
+  # shell rather than losing them to a vanished subshell.
+  boot_fresh_vm "$jail" || die "rung-A: boot_fresh_vm failed"
+  local ok=0
+  run_probe_once "$jail" "$VM_UDS" "rung-A" || ok=1
+  teardown_jail "$jail" "$CLEANUP_PID"
+  return "$ok"
+}
+
 # --- entrypoint --------------------------------------------------------------
 main() {
   preflight

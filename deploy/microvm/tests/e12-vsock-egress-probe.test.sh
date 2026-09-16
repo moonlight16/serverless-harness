@@ -204,6 +204,58 @@ check "listener captured the nonce to its capture file" \
   "$(cat "$listener_tmp/vsock.sock_1025.captured" 2>/dev/null)" "testnonce123"
 rm -rf "$listener_tmp"
 
+echo "== VM lifecycle helpers exist"
+for fn in ensure_workspace_image wait_for_agent boot_fresh_vm restore_vm run_rung_a; do
+  body="$(extract_fn "$fn" || true)"
+  check "$fn exists" "$([ -n "$body" ] && echo yes || echo no)" "yes"
+done
+
+echo "== boot_fresh_vm configures rootfs read-only and does NOT load a snapshot"
+bfv_body="$(extract_fn boot_fresh_vm || true)"
+check "boot_fresh_vm calls /boot-source" \
+  "$([ "$(echo "$bfv_body" | grep -c '/boot-source')" -ge 1 ] && echo yes || echo no)" "yes"
+check "boot_fresh_vm calls /actions InstanceStart" \
+  "$([ "$(echo "$bfv_body" | grep -c 'InstanceStart')" -ge 1 ] && echo yes || echo no)" "yes"
+check "boot_fresh_vm does NOT call /snapshot/load" \
+  "$(echo "$bfv_body" | grep -c '/snapshot/load')" "0"
+
+echo "== boot_fresh_vm mounts rootfs read-only and boots ro, so the digest cannot drift by accident"
+# .* skips over however the JSON's quotes happen to be escaped in the bash
+# source (they are backslash-escaped here, since the JSON is embedded inside a
+# double-quoted bash string) - these checks intentionally do not pin the exact
+# escaping, only that each field is set to true on some line of boot_fresh_vm's
+# own body. Scoped to $bfv_body (not the whole script) since this is what
+# boot_fresh_vm itself configures - restore_vm's drives come from the restored
+# snapshot state instead and carry no boot-source config to check here.
+check "boot_fresh_vm's rootfs drive is_root_device true" \
+  "$([ "$(echo "$bfv_body" | grep -c 'is_root_device.*true')" -ge 1 ] && echo yes || echo no)" "yes"
+check "boot_fresh_vm's rootfs drive is_read_only true" \
+  "$([ "$(echo "$bfv_body" | grep -c 'is_read_only.*true')" -ge 1 ] && echo yes || echo no)" "yes"
+check "boot_fresh_vm's boot_args contain ro" \
+  "$([ "$(echo "$bfv_body" | grep -c 'boot_args.*[^a-z]ro[^a-z]')" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "== restore_vm loads a snapshot with vsock_override and resume_vm true, and does NOT re-declare boot-source"
+rv_body="$(extract_fn restore_vm || true)"
+check "restore_vm calls /snapshot/load" \
+  "$([ "$(echo "$rv_body" | grep -c '/snapshot/load')" -ge 1 ] && echo yes || echo no)" "yes"
+check "restore_vm sets vsock_override" \
+  "$([ "$(echo "$rv_body" | grep -c 'vsock_override')" -ge 1 ] && echo yes || echo no)" "yes"
+check "restore_vm sets resume_vm true" \
+  "$([ "$(echo "$rv_body" | grep -c 'resume_vm..:true')" -ge 1 ] && echo yes || echo no)" "yes"
+check "restore_vm does NOT call /boot-source (restore carries no fresh-boot config)" \
+  "$(echo "$rv_body" | grep -c '/boot-source')" "0"
+
+echo "== run_rung_a boots fresh, runs the probe, and tears down"
+ra_body="$(extract_fn run_rung_a || true)"
+check "run_rung_a calls boot_fresh_vm" \
+  "$([ "$(echo "$ra_body" | grep -c 'boot_fresh_vm')" -ge 1 ] && echo yes || echo no)" "yes"
+check "run_rung_a calls run_probe_once" \
+  "$([ "$(echo "$ra_body" | grep -c 'run_probe_once')" -ge 1 ] && echo yes || echo no)" "yes"
+check "run_rung_a calls teardown_jail" \
+  "$([ "$(echo "$ra_body" | grep -c 'teardown_jail')" -ge 1 ] && echo yes || echo no)" "yes"
+check "run_rung_a labels its record rung-A" \
+  "$([ "$(echo "$ra_body" | grep -c 'rung-A')" -ge 1 ] && echo yes || echo no)" "yes"
+
 echo
 if [ "$fails" -ne 0 ]; then
   echo "FAILED: $fails check(s)"
