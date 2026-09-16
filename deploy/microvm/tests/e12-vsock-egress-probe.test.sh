@@ -146,6 +146,64 @@ check "teardown_jail sends a kill" \
 check "teardown_jail removes the jail dir" \
   "$([ "$(echo "$td_body" | grep -c 'rm -rf')" -ge 1 ] && echo yes || echo no)" "yes"
 
+echo "== the two-witness probe: host listener, guest command, and the combining check"
+for fn in start_host_listener stop_host_listener guest_probe_command run_probe_once; do
+  body="$(extract_fn "$fn" || true)"
+  check "$fn exists" "$([ -n "$body" ] && echo yes || echo no)" "yes"
+done
+
+echo "== the guest probe connects to CID 2, not CID 3 (guest connects OUT to the host)"
+check "guest_probe_command embeds the guest-side python3 script" \
+  "$([ "$(grep -c 'AF_VSOCK' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "the embedded script targets VMADDR_CID_HOST (2), not the guest's own CID" \
+  "$([ "$(grep -c 'VMADDR_CID_HOST' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "== run_probe_once requires BOTH witnesses, never either alone"
+rpo_body="$(extract_fn run_probe_once || true)"
+check "checks the host-side capture file" \
+  "$([ "$(echo "$rpo_body" | grep -c 'capture')" -ge 1 ] && echo yes || echo no)" "yes"
+check "checks the guest stdout for an ACK" \
+  "$([ "$(echo "$rpo_body" | grep -c 'ACK')" -ge 1 ] && echo yes || echo no)" "yes"
+# Both witness variables must appear together on the SAME line joined by &&,
+# not merely somewhere in the function (which "true" for host_ok and later,
+# separately, for guest_ok would also satisfy) and not joined by ||.
+check "combines both with an explicit AND (&&), not an OR" \
+  "$([ "$(echo "$rpo_body" | grep -cE '\$host_ok.*&&.*\$guest_ok|\$guest_ok.*&&.*\$host_ok')" -ge 1 ] && echo yes || echo no)" "yes"
+check "does not combine the two witnesses with ||" \
+  "$(echo "$rpo_body" | grep -cE '\$host_ok.*\|\||\$guest_ok.*\|\|')" "0"
+
+echo "== the host listener behaves like a real accept-once-and-reply server"
+listener_tmp="$(mktemp -d)"
+start_body="$(extract_fn start_host_listener || true)"
+stop_body="$(extract_fn stop_host_listener || true)"
+(
+  # start_host_listener references $PROBE_PORT, a global normally set when the
+  # whole script is sourced - it must be set explicitly here since this
+  # subshell only defines the one extracted function, not the driver's env
+  # contract (Task 2). It is set to the same 1025 default the driver itself
+  # uses, matching the hardcoded socket path this test connects to below.
+  PROBE_PORT=1025
+  eval "die() { echo \"e12: \$*\" >&2; exit 1; }"$'\n'"log() { :; }"$'\n'"$start_body"$'\n'"$stop_body"
+  out="$(start_host_listener "$listener_tmp" testnonce123)"
+  pid="${out#pid:}"; pid="${pid%% *}"
+  sock="$listener_tmp/vsock.sock_1025"
+  # Poll briefly for the listener to bind (it is backgrounded).
+  for _ in $(seq 1 20); do [ -S "$sock" ] && break; sleep 0.1; done
+  echo -n "testnonce123" | python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+s.sendall(sys.stdin.buffer.read() + b"\n")
+print(s.recv(4096).decode().strip())
+' "$sock" >"$listener_tmp/reply.txt" 2>&1
+  stop_host_listener "$pid"
+) >"$listener_tmp/out.log" 2>&1
+check "listener replied with the expected ACK" \
+  "$(cat "$listener_tmp/reply.txt" 2>/dev/null)" "ACK testnonce123"
+check "listener captured the nonce to its capture file" \
+  "$(cat "$listener_tmp/vsock.sock_1025.captured" 2>/dev/null)" "testnonce123"
+rm -rf "$listener_tmp"
+
 echo
 if [ "$fails" -ne 0 ]; then
   echo "FAILED: $fails check(s)"
