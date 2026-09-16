@@ -343,8 +343,13 @@ stop_host_listener() {
 # /tmp via a base64 pipe (the agent runs `sh -c "$req.Command"`, so a pipeline is
 # legal - remote-worker/internal/guestagent/agent.go:424), then runs it. The
 # script connects AF_VSOCK to VMADDR_CID_HOST (2) -- the host, from the guest's
-# point of view, per vsock.md -- on $PROBE_PORT, sends "E12 <nonce>", reads the
-# reply, and prints it to guest stdout so guest_client relays it back to us.
+# point of view, per vsock.md -- on $PROBE_PORT, sends the BARE nonce (no
+# decorative tag), reads the reply, and prints it to guest stdout so
+# guest_client relays it back to us. run_probe_once's own comparisons are
+# exact matches against the bare nonce (host_nonce = $nonce, and
+# *"ACK $nonce"* against guest_out) - a prefix tag here would make both
+# checks fail unconditionally. The nonce already self-identifies (it's built
+# as "e12-${label}-$$-${RANDOM}"), so no tag is needed anyway.
 guest_probe_command() {
   local nonce="$1" b64
   b64="$(cat <<'PYEOF' | base64 | tr -d '\n'
@@ -353,7 +358,7 @@ nonce, port = sys.argv[1], int(sys.argv[2])
 s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
 s.settimeout(10)
 s.connect((socket.VMADDR_CID_HOST, port))
-s.sendall(("E12 " + nonce + "\n").encode())
+s.sendall((nonce + "\n").encode())
 reply = s.recv(4096).decode(errors="replace").strip()
 print(reply)
 s.close()

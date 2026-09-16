@@ -205,6 +205,34 @@ check "listener captured the nonce to its capture file" \
   "$(cat "$listener_tmp/vsock.sock_1025.captured" 2>/dev/null)" "testnonce123"
 rm -rf "$listener_tmp"
 
+echo "== guest_probe_command's wire format matches run_probe_once's own comparisons exactly"
+# The listener test above hand-types "testnonce123" as the client payload,
+# which proves the LISTENER's own accept-reply logic but never exercises what
+# guest_probe_command ACTUALLY tells the guest to send - so a mismatch between
+# the two (e.g. a prefix tag the guest sends that the host-side/run_probe_once
+# comparisons don't expect) would pass every check above while still making
+# every real rung fail. This check decodes guest_probe_command's OWN embedded
+# python source (not a hand-typed stand-in) and confirms it sends the BARE
+# nonce with no prefix, matching run_probe_once's exact-match comparisons
+# (host_nonce = $nonce, and *"ACK $nonce"* against guest_out).
+gpc_body="$(extract_fn guest_probe_command || true)"
+check "guest_probe_command exists" "$([ -n "$gpc_body" ] && echo yes || echo no)" "yes"
+gpc_cmd="$(
+  # guest_probe_command also references $PROBE_PORT (a global normally set
+  # when the whole script is sourced) - same reason as the listener test
+  # above needing it set explicitly in an isolated eval context.
+  # shellcheck disable=SC2034 # read by the dynamically eval'd $gpc_body string below; shellcheck cannot trace usage through an eval boundary
+  PROBE_PORT=1025
+  eval "die() { echo \"e12: \$*\" >&2; exit 1; }"$'\n'"$gpc_body"
+  guest_probe_command "wireformat-check-nonce"
+)"
+gpc_b64="$(printf '%s' "$gpc_cmd" | sed -n 's/^echo \([^ ]*\) | base64 -d.*/\1/p')"
+gpc_decoded="$(printf '%s' "$gpc_b64" | base64 -d 2>/dev/null || true)"
+check "the embedded guest script sends the bare nonce (no tag prefix)" \
+  "$([ "$(echo "$gpc_decoded" | grep -cE 'sendall\(\(nonce \+')" -ge 1 ] && echo yes || echo no)" "yes"
+check "the embedded guest script does NOT prepend any tag before the nonce" \
+  "$(echo "$gpc_decoded" | grep -cE 'sendall\(\("[^"]+" \+ nonce')" "0"
+
 echo "== VM lifecycle helpers exist"
 for fn in ensure_workspace_image wait_for_agent boot_fresh_vm restore_vm run_rung_a; do
   body="$(extract_fn "$fn" || true)"
