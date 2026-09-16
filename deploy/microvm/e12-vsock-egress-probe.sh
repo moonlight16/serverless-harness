@@ -543,6 +543,87 @@ run_rung_b() {
   return "$ok"
 }
 
+# --- rung C: N concurrent restores from one snapshot --------------------------
+# Concurrent, not sequential: all N microVMs are restored and alive AT THE SAME
+# TIME, all connecting on 1025, before any is torn down. Sequential restarts
+# would prove repeatability but could not surface a socket-naming collision -
+# rung C's actual purpose - because only one jail would ever exist at a time.
+# Each VM gets its own jail (its own chroot filesystem namespace), so
+# restore_vm's per-jail /vsock.sock (Task 5) means there is structurally only
+# one place a collision COULD show up: this function's own aggregation, if two
+# VMs' witnesses were somehow cross-wired. They cannot be, by construction (two
+# different absolute host paths), but the aggregation still checks nonce
+# uniqueness explicitly rather than assuming it.
+run_rung_c_n() {
+  local n="$1" i pids=() jails=()
+  for i in $(seq 1 "$n"); do
+    local jail="$JAIL_BASE/rung-c-${n}-${i}"
+    rm -rf "$jail"
+    jails+=("$jail")
+    (
+      local rc=0
+      # A plain redirect on a function call (2>"...") does NOT fork a
+      # subshell by itself - only $(...) does - so restore_vm's
+      # VM_UDS/CLEANUP_PID/CLEANUP_JAIL side effects stay visible in THIS
+      # per-VM subshell's own scope below. See boot_fresh_vm's comment
+      # (Task 5) for why $(...) would have broken that.
+      restore_vm "$jail" 2>"$jail.boot.log" || {
+        write_json_record "$RESULTS/rung-C-${n}-${i}.json" \
+          "{\"rung\":\"rung-C-${n}-${i}\",\"ok\":false,\"error\":\"restore_vm failed\"}"
+        exit 1
+      }
+      run_probe_once "$jail" "$VM_UDS" "rung-C-${n}-${i}" || rc=1
+      teardown_jail "$jail" "$CLEANUP_PID"
+      exit "$rc"
+    ) &
+    pids+=("$!")
+  done
+
+  local ok_count=0 fail_count=0 pid
+  for pid in "${pids[@]}"; do
+    if wait "$pid"; then
+      ok_count=$((ok_count + 1))
+    else
+      fail_count=$((fail_count + 1))
+    fi
+  done
+
+  # Explicit collision check: every per-VM record's nonce must be unique. A
+  # duplicate would mean two VMs somehow generated (or worse, witnessed) the
+  # same nonce, which is the concrete shape "a per-restore collision" would take.
+  local nonces dup_count
+  nonces="$(python3 -c '
+import json, sys, glob
+ns = []
+for p in sys.argv[1:]:
+    try:
+        with open(p) as f:
+            ns.append(json.load(f).get("nonce", ""))
+    except Exception:
+        pass
+print("\n".join(ns))
+' "$RESULTS"/rung-C-"${n}"-*.json 2>/dev/null)"
+  dup_count=$(printf '%s\n' "$nonces" | sort | uniq -d | grep -c . || true)
+
+  local all_ok=false
+  [ "$fail_count" -eq 0 ] && [ "$dup_count" -eq 0 ] && all_ok=true
+
+  write_json_record "$RESULTS/rung-C-${n}.json" \
+    "$(printf '{"rung":"rung-C-%s","n":%s,"ok":%s,"ok_count":%s,"fail_count":%s,"nonce_collisions":%s}' \
+      "$n" "$n" "$all_ok" "$ok_count" "$fail_count" "$dup_count")"
+
+  log "rung-C(n=$n): ok_count=$ok_count fail_count=$fail_count nonce_collisions=$dup_count all_ok=$all_ok"
+  [ "$all_ok" = true ]
+}
+
+run_rung_c() {
+  local n overall=0
+  for n in $C_LADDER; do
+    run_rung_c_n "$n" || overall=1
+  done
+  return "$overall"
+}
+
 # --- entrypoint --------------------------------------------------------------
 main() {
   preflight

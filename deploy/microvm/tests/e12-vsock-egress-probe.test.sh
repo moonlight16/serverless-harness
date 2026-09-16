@@ -182,6 +182,7 @@ stop_body="$(extract_fn stop_host_listener || true)"
   # subshell only defines the one extracted function, not the driver's env
   # contract (Task 2). It is set to the same 1025 default the driver itself
   # uses, matching the hardcoded socket path this test connects to below.
+  # shellcheck disable=SC2034 # read by the dynamically eval'd $start_body string below; shellcheck cannot trace usage through an eval boundary
   PROBE_PORT=1025
   eval "die() { echo \"e12: \$*\" >&2; exit 1; }"$'\n'"log() { :; }"$'\n'"$start_body"$'\n'"$stop_body"
   out="$(start_host_listener "$listener_tmp" testnonce123)"
@@ -267,6 +268,28 @@ check "run_rung_b calls run_probe_once" \
   "$([ "$(echo "$rb_body" | grep -c 'run_probe_once')" -ge 1 ] && echo yes || echo no)" "yes"
 check "run_rung_b labels its record rung-B" \
   "$([ "$(echo "$rb_body" | grep -c 'rung-B')" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "== run_rung_c_n launches N concurrently (background jobs), not sequentially"
+rcn_body="$(extract_fn run_rung_c_n || true)"
+check "run_rung_c_n exists" "$([ -n "$rcn_body" ] && echo yes || echo no)" "yes"
+check "run_rung_c_n backgrounds its per-VM work (uses &)" \
+  "$([ "$(echo "$rcn_body" | grep -c ' &$')" -ge 1 ] && echo yes || echo no)" "yes"
+check "run_rung_c_n waits for all before aggregating" \
+  "$([ "$(echo "$rcn_body" | grep -c '\bwait\b')" -ge 1 ] && echo yes || echo no)" "yes"
+check "run_rung_c_n calls restore_vm (not boot_fresh_vm)" \
+  "$([ "$(echo "$rcn_body" | grep -c 'restore_vm')" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "== run_rung_c_n aggregates per-VM ok, not just the last one"
+check "sums or counts per-VM outcomes rather than reading a single exit code" \
+  "$([ "$(echo "$rcn_body" | grep -cE 'ok_count|fail_count|all_ok')" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "== run_rung_c drives the ladder from C_LADDER, not a hardcoded 8/128"
+rc_body="$(extract_fn run_rung_c || true)"
+check "run_rung_c exists" "$([ -n "$rc_body" ] && echo yes || echo no)" "yes"
+check "run_rung_c iterates \$C_LADDER" \
+  "$([ "$(echo "$rc_body" | grep -c 'C_LADDER')" -ge 1 ] && echo yes || echo no)" "yes"
+check "run_rung_c calls run_rung_c_n" \
+  "$([ "$(echo "$rc_body" | grep -c 'run_rung_c_n')" -ge 1 ] && echo yes || echo no)" "yes"
 
 echo
 if [ "$fails" -ne 0 ]; then
