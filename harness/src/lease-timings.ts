@@ -40,7 +40,12 @@ export interface LeaseTimings {
  */
 export function leaseTimings(env: NodeJS.ProcessEnv): LeaseTimings {
   const cap = intEnv(env, 'KAGENTI_SANDBOX_CAP', 20);
-  const ttlMs = intEnv(env, 'KAGENTI_SANDBOX_LEASE_TTL_MS', 60000);
+  // Floor of 1s, or the clamp below stays reachable from the TTL side: TTL=1 gives floor(1/3)=0, and
+  // max(1, 0) is exactly the 1 ms renewal loop this module exists to prevent -- the heartbeat knob was
+  // hardened against it while the TTL knob could still produce it. A sub-second lease cannot serve a
+  // turn anyway (it would expire before the first renewal at ANY heartbeat), so the floor costs nothing
+  // real: the lowest TTL a deployment could sanely set is orders of magnitude above it.
+  const ttlMs = intEnv(env, 'KAGENTI_SANDBOX_LEASE_TTL_MS', 60000, 1000);
   const requested = intEnv(env, 'KAGENTI_SANDBOX_HEARTBEAT_MS', 20000);
   return { cap, ttlMs, heartbeatMs: Math.max(1, Math.min(requested, Math.floor(ttlMs / 3))) };
 }

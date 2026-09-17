@@ -22,6 +22,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
  * This file proves the BOOKKEEPING only. Its mock is a plain object, so it cannot emit -- the crash
  * this re-arm was once thought to prevent lives on the event channel and is pinned separately, in
  * `redis-error-listener.test.ts`.
+ *
+ * The last case is the exception that proves the rule: node-redis's terminal give-up is reached THROUGH
+ * the event channel, but its consequence is a plain state flip (`isOpen` false, `ready` still resolved),
+ * so it is observable here without emitting anything. That flip is the whole reason `open()` cannot
+ * re-arm on a rejected promise alone.
  */
 const connect = vi.fn<() => Promise<void>>();
 const quit = vi.fn(async () => 'OK');
@@ -30,7 +35,25 @@ const keys = vi.fn(async () => [] as string[]);
 // nothing here ever fires one. That is the boundary between the two files -- the crash on the event
 // channel is `redis-error-listener.test.ts`, which mocks a real EventEmitter for it.
 const on = vi.fn();
-const client = { connect, quit, keys, on, isOpen: false };
+const client = {
+  // node-redis sets #isOpen true SYNCHRONOUSLY inside connect() (socket.js:170, before it awaits
+  // anything) and back to false only on the terminal give-up (socket.js:154). Both halves matter here:
+  // `open()` re-arms on !isOpen, so a mock that left isOpen false would re-arm on EVERY call --
+  // including the three concurrent callers below, which would then see three connects instead of one.
+  connect: async () => {
+    client.isOpen = true;
+    try {
+      return await connect();
+    } catch (err) {
+      client.isOpen = false;
+      throw err;
+    }
+  },
+  quit,
+  keys,
+  on,
+  isOpen: false,
+};
 
 vi.mock('redis', () => ({
   createClient: () => client,
@@ -104,5 +127,22 @@ describe('RedisSessionBackend connect re-arm', () => {
     await b.close();
 
     expect(quit).toHaveBeenCalledTimes(1);
+  });
+
+  it('reconnects after node-redis permanently closes the socket', async () => {
+    connect.mockResolvedValue(undefined);
+    const b = new RedisSessionBackend();
+    await b.list();
+    expect(connect).toHaveBeenCalledTimes(1);
+
+    // Past resilientClientOptions' bound node-redis sets isOpen false, swallows its own
+    // ReconnectStrategyError on the post-open path, and rejects every later command with
+    // ClientClosedError -- permanently. `ready` is still RESOLVED from the connect that SUCCEEDED, so
+    // the promise-channel re-arm above cannot see any of it. This is the event channel, and without
+    // the isOpen check in open() this call would reuse the dead client forever.
+    client.isOpen = false;
+
+    await expect(b.list()).resolves.toEqual([]);
+    expect(connect).toHaveBeenCalledTimes(2);
   });
 });

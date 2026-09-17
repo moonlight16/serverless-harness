@@ -40,7 +40,8 @@ export class RedisSessionBackend<E = unknown> implements LogStore<E> {
    * Probed against the pinned `redis@6.2.1`: a REFUSED connect rejects with `ECONNREFUSED` and a
    * black-holed SYN rejects with `ConnectionTimeoutError` once the 5s default `connectTimeout` fires.
    * In a cluster the second is the one to expect -- a Service with no ready endpoints, or a
-   * NetworkPolicy drop, black-holes the SYN rather than refusing it.
+   * NetworkPolicy drop, black-holes the SYN rather than refusing it. (That shape costs ~60 s to
+   * reject, not the ~210 ms quoted for a refused port -- see redis-errors.ts.)
    *
    * Both of those rejections were previously a SIDE EFFECT of having no `'error'` listener, and this
    * class now has one. That is why the client is built with `resilientClientOptions`: its bounded
@@ -74,8 +75,26 @@ export class RedisSessionBackend<E = unknown> implements LogStore<E> {
     return attempt;
   }
 
-  /** Await the live connect attempt, starting a fresh one if the last one failed. */
+  /**
+   * Await the live connect attempt, starting a fresh one if the last one failed OR the socket was
+   * permanently closed.
+   *
+   * Two channels can break the connection and only one of them rejects a promise. `arm()`'s `.catch`
+   * covers the promise channel. The event channel is the one past `resilientClientOptions`' reconnect
+   * bound: node-redis sets `isOpen` false, swallows its own `ReconnectStrategyError`, and rejects every
+   * later command with `ClientClosedError` -- while `ready` stays RESOLVED from the connect that
+   * succeeded, so nothing here would notice. See resilientClientOptions for the citations.
+   *
+   * Re-arming on `!isOpen` is safe: `connect()` throws `Socket already opened` only when `isOpen` is
+   * true, which this branch excludes, and the terminal path clears `isOpen` BEFORE returning the error,
+   * so the re-attempt genuinely happens.
+   *
+   * It also means a call after `close()` reconnects rather than rejecting. Deliberate, and not worth a
+   * `closed` flag: the only closers are `sharedSessionStore`'s URL-change branch and
+   * `resetSharedSessionStore()` (test-only), both of which are discarding the store anyway.
+   */
   private open(): Promise<void> {
+    if (this.ready && !this.client.isOpen) this.ready = null;
     return (this.ready ??= this.arm());
   }
 

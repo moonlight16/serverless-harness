@@ -21,7 +21,13 @@ import { EventEmitter } from 'node:events';
  */
 class FakeClient extends EventEmitter {
   isOpen = false;
-  connect = vi.fn(async () => undefined);
+  // Flipped as node-redis does (socket.js:170), which nothing here observes today -- the cases below
+  // only construct and emit. It is here because `RedisResultStore.open()` now re-arms on !isOpen, so a
+  // fake stuck at false would make any future case that awaits a store method reconnect on every call.
+  connect = vi.fn(async () => {
+    this.isOpen = true;
+    return undefined;
+  });
   quit = vi.fn(async () => 'OK');
   close = vi.fn(async () => undefined);
 }

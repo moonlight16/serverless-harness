@@ -14,7 +14,14 @@ import { EventEmitter } from 'node:events';
  */
 class FakeClient extends EventEmitter {
   isOpen = false;
-  connect = vi.fn(async () => undefined);
+  // Flipped as node-redis does (socket.js:170), which nothing here observes today -- the cases below
+  // only construct and emit. It is here because `open()` now re-arms on !isOpen, so a fake stuck at
+  // false would make any future case that awaits a queue method silently reconnect on every call.
+  // `queue-connect-rearm.test.ts` is where that behaviour is actually pinned.
+  connect = vi.fn(async () => {
+    this.isOpen = true;
+    return undefined;
+  });
   close = vi.fn(async () => undefined);
 }
 

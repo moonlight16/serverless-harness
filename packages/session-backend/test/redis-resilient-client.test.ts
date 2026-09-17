@@ -9,7 +9,9 @@ import { resilientClientOptions } from '../src/redis-errors';
  * that used to make a failed `connect()` REJECT, so with node-redis's default (unbounded, backing-off)
  * strategy the attempt retries forever and `connect()` never settles. Probed on the pinned redis 6.2.1
  * against a dead port: no listener rejects in ~1 ms, listener-only was still pending at 6 s, listener
- * plus a bounded strategy rejects in ~210 ms with `ReconnectStrategyError`.
+ * plus a bounded strategy rejects in ~210 ms with `ReconnectStrategyError`. That ~210 ms is the
+ * REFUSED-port case; a black-holed SYN pays the full 5 s `connectTimeout` per attempt instead, so ~60 s
+ * to reject — bounded either way, but do not size a timeout against the 210 ms (see `redis-errors.ts`).
  *
  * A hang is worse here than the crash it replaced. `RedisSessionBackend.arm()` re-arms by clearing its
  * memo when `connect()` rejects, so a promise that never settles does not merely delay a turn — it

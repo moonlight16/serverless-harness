@@ -19,7 +19,22 @@ import { EventEmitter } from 'node:events';
  */
 class FakeClient extends EventEmitter {
   isOpen = false;
-  connect = vi.fn(async () => undefined);
+  // node-redis sets #isOpen true SYNCHRONOUSLY inside connect() (socket.js:170) and clears it on the
+  // terminal give-up (socket.js:154). Modelling that is load-bearing now that `open()` re-arms on
+  // !isOpen: a fake that left isOpen false would re-arm on every call, quietly consuming `attempt`'s
+  // one-shot rejection and turning the awaited FAILURE this file is about into a second, succeeding
+  // connect.
+  connect = vi.fn(async () => {
+    this.isOpen = true;
+    try {
+      return await this.attempt();
+    } catch (err) {
+      this.isOpen = false;
+      throw err;
+    }
+  });
+  /** The connect's outcome. Held apart from `connect` so overriding it keeps the isOpen bookkeeping. */
+  attempt = vi.fn<() => Promise<void>>(async () => undefined);
   quit = vi.fn(async () => 'OK');
   keys = vi.fn(async () => [] as string[]);
 }
@@ -45,7 +60,7 @@ describe('RedisSessionBackend error listener', () => {
   });
 
   it('does not swallow the failure a caller is awaiting', async () => {
-    client.connect.mockRejectedValueOnce(new Error('connect ETIMEDOUT'));
+    client.attempt.mockRejectedValueOnce(new Error('connect ETIMEDOUT'));
     const b = new RedisSessionBackend();
 
     // The listener is for unawaited EVENTS; a rejected command still reaches its caller.

@@ -58,8 +58,29 @@ describe('leaseTimings', () => {
     expect(leaseTimings({ KAGENTI_SANDBOX_LEASE_TTL_MS: '15000' }).heartbeatMs).toBe(5000);
   });
 
-  it('never clamps the heartbeat below 1 ms even for an absurdly short TTL', () => {
-    expect(leaseTimings({ KAGENTI_SANDBOX_LEASE_TTL_MS: '1' }).heartbeatMs).toBe(1);
+  // This case previously asserted `heartbeatMs === 1` for TTL=1 -- it documented that the clamp's own
+  // `max(1, ...)` was the only thing standing between a 1 ms TTL and a 0 ms interval. That made the
+  // hardening one-sided: the HEARTBEAT knob fell back to a default rather than produce a 1 ms renewal
+  // loop, while the TTL knob could still produce one through the clamp (floor(1/3) = 0 -> max(1,0) = 1).
+  // A 1 s floor on the TTL closes that side, so the 1 ms loop is now unreachable from either knob.
+  it.each([
+    ['1 ms', '1'],
+    ['just under the floor', '999'],
+  ])(
+    'falls back to the default TTL for %s rather than clamping to a 1 ms renewal loop',
+    (_n, raw) => {
+      const t = leaseTimings({ KAGENTI_SANDBOX_LEASE_TTL_MS: raw });
+      expect(t.ttlMs).toBe(60000);
+      expect(t.heartbeatMs).toBe(20000);
+    },
+  );
+
+  it('accepts the floor itself, so the boundary is inclusive', () => {
+    // 1000 is a real (if impractical) value, not a rejected one -- the floor is `>= min`, and getting
+    // this edge wrong would silently widen the fallback to a range operators might actually set.
+    const t = leaseTimings({ KAGENTI_SANDBOX_LEASE_TTL_MS: '1000' });
+    expect(t.ttlMs).toBe(1000);
+    expect(t.heartbeatMs).toBe(333);
   });
 
   it('leaves a heartbeat already inside ttl/3 alone', () => {

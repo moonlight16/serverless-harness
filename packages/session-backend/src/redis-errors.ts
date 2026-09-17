@@ -26,6 +26,16 @@ const DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
  *    listener-only is still pending at 6 s, listener plus this bound rejects in ~210 ms with
  *    `ReconnectStrategyError`.
  *
+ *    That ~210 ms is the REFUSED-port case, where `ECONNREFUSED` returns at once and only the delays
+ *    below accumulate. A black-holed SYN -- a Service with no ready endpoints, or a NetworkPolicy drop,
+ *    which is the shape to expect in a cluster -- instead pays the full `connectTimeout` per attempt
+ *    (5 s by default; `#createSocket` arms `socket.setTimeout` and destroys with
+ *    `ConnectionTimeoutError`, socket.js:278-284). Eleven attempts plus ~5.5 s of delays is ~60 s to
+ *    reject, not 210 ms. Still bounded, still loud, still re-armed -- but do not size a timeout against
+ *    the 210 ms. Left as the 5 s default deliberately: a tighter `connectTimeout` would make a Redis
+ *    that merely takes >1 s to accept (cold start, TLS, cross-AZ DNS) exhaust the bound on timeouts
+ *    alone and never connect at all, trading a slow correct failure for a permanent one.
+ *
  * The hang is the worse failure, and not only because it is silent. `RedisSessionBackend.arm()` re-arms
  * by clearing its memo when `connect()` REJECTS; a promise that never settles disables that retry and
  * leaves every caller awaiting forever. So adding the listener without this would have traded a crash
@@ -34,6 +44,21 @@ const DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
  * Bounded retry keeps both properties: a transient blip (a container recreated, or `docker run -d`
  * returning before Redis accepts) reconnects on its own, while a Redis that is genuinely absent gives
  * up and rejects, so the caller fails loudly and soon.
+ *
+ * ONE CONSEQUENCE EVERY CALLER MUST HANDLE. Past this bound node-redis gives up permanently, and it is
+ * quiet about it on the post-open path: `#shouldReconnect` sets `#isOpen = false` before returning the
+ * `ReconnectStrategyError` (socket.js:153-162), and `#onSocketError` swallows that error -- it calls
+ * `#connect()` with a `.catch` whose body is the comment "the error was already emitted, silently
+ * ignore it" (socket.js:333-335). Every later command then rejects `ClientClosedError`
+ * (index.js:1127), for the life of the process. A memo that re-arms only on a REJECTED connect cannot
+ * see this: the connect succeeded, so its promise stays resolved.
+ *
+ * So a client built with these options must also re-arm on `!client.isOpen`. `isOpen` is the precise
+ * signal and nothing else: node-redis keeps it TRUE for the whole retry sequence (only `isReady` drops
+ * while reconnecting) and false only on the terminal give-up or an explicit close. `RedisSessionBackend`,
+ * `RedisWorkQueue` and `RedisResultStore` each do this in `open()`. `sharedLease` / `sharedRecords`
+ * (select-sandbox.ts) are exempt: their `guard()` evicts the memo on any rejected command, so the
+ * `ClientClosedError` itself rebuilds the client.
  *
  * `RedisRecordStore` (harness/src/pool-records.ts) reached the same pairing from the same probe in
  * #251 and keeps its own copy inline; this is the shared form for the other four long-lived clients.
