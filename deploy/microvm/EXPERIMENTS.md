@@ -1419,21 +1419,66 @@ just an efficiency improvement: a listener that is already bound and
   It is specifically about rung C@128's own concurrent-probe apparatus,
   which is throwaway diagnostic code, not the mechanism PR #268 would ship.
 
+##### The fix, applied and confirmed: 167.8x on the same substrate that showed the race clearest
+
+The listener-startup race described above is fixed directly in
+`start_host_listener()`: the host-side `python3` script now writes a marker
+file the instant its own `listen()` call returns — before `accept()` — and
+the bash function blocks on that marker (polling every 0.1s, `die`-ing loudly
+past 5s rather than hanging) before returning control to its caller. No
+caller can trigger the guest's `connect()` until the host side is genuinely
+bound and listening; a fixed sleep was deliberately not used, since under
+the exact N=128 contention this exists to survive a fixed delay is either too
+short (races again) or adds latency to every one of 128 concurrent probes for
+no reason on the common path.
+
+Confirmed on the same bare-metal host, same golden snapshot, same
+`SH_SUBSTRATE=metal`, same rung C@128, back to back with the pre-fix run
+above for the cleanest possible comparison:
+
+| Run                          | Iterations | VM-attempts | Failure rate | Iterations with zero failures | Mean fails/iteration |
+| ---------------------------- | ---------- | ----------- | ------------ | ----------------------------- | -------------------- |
+| Before (this section, above) | 80         | 10,240      | 9.83%        | 0 / 80                        | 12.59                |
+| **After the fix**            | 40         | 5,120       | **0.059%**   | **37 / 40**                   | **0.075**            |
+
+**167.8x reduction in failure rate.** Of the 3 residual failures across
+5,120 VM-attempts, every one is a member of the _other_ failure family this
+section already knew about and never attributed to the listener race —
+`read CONNECT ack: EOF`, `read: EOF`, and a `dial` failure — and **zero** are
+the guest-side `ConnectionResetError` on the 1025 `connect()` that made up
+99.2% of failures before the fix. The mechanism this section proposed is not
+just plausible in hindsight; fixing exactly that mechanism, and nothing
+else, removed exactly that failure signature, and nothing else moved it.
+
+Also confirmed, so this reads as a fix and not a regression: the existing
+`e12-vsock-egress-probe.test.sh` contract test (including its behavioral
+"host listener behaves like a real accept-once-and-reply server" check)
+passes unchanged, `shellcheck` is clean, and `make lint` passes end to end.
+The single-VM control path (rung A/B/D) is untouched by this change —
+`start_host_listener` is called identically from all of them, and the fix
+only changes when the function _returns_, not what it does.
+
+Rig left clean afterward: no live `firecracker`/`guest_client` processes, no
+leftover mounts or jail directories, golden snapshot digest unchanged
+throughout both the pre-fix and post-fix runs.
+
 #### Effect on PR #268 and P4.1
 
-**T1 (route all sandbox egress over vsock) stands, on firmer ground than
-after E12, and the bare-metal follow-up is the best news yet for it.** E12
+**T1 (route all sandbox egress over vsock) stands, and the bare-metal
+follow-up's diagnosis is now a confirmed fix, not just a hypothesis.** E12
 established the mechanism across rungs A, B, D and C@8. The overnight
 follow-up found the 1025 mechanism itself failing directly (37 times, small
-next to the 1024-relay signatures). The metal follow-up then found _why_, on
-the balance of evidence collected so far: on a substrate where every
-host-resource candidate is flat and abundant, 99.2% of failures are that
-same guest-side reset, and it matches this project's own documented
-Firecracker behavior for "nobody was listening yet" — which points at a race
-in the throwaway _probe's_ one-process-per-VM listener design, not a defect
-in the vsock mechanism PR #268 actually ships. Nothing on any substrate
-resembles the restore-mechanism failure that would force the NIC option
-(spec §2).
+next to the 1024-relay signatures). The metal follow-up found _why_: on a
+substrate where every host-resource candidate is flat and abundant, 99.2%
+of failures were that same guest-side reset, matching this project's own
+documented Firecracker behavior for "nobody was listening yet" — a race in
+the throwaway _probe's_ one-process-per-VM listener design, not a defect in
+the vsock mechanism PR #268 actually ships. Fixing exactly that race (see
+below) cut the failure rate **167.8x** (9.83% → 0.059%) on the same
+substrate, with the guest-side reset signature going to zero across 5,120
+VM-attempts while the small, unrelated background failure rate stayed put.
+Nothing on any substrate resembles the restore-mechanism failure that would
+force the NIC option (spec §2).
 
 **P4.1's open scale/capacity question should be re-scoped, not just carried
 forward.** E12 framed it as "how many concurrent egress connections a single
@@ -1445,17 +1490,15 @@ question that survives is narrower than either follow-up first suggested:
 race this probe's throwaway version did not.** Concretely, for P4.1:
 
 1. **Do not carry E12's one-host-process-per-connection shape into the
-   implementation — this is now the load-bearing recommendation, not a nice-
-   to-have.** The bare-metal follow-up's dominant failure mode
-   (`ConnectionResetError` on the guest's own `connect()`, 99.2% of that
-   run's failures) is best explained by `start_host_listener` returning as
-   soon as its `python3` process is backgrounded, not once it has actually
-   reached `srv.listen()` — at N=128 that creates real variance in exactly
-   when each VM's listener is ready, independent of host compute. A single,
-   persistent, pre-bound multiplexed listener started well before any
-   restore begins cannot lose this race at all. This was already recommended
-   for efficiency; it is now also the most likely fix for the dominant
-   failure mode observed on the cleanest substrate tested.
+   implementation — confirmed as the load-bearing recommendation, not a
+   nice-to-have.** `start_host_listener`'s fix (block until the listener's
+   own `listen()` call has actually succeeded, not just until its process is
+   backgrounded) cut this probe's own failure rate 167.8x on bare metal.
+   Production's listener will be a single persistent, pre-bound one started
+   well before any restore begins, which cannot lose an equivalent race at
+   all — but the _shape_ of the bug (trusting "the process is running" as a
+   proxy for "the socket is ready to accept") is exactly the class of defect
+   a multiplexed design must not reintroduce in its own startup path.
 2. **Treat the Exec relay on 1024 as fallible under concurrent load, on the
    substrate where it is the dominant signature.** On `nested-m8i` specifically,
    an unrelated channel's transport dying while the host is busy was 84% of
@@ -1477,17 +1520,19 @@ race this probe's throwaway version did not.** Concretely, for P4.1:
    |r| < 0.2), shows disk I/O contention cannot be the general explanation.
    Confirming the `nested-m8i` finding as EBS-specific still needs an
    AWS-level burst-balance metric neither run collected.
-5. **Treat the second port as fallible, full stop — not "unimplicated" and
-   not "rare."** 37 of ~2,113 on `nested-m8i` looked like a low-rate edge
-   case; 999 of 1,007 on metal is the dominant signature on that substrate.
-   Whatever P4.1 builds should not assume the guest-initiated direction is
-   failure-free under concurrent restore load, on any substrate — item 1's
-   fix is the reason to expect this to improve, not a reason to assume it
-   already doesn't matter.
+5. **The second-port failures on this probe were the listener race, almost
+   entirely — but "almost" is doing real work in that sentence.** 999 of
+   1,007 pre-fix metal failures were the guest-side reset; the fix drove
+   that signature to zero across 5,120 post-fix VM-attempts. That is strong
+   evidence the race was the dominant cause on this probe, not proof the
+   guest-initiated direction has no other failure mode under load — P4.1's
+   own implementation should still not assume the direction is failure-free
+   just because this specific, now-fixed defect accounted for nearly all of
+   what was observed here.
 6. **CPU utilization itself is still unmeasured, on either substrate.** Both
    follow-ups added steal% and iowait%; steal was flat and uninformative on
    both (uninterpretable-but-present on `nested-m8i`, `0.0%` by construction
    on metal). Neither run measured this host's own CPU utilization or
-   run-queue depth during the burst — worth doing once the listener-race fix
-   in item 1 is actually implemented, to check whether it was the whole
-   story or one contributor among several.
+   run-queue depth during the burst. Lower priority now that the listener
+   race is fixed and confirmed as the dominant cause, but still an open gap
+   in what either follow-up actually collected.

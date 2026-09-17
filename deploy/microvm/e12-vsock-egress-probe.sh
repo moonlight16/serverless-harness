@@ -287,7 +287,22 @@ trap cleanup_on_exit EXIT
 # for the guest-initiated direction -- accepts exactly one connection, reads one
 # line, writes it verbatim to <jail>/vsock.sock_1025.captured, replies
 # "ACK <line>\n", and exits. Firecracker needs no handshake for this direction:
-# the socket only needs to EXIST at connect time.
+# the socket only needs to EXIST at connect time - but "exist" means bound AND
+# listening, and backgrounding the python3 process is not the same instant as
+# that process actually reaching listen(). At N=128 concurrent restores
+# (issue #271's rung C@128; see EXPERIMENTS.md's E13 section), forking and
+# execing 128 python3 interpreters in close succession creates real variance
+# in exactly when each one's listen() call executes, independent of host
+# compute - a guest whose CONNECT lands before its own listener is bound gets
+# VIRTIO_VSOCK_OP_RST, correctly, because nothing was listening yet. That is
+# the dominant recovered failure signature in E13's bare-metal run (99.2% of
+# failures there), where every host-resource candidate (CPU steal, disk
+# iowait, memory) was independently ruled out - a race in this function's own
+# startup ordering, not a mechanism defect, fits the evidence. The fix: the
+# python3 script signals readiness via a marker file the instant its own
+# listen() call returns, and this function blocks on that file before
+# returning - so no caller can trigger the guest's CONNECT until the host
+# side is genuinely ready to receive it.
 start_host_listener() {
   # jail/nonce and sock are split into two `local` statements deliberately: a
   # single `local a="$1" b="$a/x"` does NOT let b see the freshly-assigned a -
@@ -298,10 +313,12 @@ start_host_listener() {
   # variable rather than merely a wrong value.
   local jail="$1" nonce="$2" pyfile
   local sock="$jail/vsock.sock_${PROBE_PORT}"
+  local ready="$sock.ready"
   pyfile="$jail/.e12-listener.py"
+  rm -f "$ready"
   cat >"$pyfile" <<'PYEOF'
 import socket, sys, os
-sock_path, capture_path = sys.argv[1], sys.argv[2]
+sock_path, capture_path, ready_path = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
     os.unlink(sock_path)
 except FileNotFoundError:
@@ -310,6 +327,11 @@ srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 srv.bind(sock_path)
 os.chmod(sock_path, 0o666)
 srv.listen(1)
+# Signals readiness only AFTER listen() has actually succeeded - this is the
+# ordering fix itself. Written before accept() so the caller never blocks on
+# this longer than the bind+listen setup actually takes.
+with open(ready_path, "w") as f:
+    f.write("ready\n")
 conn, _ = srv.accept()
 data = conn.recv(4096)
 line = data.decode(errors="replace").strip()
@@ -327,8 +349,23 @@ PYEOF
   # the whole capture forever whenever no client connects in time. Found the
   # hard way: this masked itself behind an unrelated bug in an earlier round
   # of this same task, and only surfaced once that bug was fixed.
-  python3 "$pyfile" "$sock" "$sock.captured" >/dev/null 2>&1 &
+  python3 "$pyfile" "$sock" "$sock.captured" "$ready" >/dev/null 2>&1 &
   local pid=$!
+  # Poll for the ready file rather than assume any fixed delay is enough -
+  # under the exact N=128 contention this exists to survive, a fixed sleep
+  # would either be too short (races again) or too long (adds real latency
+  # to every one of 128 concurrent probes). 5s is generous next to a bind+
+  # listen that normally completes in microseconds; if it is ever actually
+  # needed, something is already badly wrong and dying loudly beats hanging.
+  local waited=0
+  while [ ! -f "$ready" ]; do
+    if [ "$waited" -ge 50 ]; then
+      kill "$pid" 2>/dev/null || true
+      die "host listener on $sock never signaled ready within 5s - is python3's AF_UNIX bind/listen actually failing, or is this host starved past any reasonable startup delay?"
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
   echo "pid:$pid capture:$sock.captured"
 }
 
