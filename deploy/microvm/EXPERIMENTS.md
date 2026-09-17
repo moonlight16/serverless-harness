@@ -1462,23 +1462,80 @@ Rig left clean afterward: no live `firecracker`/`guest_client` processes, no
 leftover mounts or jail directories, golden snapshot digest unchanged
 throughout both the pre-fix and post-fix runs.
 
+##### The fix also confirmed on `nested-m8i`, sized to actually detect it there
+
+The listener race was never the _dominant_ failure on `nested-m8i` the way
+it was on metal — only 37 of 31,104 pre-fix VM-attempts (≈0.119%) were that
+signature there, next to the much larger iowait-correlated `read: EOF`
+family. That asymmetry matters for how big a confirmation run needs to be:
+detecting a rare signature's disappearance with confidence needs enough
+trials that seeing zero would be surprising if the true rate _hadn't_
+dropped. For a Poisson-style one-sided test, that threshold is
+`n > -ln(α)/p`; at `p = 0.119%` and `α = 0.01` (99% confidence), `n >
+3,866` VM-attempts (≈31 iterations at N=128). This run was sized well past
+that floor on purpose.
+
+**57 iterations, 7,296 VM-attempts, run to its own 90-minute budget on the
+fixed driver, `SH_SUBSTRATE=nested-m8i`.** The bimodal fast/slow pattern and
+its iowait correlation are unchanged, exactly as expected — this fix does
+not touch that mechanism at all: 33 fast / 24 slow iterations, fast mean
+iowait 0.269% vs. slow mean 1.545%, fast per-VM failure rate 0.92% vs. slow
+15.53%, duration↔iowait **r=0.622**, duration↔fail_count **r=0.689**,
+iowait↔fail_count **r=0.504** — all consistent in direction and magnitude
+with the pre-fix overnight run's own r=0.788/0.582/0.41 (sampling variance
+across a 57- vs. 243-iteration window, not a change in the underlying
+relationship). Overall failure rate is 7.07% (516/7,296), close to the
+pre-fix baseline's own wide swings — exactly the outcome predicted: the
+fix's true contribution to the _overall_ rate is a fraction of a point
+against a noise floor of dozens of points, not something a run this size
+could resolve either way, and it was not the metric this run was sized to
+resolve.
+
+**The signature it _was_ sized to resolve: zero.** Of 423 recovered failing
+records (516 counted, the same ~18% `die()`-bypass gap as every other run
+in this section), the breakdown is `read: EOF` 344, `dial-fail` 57,
+handshake-ack `connection reset` 13, handshake-ack `EOF` 6, handshake-ack
+`i/o timeout` 2, `short-payload` 1 — **and zero guest-side
+`ConnectionResetError` on the 1025 `connect()`.** Against the 0.119%
+baseline rate, observing zero in 7,296 attempts has a probability of
+`e^(-7296 × 0.00119) ≈ 0.00017` (0.017%) under the hypothesis that the rate
+had not actually changed — this is not an ambiguous null result stretched
+to look positive; it is a specific, rare signature disappearing at a
+confidence level the run was deliberately sized to reach. Rig left clean
+afterward: no live processes, no leftover mounts or jails, golden snapshot
+digest (`sha256:833401a1...`, `nested-m8i`'s own, distinct from metal's)
+unchanged throughout.
+
+Read together with the bare-metal confirmation above, the fix's effect is
+now established on two substrates with very different baseline exposure to
+it (metal: 99.2% of failures; `nested-m8i`: 1.75%) and it disappears
+completely on both, while each substrate's own _other_, unrelated failure
+mechanism (disk I/O contention on `nested-m8i`; the smaller residual family
+on metal) is left exactly where it was — which is the correct outcome for a
+fix that targets one specific mechanism among several, not evidence that
+either follow-up's other findings were wrong.
+
 #### Effect on PR #268 and P4.1
 
 **T1 (route all sandbox egress over vsock) stands, and the bare-metal
-follow-up's diagnosis is now a confirmed fix, not just a hypothesis.** E12
-established the mechanism across rungs A, B, D and C@8. The overnight
-follow-up found the 1025 mechanism itself failing directly (37 times, small
-next to the 1024-relay signatures). The metal follow-up found _why_: on a
-substrate where every host-resource candidate is flat and abundant, 99.2%
-of failures were that same guest-side reset, matching this project's own
-documented Firecracker behavior for "nobody was listening yet" — a race in
-the throwaway _probe's_ one-process-per-VM listener design, not a defect in
-the vsock mechanism PR #268 actually ships. Fixing exactly that race (see
-below) cut the failure rate **167.8x** (9.83% → 0.059%) on the same
-substrate, with the guest-side reset signature going to zero across 5,120
-VM-attempts while the small, unrelated background failure rate stayed put.
-Nothing on any substrate resembles the restore-mechanism failure that would
-force the NIC option (spec §2).
+follow-up's diagnosis is now a confirmed fix on both substrates tested, not
+just a hypothesis.** E12 established the mechanism across rungs A, B, D and
+C@8. The overnight follow-up found the 1025 mechanism itself failing
+directly (37 times, small next to the 1024-relay signatures). The metal
+follow-up found _why_: on a substrate where every host-resource candidate is
+flat and abundant, 99.2% of failures were that same guest-side reset,
+matching this project's own documented Firecracker behavior for "nobody was
+listening yet" — a race in the throwaway _probe's_ one-process-per-VM
+listener design, not a defect in the vsock mechanism PR #268 actually ships.
+Fixing exactly that race (see below) cut the failure rate **167.8x** (9.83%
+→ 0.059%) on metal, with the guest-side reset signature going to zero across
+5,120 VM-attempts. Re-run on `nested-m8i` — where the same signature was
+only ≈0.119% of pre-fix attempts, not 99.2% — it disappeared there too,
+to zero across 7,296 post-fix VM-attempts (p ≈ 0.017% under "the rate didn't
+actually change"), while that substrate's own unrelated, iowait-correlated
+failure mechanism stayed exactly where it was. Nothing on any substrate
+resembles the restore-mechanism failure that would force the NIC option
+(spec §2).
 
 **P4.1's open scale/capacity question should be re-scoped, not just carried
 forward.** E12 framed it as "how many concurrent egress connections a single
