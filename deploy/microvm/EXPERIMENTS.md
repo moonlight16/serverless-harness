@@ -1234,6 +1234,117 @@ simultaneous restores exceed what a 4-vCPU rig can schedule reliably."
 It is 128 simultaneous restores _plus 256 extra userspace processes doing
 real work_ that are not.
 
+#### Overnight follow-up: 293 iterations, and iowait as the best lead so far
+
+The section above named the missing measurement plainly: "CPU was never
+measured." Getting a real measurement turned out to need a detour first —
+`teardown_jail`'s own `rm -rf` deletes a VM's `console.log` before the
+`/dev/kvm`-busy partial-unmount failure that leaves the jail directory
+behind, so every one of the run's 38 failing VMs had already lost its guest
+console by the time anyone could read it. A throwaway patch to
+`e12-vsock-egress-probe.sh` (`CONSOLE_ARCHIVE`, writing each VM's console
+_outside_ the jail so teardown can't touch it — not committed to this
+driver; kept as a local diagnostic copy) made the logs readable at all. That
+in turn surfaced a genuinely different failure signature on the first
+attempt — a guest-side `ConnectionResetError` on the actual 1025 `connect()`
+— which was reason enough to run this for real rather than by hand: an
+overnight loop (`e13-overnight-loop.sh` + two small Python helpers, same
+throwaway status) re-ran rung C@128 every ~20-160s for most of a night on
+`nested-m8i`, sampling host `MemAvailable`, CPU steal%, and — added mid-run,
+after the first ~74 iterations showed a pattern steal and memory couldn't
+explain — disk iowait%, via `/proc/stat`.
+
+**293 iterations, 37,504 VM-attempts, 8.61% overall failure rate.** Rig
+verified clean afterward every time: no live `firecracker`/`guest_client`
+processes, no leftover bind mounts or jail directories, golden snapshot
+`rootfs` digest unchanged (`sha256:833401a1...`) on every single check across
+the whole night.
+
+##### The bimodal pattern has a real (if partial) explanation now
+
+Iterations split cleanly into two regimes by wall-clock duration — not a
+smooth distribution, two clusters — and the split is not simple alternation:
+fast iterations run in streaks up to 7 long, slow ones are mostly isolated
+singletons (mean streak length ≈ 2).
+
+| Regime (243-iteration run) | n   | mean iowait% | mean steal% | mean `MemAvailable` | per-VM failure rate       |
+| -------------------------- | --- | ------------ | ----------- | ------------------- | ------------------------- |
+| Fast (< 30s)               | 136 | 0.108%       | 0.117%      | 12.42 GiB           | **2.37%** (413/17,408)    |
+| Slow (≥ 30s, ~125-160s)    | 107 | 0.922%       | 0.161%      | 12.72 GiB           | **15.81%** (2,165/13,696) |
+
+Steal and memory are the same story the single-run telemetry already told —
+flat, low, and if anything _higher_ available memory in the slow group, not
+lower. iowait is the first metric all night that actually moves between the
+two regimes, and by a wide margin (8.5x). Correlating per-iteration values
+directly (Pearson, n=243): duration↔iowait **r=0.788** (strong), duration↔
+fail_count **r=0.582** (moderate-strong), iowait↔fail_count **r=0.41**
+(moderate). That last number is the honest one to hold onto: real and
+stable across nearly 300 iterations, but a 0.41 correlation is a
+contributor, not a single sufficient cause — plenty of variance in
+fail_count isn't explained by iowait alone.
+
+**What this most plausibly is, stated at the confidence the evidence
+supports:** disk I/O contention — plausibly EBS burst-balance throttling,
+since sustained iowait with flat CPU/memory is exactly that signature — is a
+real contributor to the slow/high-failure regime, on a rig this is a _shared_
+EC2 instance type. This is inferred from the iowait correlation and the
+absence of any better-fitting alternative among the three metrics collected,
+not confirmed against an AWS-level burst-balance or `CreditBalance`
+CloudWatch metric, which nothing in this run captured. The mechanism from
+E12/E13's core section (extra host processes + heavier guest Exec payload
+holding VMs open longer) is still very plausibly what makes fast iterations
+occasionally slip into the slow regime in the first place — iowait explains
+which iterations get _worse_ once something is already straining the box,
+not why straining happens on this workload at all.
+
+##### What actually failed, categorized across all of part 2 (243 iterations)
+
+| Signature                                                            | Count  | Where in the lifecycle                                                                                |
+| -------------------------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------- |
+| `read: EOF`                                                          | 1,769  | Mid-protocol — CONNECT handshake already succeeded, response never arrives (E12's original signature) |
+| dial failed, connection refused                                      | 132    | Earliest possible failure — `guest_client` couldn't reach Firecracker's own local vsock socket at all |
+| handshake ack read, connection reset                                 | 101    | Early — the `CONNECT <port>` handshake itself fails, before any real data flows                       |
+| handshake ack read, EOF                                              | 62     | Same stage, different failure mode                                                                    |
+| **guest-side `ConnectionResetError` on the 1025 `connect()` itself** | **37** | **Inside the guest, on the actual second-port mechanism — not the 1024 relay**                        |
+| short-payload framing error                                          | 6      | Protocol-level, mid-response                                                                          |
+| handshake ack read, i/o timeout                                      | 4      | Same stage as above, an explicit timeout rather than a reset/EOF — itself an I/O-flavored symptom     |
+
+2,113 per-VM records recovered against a `fail_count` sum of 2,578 — the
+~18% gap is the same `die()`-bypass bookkeeping gap E12's own combined run
+hit, not a new one; it costs per-VM detail, not aggregate accuracy.
+
+Two things worth being precise about, in both directions:
+
+- **The failure signature is not one bug.** It spans the entire connection
+  lifecycle, from the earliest possible failure (can't even reach
+  Firecracker's own socket) through the handshake to the mid-protocol
+  `read: EOF` that dominated the single-run analysis above. That spread — not
+  one narrow defect recurring — is consistent with something degrading the
+  whole host-side connection-serving path under load, which fits the iowait
+  finding better than it would fit a single specific code bug.
+- **The second port is now directly implicated, 37 times, not once.** E12's
+  original run and this section's single-run analysis both located every
+  observed failure in the 1024 relay and treated the 1025 mechanism as
+  unimplicated-but-uncleared. Running it 243 more times found 37 cases of a
+  guest-side traceback on the second port's own `connect()` call — direct
+  evidence, not inference, that the 1025 mechanism itself fails under this
+  same load, at a low but real rate (37 of ~2,113 recovered failures, ≈1.75%
+  of all recovered failures across the whole run).
+
+##### What this run did not do
+
+In the interest of not overstating coverage: the loop's own disk hygiene
+(matching the earlier single-run diagnostic) keeps a VM's console log only
+for iterations with `fail_count > 0` — 107 of them in part 2 alone, still
+sitting under the rig's `/tmp/e13-overnight-part2/iter-*/console/`
+directories (gitignored, not pulled into this repo, per the same precedent
+as every other rig artifact this section cites). Beyond the single example
+that motivated this whole follow-up (one passing VM's console showing a
+genuine `sched: DL replenish lagged too much` kernel warning during the very
+first exploratory run), those logs were never systematically mined for
+kernel-level anomalies across the full night. That is a real, still-available
+next step, not something this section's numbers already cover.
+
 #### Effect on PR #268 and P4.1
 
 **T1 (route all sandbox egress over vsock) stands, and on firmer ground than
@@ -1242,7 +1353,11 @@ E13 adds that the one rung that failed did not fail in the second-port
 CONNECT/data path, that its failures were not memory, and that they were not
 the restore concurrency the design would actually have to live with. Nothing
 in either run resembles the restore-mechanism failure that would force the
-NIC option (spec §2).
+NIC option (spec §2). The overnight follow-up complicates this only
+slightly: 37 of ~2,113 recovered failures over 243 iterations _did_ show the
+1025 mechanism itself failing, directly — small and infrequent next to the
+1024-relay signatures, but no longer zero. T1 stands; "the second-port
+mechanism has never been observed to fail" no longer does.
 
 **P4.1's open scale/capacity question should be re-scoped, not just carried
 forward.** E12 framed it as "how many concurrent egress connections a single
@@ -1251,7 +1366,9 @@ rate-limited." The restore-count half of that is answered in the negative at
 N=128 for a 4-vCPU rig, so staggering restores is not the lever. The
 question that survives is: **how much concurrent CPU-bound work the host and
 guests do alongside a restore burst, and whether the agent Exec channel on
-1024 stays healthy under it.** Concretely, for P4.1:
+1024 stays healthy under it** — and, per the overnight run, **whether the
+host's disk I/O is under contention at the same time.** Concretely, for
+P4.1:
 
 1. **Do not carry E12's one-host-process-per-connection shape into the
    implementation.** The probe's per-VM `python3` listener was fine for a
@@ -1262,9 +1379,27 @@ guests do alongside a restore burst, and whether the agent Exec channel on
    observed failure is an unrelated channel's transport dying while the host
    is busy. Whatever P4.1 builds on top of Exec needs a retry with backoff;
    a single `read: EOF` must not be terminal.
-3. **Gate on a distribution, not a run.** 1/128, 52/128 and 38/128 for the
-   same rung at the same N means any acceptance threshold needs repeated
-   trials. A single clean run proves nothing here, and neither does a single
-   bad one.
-4. **Measure CPU next time.** The one telemetry axis that would have turned
-   this run's inference into a measurement was not collected.
+3. **Gate on a distribution, not a run.** 1/128, 52/128, 38/128, and now a
+   243-iteration spread from 0 to 61 failures for the same rung at the same
+   N means any acceptance threshold needs repeated trials. A single clean
+   run proves nothing here, and neither does a single bad one.
+4. **Measure disk I/O, not just CPU.** iowait — not steal, not memory — is
+   the only metric collected so far that actually separates the slow/failing
+   regime from the clean one (r=0.788 against duration). On a shared EC2
+   instance type, that points at storage-layer contention (plausibly EBS
+   burst-balance throttling) as more load-bearing than CPU scheduling for
+   this specific failure mode; confirming it needs an AWS-level burst-balance
+   metric, which this run did not collect.
+5. **Treat the second port as fallible too, not just unimplicated.** 37
+   guest-side resets on the 1025 `connect()` itself, out of 243 iterations,
+   is low-rate but real. Whatever P4.1 builds should not assume the
+   guest-initiated direction is failure-free just because it fails less often
+   than the host-initiated one does under the same load.
+6. **CPU utilization itself is still unmeasured.** The overnight follow-up
+   added steal% and iowait%, and steal (time stolen by the physical
+   hypervisor) turned out flat and uninformative — but that is not the same
+   as measuring this host's own CPU utilization or run-queue depth during
+   the burst, which nothing in either run collected. Steal ruled out one
+   specific noisy-neighbor mechanism; it did not rule out ordinary
+   self-inflicted CPU contention from the 256 extra processes this workload
+   itself starts.
