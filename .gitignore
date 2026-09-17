@@ -47,3 +47,7 @@ go.work.sum
 deploy/microvm/e13-results/
 deploy/microvm/e13-control-results/
 deploy/microvm/e13-telemetry/
+
+# Python bytecode cache - deploy/microvm/tests/e13-correlate.test.sh imports
+# e13-correlate.py, and every run regenerates this.
+__pycache__/
