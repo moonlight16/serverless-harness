@@ -30,9 +30,11 @@ check "control executable" "$([ -x "$SCRIPT" ] && echo yes || echo no)" "yes"
 if command -v shellcheck >/dev/null; then
   # -x (follow sourced files) is required here, and its own `source=` path
   # in e13-restore-capacity-control.sh resolves relative to shellcheck's
-  # CWD, not the linted file's directory - confirmed by hand against this
-  # shellcheck build - so cd into $DIR first, or SC1091 fires even with a
-  # correct directive and the sourced file sitting right next to it.
+  # CWD, not the linted file's directory - confirmed by hand against the
+  # build of shellcheck in use - so cd into $DIR first, or SC1091 fires even
+  # with a correct directive and the sourced file sitting right next to it.
+  # (Do not start a comment line with the tool's own name: it gets parsed as
+  # a directive and fails SC1072/SC1073.)
   if (cd "$DIR" && shellcheck -x "$(basename "$SCRIPT")") >/tmp/e13-control-shellcheck.out 2>&1; then
     check "shellcheck" "clean" "clean"
   else
