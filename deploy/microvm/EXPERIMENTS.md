@@ -1069,10 +1069,10 @@ the channel it degrades is the pre-existing Exec path on port 1024, not the
 Both ran back to back on the same host, under the same 1 Hz memory/OOM
 sampler (`e13-mem-telemetry.sh`), within the same 40-second window.
 
-| Run                                                                     | What each VM does after restore                                                                                                                                                                                           | Result                                                        | Wall time | `MemAvailable` floor                       | OOM events |
-| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- | --------- | ------------------------------------------ | ---------- |
-| Control, N=128 (`e13-restore-capacity-control.sh`)                      | existing host-initiated Exec on vsock:1024 only, `-command true`; no listener on 1025, no guest-side script, no second port at all                                                                                        | `ok=true`, **128/128**, `fail_count=0`                        | 5.442s    | 15,098,597,376 B (14.06 GiB), ~0.26 GB dip | 0          |
-| E12 rung C@128, rerun standalone (`e12-vsock-egress-probe.sh -rungs C`) | one host-side `python3` listener process per VM on `<jail>/vsock.sock_1025`, plus an Exec on 1024 that base64-decodes and runs a `python3` script **inside** the guest to do a real AF_VSOCK connect/send/recv round trip | `ok=false`, 90/128, **`fail_count=38`**, `nonce_collisions=0` | 17.204s   | 13,231,726,592 B (12.32 GiB), ~2.13 GB dip | 0          |
+| Run                                                                                               | What each VM does after restore                                                                                                                                                                                           | Result                                                        | Wall time | `MemAvailable` floor                       | OOM events |
+| ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- | --------- | ------------------------------------------ | ---------- |
+| Control, N=128 (`e13-restore-capacity-control.sh`)                                                | existing host-initiated Exec on vsock:1024 only, `-command true`; no listener on 1025, no guest-side script, no second port at all                                                                                        | `ok=true`, **128/128**, `fail_count=0`                        | 5.442s    | 15,098,597,376 B (14.06 GiB), ~0.26 GB dip | 0          |
+| E12 rung C@128, rerun standalone (`SH_E12_RUNGS=C SH_E12_C_LADDER=128 e12-vsock-egress-probe.sh`) | one host-side `python3` listener process per VM on `<jail>/vsock.sock_1025`, plus an Exec on 1024 that base64-decodes and runs a `python3` script **inside** the guest to do a real AF_VSOCK connect/send/recv round trip | `ok=false`, 90/128, **`fail_count=38`**, `nonce_collisions=0` | 17.204s   | 13,231,726,592 B (12.32 GiB), ~2.13 GB dip | 0          |
 
 Per-VM and per-rung JSON, the telemetry timelines and the correlation output
 are rig artifacts, not committed (`deploy/microvm/e13-results/`,
@@ -1082,18 +1082,31 @@ precedent) — the numbers here are the complete record of what they showed.
 
 Every one of the 38 failures carries the identical signature PR #272
 reported: `"guest_client_exit":1` with
-`"guest_output":"e12-guest-client: read: EOF"`, and `"host_witness":"no"` /
-`"guest_witness":"no"`. Unlike E12's combined run, this rerun has **no
-bookkeeping gap** — 38 counted failures, 38 per-VM records, all 128 per-VM
-records present — so no `die()`-path failures are hiding here (see E12's
-4-VM gap above).
+`"guest_output":"e12-guest-client: read: EOF"`, and `"guest_witness":"no"`.
+The host witness is **not** uniform, and the exception matters: 36 of the 38
+show `"host_witness":"no"`, but **two — VM indices 12 and 52 — show
+`"host_witness":"yes"`**. `host_ok` is set only by
+`[ "$host_nonce" = "$nonce" ]`, so in those two the host listener captured
+that VM's own unique nonce, byte-for-byte, on `<jail>/vsock.sock_1025`: the
+guest ran its `python3` payload, opened an AF_VSOCK connection to the host on
+1025 and sent its nonce, and only afterwards did the read of the 1024 response
+fail. (Precisely: this witnesses the guest→host leg. The guest's own
+subsequent `recv()` of the host's `ACK` cannot be checked, because the only
+channel that would have carried that evidence — its stdout, relayed over 1024
+— is the one that broke, which is also why `"guest_witness":"no"` is forced
+for all 38 regardless of what the guests actually did.) All 90 passing VMs are
+`"host_witness":"yes"` too, so 92 of 128 nonces arrived host-side in a run
+scored 90/128. Unlike E12's
+combined run, this rerun has **no bookkeeping gap** — 38 counted failures, 38
+per-VM records, all 128 per-VM records present — so no `die()`-path failures
+are hiding here (see E12's 4-VM gap above).
 
 #### Memory is ruled out directly, and prediction 7's premise never materialized
 
 `e13-correlate.py` matched all 128 per-VM records against the memory
 timeline: `oom_events_total=0`, `failed_near_oom_event=0`,
 `failed_below_low_water=0` (of 38), `ok_near_oom_event=0`,
-`below_low_water=0`. `oom-events.log` is zero bytes for both runs. The
+`ok_below_low_water=0`. `oom-events.log` is zero bytes for both runs. The
 floor across the failing run was 13,231,726,592 bytes — **12.32 GiB still
 available**, i.e. roughly 80% of the rig's memory free at the worst moment of
 a run in which 30% of connections failed. There is no exhaustion here to
@@ -1155,23 +1168,34 @@ Two honesty caveats on that, in the same spirit as E12's:
 
 - **CPU was never measured.** `e13-mem-telemetry.sh` samples `MemAvailable`
   and the OOM killer, nothing else. "CPU/scheduling contention" is therefore
-  an inference from elimination plus the ~1.9 GB and 3.2× wall-time deltas,
+  an inference from elimination plus the ~1.87 GB (2.13 GB − 0.26 GB, the
+  incremental memory cost over the control's own dip) and 3.2× wall-time deltas,
   not an observation. Confirming it needs host CPU-utilization and
   run-queue-depth sampling across the burst, plus the cheap discriminating
   experiment this run did not do: rerun the control at N=128 with `-command`
   changed from `true` to the same guest-side `python3` payload but **no**
   1025 listener, which separates the guest-side cost from the host-side
   process cost.
-- **The 1025 hop was probably never reached in these 38 cases, and cannot be
-  cleared or blamed from these artifacts alone.** `read: EOF` is the
+- **The degraded channel is the 1024 Exec relay, and in two cases that is
+  directly observed rather than inferred.** `read: EOF` is the
   `guest_client`'s own transport error reading the framed response from
   **vsock:1024**; the guest-side script that would connect to 1025 is
-  _delivered by_ that same Exec call. `"host_witness":"no"` on all 38 is
-  therefore an expected downstream consequence of the 1024 relay dying, not
-  independent evidence about 1025. What can be said is that the failure is
-  located in the port-1024 Exec relay and that no failure in this run is
-  attributable to the 1025 mechanism; what cannot be said from these
-  artifacts is that each guest definitively never attempted the 1025 connect.
+  _delivered by_ that same Exec call. So for the 36 failures with
+  `"host_witness":"no"`, that absent nonce is an expected downstream
+  consequence of the 1024 relay dying and is not independent evidence about
+  1025 — those cases cannot distinguish "the guest never ran" from "the guest
+  ran and the 1025 connect failed." But indices 12 and 52 settle it in the
+  affirmative for themselves: their nonces **were** captured on
+  `vsock.sock_1025`, so in those two the guest-side `python3` payload was
+  delivered, started, and got as far as connecting to the host on 1025 and
+  sending its nonce — and the read of the 1024 response failed afterwards. In
+  at least those two cases the 1025 hop was demonstrably reached and worked.
+  That is direct evidence for the added-workload reading — the expensive
+  guest-side work does get done — and it localizes the fault in the 1024 Exec
+  relay rather than in the mechanism E12 added. Two of 38 is a narrow base,
+  and it witnesses the guest→host leg only, so it is offered as an existence
+  proof, not as a rate and not as a clean bill of health for the whole
+  exchange.
 
 #### Prediction (spec-style, pinned in `predictions.json` id 7)
 
