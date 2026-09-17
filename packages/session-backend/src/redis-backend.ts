@@ -41,7 +41,7 @@ export class RedisSessionBackend<E = unknown> implements LogStore<E> {
    * black-holed SYN rejects with `ConnectionTimeoutError` once the 5s default `connectTimeout` fires.
    * In a cluster the second is the one to expect -- a Service with no ready endpoints, or a
    * NetworkPolicy drop, black-holes the SYN rather than refusing it. (That shape costs ~60 s to
-   * reject, not the ~210 ms quoted for a refused port -- see redis-errors.ts.)
+   * reject, against ~5.5 s for a refused port at this bound -- see redis-errors.ts.)
    *
    * Both of those rejections were previously a SIDE EFFECT of having no `'error'` listener, and this
    * class now has one. That is why the client is built with `resilientClientOptions`: its bounded

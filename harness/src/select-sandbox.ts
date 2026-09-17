@@ -40,44 +40,93 @@ type Closable = { close(): Promise<void> };
 let recordsMemo: { url: string | undefined; store: RecordStore & Closable } | null = null;
 let leaseMemo: { url: string | undefined; store: LeaseStore & Closable } | null = null;
 
-function sharedRecords(url: string | undefined): RecordStore {
+/**
+ * Resolve the memoised store, building one if there is none or the URL changed.
+ *
+ * Split out of the wrappers below because they must call it PER COMMAND rather than once — see
+ * `sharedLease`. Kept as two concrete functions rather than one generic helper so each `new` stays
+ * lexically inside its memo assignment, which is what `redis-client-per-turn.test.ts` asserts.
+ */
+function recordsStore(url: string | undefined): RecordStore & Closable {
   if (!recordsMemo || recordsMemo.url !== url) {
     // A changed REDIS_URL means a different Redis; drop the old client rather than silently talking
     // to the wrong one. Closing is best-effort — it is being replaced either way.
     if (recordsMemo) void recordsMemo.store.close().catch(() => {});
     recordsMemo = { url, store: new RedisRecordStore(url) };
   }
-  const store = recordsMemo.store;
-  const drop = () =>
-    dropMemo(
-      store,
-      () => recordsMemo,
-      () => (recordsMemo = null),
-    );
-  return {
-    put: (rec) => guard(store.put(rec), drop),
-    remove: (id) => guard(store.remove(id), drop),
-    list: () => guard(store.list(), drop),
-  };
+  return recordsMemo.store;
 }
 
-function sharedLease(url: string | undefined): LeaseStore {
+function leaseStore(url: string | undefined): LeaseStore & Closable {
   if (!leaseMemo || leaseMemo.url !== url) {
     if (leaseMemo) void leaseMemo.store.close().catch(() => {});
     leaseMemo = { url, store: new RedisLeaseStore(url) };
   }
-  const store = leaseMemo.store;
-  const drop = () =>
-    dropMemo(
-      store,
-      () => leaseMemo,
-      () => (leaseMemo = null),
+  return leaseMemo.store;
+}
+
+function sharedRecords(url: string | undefined): RecordStore {
+  const call = <T>(fn: (store: RecordStore) => Promise<T>): Promise<T> => {
+    const store = recordsStore(url);
+    return guard(fn(store), () =>
+      dropMemo(
+        store,
+        () => recordsMemo,
+        () => (recordsMemo = null),
+      ),
     );
+  };
   return {
-    load: (pod) => guard(store.load(pod), drop),
-    acquire: (pod, cap, runId, ttlMs) => guard(store.acquire(pod, cap, runId, ttlMs), drop),
-    heartbeat: (pod, runId, ttlMs) => guard(store.heartbeat(pod, runId, ttlMs), drop),
-    release: (pod, runId) => guard(store.release(pod, runId), drop),
+    put: (rec) => call((s) => s.put(rec)),
+    remove: (id) => call((s) => s.remove(id)),
+    list: () => call((s) => s.list()),
+  };
+}
+
+/**
+ * The wrapper resolves the memo PER COMMAND, not once when the wrapper is built.
+ *
+ * That distinction is the whole point, because `selectPoolSandbox` hands its caller CLOSURES over
+ * this wrapper (`heartbeat`/`release`, below) and every caller ticks them for the life of the turn or
+ * leaf — `run-leaf.ts`'s three `setInterval`s, `run-turn.ts`'s renewal. Binding one store instance
+ * here meant those closures could not see the memo's own recovery: `dropMemo` closes the failed store
+ * and clears the memo, the next `selectPoolSandbox` gets a healthy one, but the captured closure still
+ * points at the closed client — whose every command rejects `ClientClosedError` for the life of the
+ * process, and whose further drops are no-ops because `dropMemo` identity-checks against a memo that
+ * now holds a different store.
+ *
+ * A one-command blip therefore cost the lease for the entire turn: renewals stop, the TTL lapses, and
+ * the pod goes back in the pool while the turn is still executing in it — over-subscribing the soft
+ * cap `ACQUIRE_LUA` enforces. Each later tick was also a fresh rejection, which is what made an
+ * unguarded `void lease.heartbeat()` a repeat process-killer rather than a one-off.
+ *
+ * Recovery deliberately comes from the memo and NOT from an `arm()`/`open()` re-arm inside
+ * `RedisLeaseStore` (the shape `RedisSessionBackend`, `RedisWorkQueue` and `RedisResultStore` use).
+ * Those four are memoised for the process's life and never closed on any path that keeps using them,
+ * so reconnecting in place is right there. This store is different: `dropMemo` CLOSES it on purpose,
+ * and node-redis will happily reopen a closed client (probed on the pinned redis 6.2.1 — `close()`
+ * then `connect()` yields `isOpen: true` and PINGs). A re-arm would therefore resurrect a store that
+ * no memo references and nothing will ever close again: one orphaned connection per outage, in the
+ * code that exists to keep connections off the `maxclients` ceiling. Re-entering the memo has the
+ * self-healing without the orphan, and it makes the exemption `redis-errors.ts` claims for these two
+ * stores unconditional — it no longer depends on the caller re-entering `sharedLease()` by hand.
+ */
+function sharedLease(url: string | undefined): LeaseStore {
+  const call = <T>(fn: (store: LeaseStore) => Promise<T>): Promise<T> => {
+    const store = leaseStore(url);
+    return guard(fn(store), () =>
+      dropMemo(
+        store,
+        () => leaseMemo,
+        () => (leaseMemo = null),
+      ),
+    );
+  };
+  return {
+    load: (pod) => call((s) => s.load(pod)),
+    acquire: (pod, cap, runId, ttlMs) => call((s) => s.acquire(pod, cap, runId, ttlMs)),
+    heartbeat: (pod, runId, ttlMs) => call((s) => s.heartbeat(pod, runId, ttlMs)),
+    release: (pod, runId) => call((s) => s.release(pod, runId)),
   };
 }
 

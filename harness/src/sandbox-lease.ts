@@ -73,8 +73,20 @@ export class RedisLeaseStore implements LeaseStore {
     await this.ready;
     await this.client.zRem(leaseKey(pod), sessionId);
   }
+  /**
+   * Tear the client down without re-throwing a failed connect.
+   *
+   * A bare `await this.ready` re-threw exactly on the store this is most often called for:
+   * `select-sandbox.ts`'s `dropMemo` closes the store a rejected command evicted, and the commonest
+   * such rejection IS the rejected connect. Nothing leaks either way -- a client past the reconnect
+   * bound has `isOpen: false` and its socket already destroyed, and node-redis's `close()` rejects
+   * `ClientClosedError` on it regardless (probed on the pinned redis 6.2.1) -- but a teardown that
+   * rejects on the failure path is a trap for the next caller: today's two both swallow, and one that
+   * awaits would fail precisely when teardown matters. Same shape as `RedisRecordStore.close()` and
+   * `RedisSessionBackend.close()`.
+   */
   async close(): Promise<void> {
-    await this.ready;
-    await this.client.close();
+    await this.ready.catch(() => {});
+    if (this.client.isOpen) await this.client.close();
   }
 }

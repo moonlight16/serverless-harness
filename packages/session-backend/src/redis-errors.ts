@@ -23,16 +23,19 @@ const DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
  *  - With the listener but node-redis's DEFAULT strategy, the listener consumes the very error that
  *    used to make a failed `connect()` reject, so the attempt retries forever and `connect()` never
  *    settles. Probed on the pinned redis 6.2.1 against a dead port: no listener rejects in ~1 ms,
- *    listener-only is still pending at 6 s, listener plus this bound rejects in ~210 ms with
+ *    listener-only is still pending at 6 s, listener plus this bound rejects with
  *    `ReconnectStrategyError`.
  *
- *    That ~210 ms is the REFUSED-port case, where `ECONNREFUSED` returns at once and only the delays
- *    below accumulate. A black-holed SYN -- a Service with no ready endpoints, or a NetworkPolicy drop,
- *    which is the shape to expect in a cluster -- instead pays the full `connectTimeout` per attempt
- *    (5 s by default; `#createSocket` arms `socket.setTimeout` and destroys with
- *    `ConnectionTimeoutError`, socket.js:278-284). Eleven attempts plus ~5.5 s of delays is ~60 s to
- *    reject, not 210 ms. Still bounded, still loud, still re-armed -- but do not size a timeout against
- *    the 210 ms. Left as the 5 s default deliberately: a tighter `connectTimeout` would make a Redis
+ *    Two figures, and it matters which is quoted. A REFUSED port returns `ECONNREFUSED` at once, so
+ *    only the delays below accumulate: at THIS bound ~5.5 s, the sum of `min(retries * 100, 1000)`
+ *    over retries 0..10 (measured 5537 ms). The ~210 ms an earlier revision of this note quoted was a
+ *    probe at a REDUCED bound -- the `maxReconnectAttempts` test seam -- and is an order of magnitude
+ *    out for the default (measured: max=0 -> 4 ms, max=1 -> 105 ms, max=10 -> 5537 ms). A black-holed
+ *    SYN -- a Service with no ready endpoints, or a NetworkPolicy drop, which is the shape to expect in
+ *    a cluster -- instead pays the full `connectTimeout` per attempt (5 s by default; `#createSocket`
+ *    arms `socket.setTimeout` and destroys with `ConnectionTimeoutError`, socket.js:278-284), so twelve
+ *    attempts is ~60 s to reject. Still bounded, still loud, still re-armed -- but size nothing against
+ *    the refused-port number. Left as the 5 s default deliberately: a tighter `connectTimeout` would make a Redis
  *    that merely takes >1 s to accept (cold start, TLS, cross-AZ DNS) exhaust the bound on timeouts
  *    alone and never connect at all, trading a slow correct failure for a permanent one.
  *
@@ -57,8 +60,12 @@ const DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
  * signal and nothing else: node-redis keeps it TRUE for the whole retry sequence (only `isReady` drops
  * while reconnecting) and false only on the terminal give-up or an explicit close. `RedisSessionBackend`,
  * `RedisWorkQueue` and `RedisResultStore` each do this in `open()`. `sharedLease` / `sharedRecords`
- * (select-sandbox.ts) are exempt: their `guard()` evicts the memo on any rejected command, so the
- * `ClientClosedError` itself rebuilds the client.
+ * (select-sandbox.ts) are exempt, and their exemption is unconditional rather than caller-dependent:
+ * `guard()` evicts the memo on any rejected command, and the wrapper resolves that memo PER COMMAND,
+ * so the `ClientClosedError` itself rebuilds the client even for a caller holding a closure rather
+ * than re-entering `sharedLease()`. Re-arming in place would be WRONG for those two, not merely
+ * redundant: `dropMemo` closes the store it evicts, and `connect()` reopens a closed client, so an
+ * in-place re-arm would resurrect a store no memo references and nothing will ever close again.
  *
  * `RedisRecordStore` (harness/src/pool-records.ts) reached the same pairing from the same probe in
  * #251 and keeps its own copy inline; this is the shared form for the other four long-lived clients.

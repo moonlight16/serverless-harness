@@ -43,9 +43,10 @@ export class RedisWorkQueue implements WorkQueue {
     // `swallowRedisErrors` in @sh/session-backend (with the full rationale and the probe numbers), and
     // a queue depending on the session store to reach it would invert the layering.
     //
-    // Two notes from that shared rationale apply here verbatim. A REFUSED port rejects in ~210 ms, but
-    // a black-holed SYN -- the cluster shape, from a Service with no ready endpoints or a NetworkPolicy
-    // drop -- pays the full 5 s connectTimeout per attempt, so ~60 s to reject. And past this bound
+    // Two notes from that shared rationale apply here verbatim. A REFUSED port rejects in ~5.5 s at this
+    // bound (its delays and nothing else), but a black-holed SYN -- the cluster shape, from a Service
+    // with no ready endpoints or a NetworkPolicy drop -- pays the full 5 s connectTimeout per attempt,
+    // so ~60 s to reject. And past this bound
     // node-redis gives up PERMANENTLY and silently; the isOpen re-arm in open() is the other half of
     // this fix, without which every later command rejects ClientClosedError for the life of the process.
     this.client = createClient({
