@@ -1345,61 +1345,149 @@ first exploratory run), those logs were never systematically mined for
 kernel-level anomalies across the full night. That is a real, still-available
 next step, not something this section's numbers already cover.
 
+##### Bare-metal follow-up: the failure is substrate-independent, and the signature inverts
+
+The overnight run's own leading hypothesis (disk I/O contention, plausibly
+EBS burst-balance throttling — a mechanism specific to `nested-m8i` being a
+_shared_ EC2 instance type) is directly testable by running the identical
+diagnostic on dedicated hardware with none of the candidate confounds: no
+hypervisor above the guest, no shared tenancy, no EBS. `metal` in this
+project's own SH_SUBSTRATE convention (72 vCPU / 754 GiB, the same host
+E10/E11's bare-metal rungs used, golden snapshot digest
+`sha256:668af589...` confirmed unchanged before, during, and after) is
+exactly that host, already reserved. One hour, `SH_SUBSTRATE=metal`, same
+console-preserving throwaway patch, same telemetry.
+
+**80 iterations, 10,240 VM-attempts, 9.83% overall failure rate — essentially
+the same magnitude as `nested-m8i`'s 8.61%, on hardware with none of that
+rig's candidate causes.** `max_steal_pct` is `0.0` on every single iteration
+(correctly — there is no hypervisor above bare metal to steal from).
+`max_iowait_pct` stays in a narrow 0.40-1.35% band (mean 0.755%), nothing
+like `nested-m8i`'s 8x fast/slow split. `min_mem_available_bytes` never
+drops below 800 GB of ~810 GB total. Duration is tight and unimodal —
+14.19-16.40s, mean 15.05s — the bimodal ~19s/~125s pattern that dominated
+`nested-m8i` **does not appear at all**. And critically: **every single one
+of the 80 iterations had at least 2 failures** (range 2-21, mean 12.59) —
+this is not an occasional bad run, it is a persistent baseline. Correlating
+per-iteration values directly (Pearson, n=80): duration↔iowait **r=-0.136**,
+duration↔fail_count **r=0.198**, iowait↔fail_count **r=-0.132** — all three
+essentially null. Nothing this project measured on either substrate explains
+metal's failure rate.
+
+**The failure signature composition inverts completely.** `nested-m8i`
+recovered 2,113 failing records, 84% `read: EOF` (the 1024 relay dying, not
+the 1025 mechanism) and only 37 (1.75%) a guest-side `ConnectionResetError`
+on the 1025 `connect()` itself. Metal recovered 1,007 failing records, and
+**999 of them (99.2%)** are that same guest-side `ConnectionResetError` —
+`read: EOF` drops to 4 occurrences (0.4%).
+
+That inversion, together with the null correlations above, points at a
+specific, previously undiagnosed mechanism rather than resource contention
+of any kind: per this project's own documented Firecracker behavior ("if
+nobody listens, the guest gets `VIRTIO_VSOCK_OP_RST`" — `vsock.md`, quoted in
+`e12-vsock-egress-probe.sh`'s own header), a `ConnectionResetError` on the
+guest's `connect()` is the _expected_ response when the guest's connection
+attempt reaches Firecracker before the host-side listener on
+`<uds>_<PROBE_PORT>` is actually bound. `start_host_listener` starts a fresh
+`python3` process per VM and returns as soon as it is backgrounded — **not**
+once that process has reached `srv.listen()` — so at N=128, forking and
+execing 128 Python interpreters in close succession creates real variance in
+exactly when each one starts listening, independent of how much host
+compute is available to absorb that fork/exec burst. A guest whose `connect()`
+lands in that window gets RST, correctly, because nothing was listening yet.
+This is a race in the **probe's own per-VM-listener design**, not a defect
+in Firecracker's vsock backend or in the guest-initiated direction as such —
+and it is exactly why P4.1's existing recommendation to use one persistent,
+pre-bound multiplexed listener rather than one process per connection is not
+just an efficiency improvement: a listener that is already bound and
+`listen()`-ing long before any restore happens cannot lose this race at all.
+
+##### Rulings from this comparison
+
+- **The disk-I/O correlation found on `nested-m8i` is now best read as a
+  real but secondary or confounding signal, not the primary mechanism.**
+  It explained real variance on that specific, shared substrate and should
+  not be discarded — but it explains none of metal's failure rate, and
+  metal's failure rate is the same order of magnitude. The listener-startup
+  race is the more defensible primary explanation on the evidence collected
+  so far, precisely because it reproduces, unchanged in magnitude, on a
+  substrate where every host-resource-contention candidate this project has
+  measured (steal, iowait, memory) is flat, low, and abundant.
+- **This was never a test of whether the golden snapshot or the restore
+  mechanism itself is sound on metal** — rungs A, B, D and C@8 are not what
+  this follow-up re-ran, and nothing here should be read as reopening those.
+  It is specifically about rung C@128's own concurrent-probe apparatus,
+  which is throwaway diagnostic code, not the mechanism PR #268 would ship.
+
 #### Effect on PR #268 and P4.1
 
-**T1 (route all sandbox egress over vsock) stands, and on firmer ground than
-after E12.** E12 established the mechanism across rungs A, B, D and C@8;
-E13 adds that the one rung that failed did not fail in the second-port
-CONNECT/data path, that its failures were not memory, and that they were not
-the restore concurrency the design would actually have to live with. Nothing
-in either run resembles the restore-mechanism failure that would force the
-NIC option (spec §2). The overnight follow-up complicates this only
-slightly: 37 of ~2,113 recovered failures over 243 iterations _did_ show the
-1025 mechanism itself failing, directly — small and infrequent next to the
-1024-relay signatures, but no longer zero. T1 stands; "the second-port
-mechanism has never been observed to fail" no longer does.
+**T1 (route all sandbox egress over vsock) stands, on firmer ground than
+after E12, and the bare-metal follow-up is the best news yet for it.** E12
+established the mechanism across rungs A, B, D and C@8. The overnight
+follow-up found the 1025 mechanism itself failing directly (37 times, small
+next to the 1024-relay signatures). The metal follow-up then found _why_, on
+the balance of evidence collected so far: on a substrate where every
+host-resource candidate is flat and abundant, 99.2% of failures are that
+same guest-side reset, and it matches this project's own documented
+Firecracker behavior for "nobody was listening yet" — which points at a race
+in the throwaway _probe's_ one-process-per-VM listener design, not a defect
+in the vsock mechanism PR #268 actually ships. Nothing on any substrate
+resembles the restore-mechanism failure that would force the NIC option
+(spec §2).
 
 **P4.1's open scale/capacity question should be re-scoped, not just carried
 forward.** E12 framed it as "how many concurrent egress connections a single
 host is expected to serve, and whether restores should be staggered or
 rate-limited." The restore-count half of that is answered in the negative at
-N=128 for a 4-vCPU rig, so staggering restores is not the lever. The
-question that survives is: **how much concurrent CPU-bound work the host and
-guests do alongside a restore burst, and whether the agent Exec channel on
-1024 stays healthy under it** — and, per the overnight run, **whether the
-host's disk I/O is under contention at the same time.** Concretely, for
-P4.1:
+N=128 on every substrate tried, so staggering restores is not the lever. The
+question that survives is narrower than either follow-up first suggested:
+**does P4.1's own listener implementation avoid the specific startup-ordering
+race this probe's throwaway version did not.** Concretely, for P4.1:
 
 1. **Do not carry E12's one-host-process-per-connection shape into the
-   implementation.** The probe's per-VM `python3` listener was fine for a
-   throwaway diagnostic and is the largest single difference between the
-   clean control and the failing rung. Production egress wants one
-   multiplexed host-side listener, not a process per VM or per connection.
-2. **Treat the Exec relay on 1024 as fallible under concurrent load.** The
-   observed failure is an unrelated channel's transport dying while the host
-   is busy. Whatever P4.1 builds on top of Exec needs a retry with backoff;
-   a single `read: EOF` must not be terminal.
-3. **Gate on a distribution, not a run.** 1/128, 52/128, 38/128, and now a
-   243-iteration spread from 0 to 61 failures for the same rung at the same
-   N means any acceptance threshold needs repeated trials. A single clean
-   run proves nothing here, and neither does a single bad one.
-4. **Measure disk I/O, not just CPU.** iowait — not steal, not memory — is
-   the only metric collected so far that actually separates the slow/failing
-   regime from the clean one (r=0.788 against duration). On a shared EC2
-   instance type, that points at storage-layer contention (plausibly EBS
-   burst-balance throttling) as more load-bearing than CPU scheduling for
-   this specific failure mode; confirming it needs an AWS-level burst-balance
-   metric, which this run did not collect.
-5. **Treat the second port as fallible too, not just unimplicated.** 37
-   guest-side resets on the 1025 `connect()` itself, out of 243 iterations,
-   is low-rate but real. Whatever P4.1 builds should not assume the
-   guest-initiated direction is failure-free just because it fails less often
-   than the host-initiated one does under the same load.
-6. **CPU utilization itself is still unmeasured.** The overnight follow-up
-   added steal% and iowait%, and steal (time stolen by the physical
-   hypervisor) turned out flat and uninformative — but that is not the same
-   as measuring this host's own CPU utilization or run-queue depth during
-   the burst, which nothing in either run collected. Steal ruled out one
-   specific noisy-neighbor mechanism; it did not rule out ordinary
-   self-inflicted CPU contention from the 256 extra processes this workload
-   itself starts.
+   implementation — this is now the load-bearing recommendation, not a nice-
+   to-have.** The bare-metal follow-up's dominant failure mode
+   (`ConnectionResetError` on the guest's own `connect()`, 99.2% of that
+   run's failures) is best explained by `start_host_listener` returning as
+   soon as its `python3` process is backgrounded, not once it has actually
+   reached `srv.listen()` — at N=128 that creates real variance in exactly
+   when each VM's listener is ready, independent of host compute. A single,
+   persistent, pre-bound multiplexed listener started well before any
+   restore begins cannot lose this race at all. This was already recommended
+   for efficiency; it is now also the most likely fix for the dominant
+   failure mode observed on the cleanest substrate tested.
+2. **Treat the Exec relay on 1024 as fallible under concurrent load, on the
+   substrate where it is the dominant signature.** On `nested-m8i` specifically,
+   an unrelated channel's transport dying while the host is busy was 84% of
+   recovered failures. Whatever P4.1 builds on top of Exec still needs a
+   retry with backoff; a single `read: EOF` must not be terminal — but see
+   item 4 below for why this should not be read as the general explanation.
+3. **Gate on a distribution, not a run.** 1/128, 52/128, 38/128 on
+   `nested-m8i`, a 243-iteration spread from 0 to 61 failures there, and now
+   80/80 metal iterations all failing (2-21 each, never zero) — three
+   different substrates, none of them giving a single trustworthy rate for
+   the same rung at the same N. Any acceptance threshold needs repeated
+   trials regardless of substrate.
+4. **The disk-I/O correlation found on `nested-m8i` (r=0.788 against
+   duration) is real but substrate-specific, not the general mechanism.**
+   It explained real variance there and should still inform staggering
+   decisions on shared EC2 instance types specifically — but the metal run's
+   near-identical ~10% failure rate, with steal at a flat `0.0%`, iowait in a
+   narrow 0.4-1.35% band, and near-null correlations throughout (all three
+   |r| < 0.2), shows disk I/O contention cannot be the general explanation.
+   Confirming the `nested-m8i` finding as EBS-specific still needs an
+   AWS-level burst-balance metric neither run collected.
+5. **Treat the second port as fallible, full stop — not "unimplicated" and
+   not "rare."** 37 of ~2,113 on `nested-m8i` looked like a low-rate edge
+   case; 999 of 1,007 on metal is the dominant signature on that substrate.
+   Whatever P4.1 builds should not assume the guest-initiated direction is
+   failure-free under concurrent restore load, on any substrate — item 1's
+   fix is the reason to expect this to improve, not a reason to assume it
+   already doesn't matter.
+6. **CPU utilization itself is still unmeasured, on either substrate.** Both
+   follow-ups added steal% and iowait%; steal was flat and uninformative on
+   both (uninterpretable-but-present on `nested-m8i`, `0.0%` by construction
+   on metal). Neither run measured this host's own CPU utilization or
+   run-queue depth during the burst — worth doing once the listener-race fix
+   in item 1 is actually implemented, to check whether it was the whole
+   story or one contributor among several.
