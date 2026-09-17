@@ -1045,3 +1045,202 @@ to serve, and whether restores should be staggered or rate-limited under
 heavy concurrent load — not as grounds to revert to the NIC option (spec
 §2). Nothing observed here resembles the restore-mechanism failure that
 would force that reversion.
+
+### E13 — rung C@128's failures are its own probe's added workload, not memory and not restore count
+
+**Prediction 7 is falsified, both disjuncts of its own falsifier fired, and
+the control rules out the other obvious explanation as well.** E12 left an
+open scale question with two candidate causes on the table: host memory
+exhaustion under 128 concurrent 256 MiB guests against this rig's ~15 GiB
+(prediction 7's claim), or a bare concurrent-restore capacity limit on a
+4-vCPU rig (PR #272's own framing). Both were tested on `nested-m8i` and
+neither survives. A no-second-port control at the same N=128 is a **clean
+128/128 pass**, so 128 concurrent restores of the already-shipped mechanism
+are not by themselves the problem. A telemetry-wrapped rerun of E12's own
+rung C@128 fails **38/128** with **zero OOM events** and `MemAvailable`
+never falling below 12.3 GiB, so memory is not the problem either. What
+remains — and what the elimination points at — is contention from the
+workload rung C@128's own probe apparatus adds on top of the restores, and
+the channel it degrades is the pre-existing Exec path on port 1024, not the
+1025 path E12 introduced.
+
+#### The two runs, on `nested-m8i`
+
+Both ran back to back on the same host, under the same 1 Hz memory/OOM
+sampler (`e13-mem-telemetry.sh`), within the same 40-second window.
+
+| Run                                                                     | What each VM does after restore                                                                                                                                                                                           | Result                                                        | Wall time | `MemAvailable` floor                       | OOM events |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- | --------- | ------------------------------------------ | ---------- |
+| Control, N=128 (`e13-restore-capacity-control.sh`)                      | existing host-initiated Exec on vsock:1024 only, `-command true`; no listener on 1025, no guest-side script, no second port at all                                                                                        | `ok=true`, **128/128**, `fail_count=0`                        | 5.442s    | 15,098,597,376 B (14.06 GiB), ~0.26 GB dip | 0          |
+| E12 rung C@128, rerun standalone (`e12-vsock-egress-probe.sh -rungs C`) | one host-side `python3` listener process per VM on `<jail>/vsock.sock_1025`, plus an Exec on 1024 that base64-decodes and runs a `python3` script **inside** the guest to do a real AF_VSOCK connect/send/recv round trip | `ok=false`, 90/128, **`fail_count=38`**, `nonce_collisions=0` | 17.204s   | 13,231,726,592 B (12.32 GiB), ~2.13 GB dip | 0          |
+
+Per-VM and per-rung JSON, the telemetry timelines and the correlation output
+are rig artifacts, not committed (`deploy/microvm/e13-results/`,
+`e13-control-results/` and `e13-telemetry/` are gitignored, per PR #272's own
+precedent) — the numbers here are the complete record of what they showed.
+`e12-answer.json` from the rerun is `{"substrate":"nested-m8i","rungs_run":"C","ok":false}`.
+
+Every one of the 38 failures carries the identical signature PR #272
+reported: `"guest_client_exit":1` with
+`"guest_output":"e12-guest-client: read: EOF"`, and `"host_witness":"no"` /
+`"guest_witness":"no"`. Unlike E12's combined run, this rerun has **no
+bookkeeping gap** — 38 counted failures, 38 per-VM records, all 128 per-VM
+records present — so no `die()`-path failures are hiding here (see E12's
+4-VM gap above).
+
+#### Memory is ruled out directly, and prediction 7's premise never materialized
+
+`e13-correlate.py` matched all 128 per-VM records against the memory
+timeline: `oom_events_total=0`, `failed_near_oom_event=0`,
+`failed_below_low_water=0` (of 38), `ok_near_oom_event=0`,
+`below_low_water=0`. `oom-events.log` is zero bytes for both runs. The
+floor across the failing run was 13,231,726,592 bytes — **12.32 GiB still
+available**, i.e. roughly 80% of the rig's memory free at the worst moment of
+a run in which 30% of connections failed. There is no exhaustion here to
+correlate against.
+
+The control's timeline undercuts prediction 7's arithmetic premise
+independently, before the OOM correlation is even consulted: restoring 128
+VMs each configured with 256 MiB moved `MemAvailable` by only ~0.26 GB, not
+the ~32 GiB that the "128 × 256 MiB against 15 GiB" admission math implies.
+Firecracker faults guest RAM in lazily, so a configured guest size is an
+upper bound that trivial post-restore work never approaches. The
+concurrent-restore admission budget prediction 7 borrowed from issue #266 is
+simply not the binding constraint at this N for this workload. (Caveat: the
+control's sampler took only 7 samples across its 5.4s run, so its floor is
+coarse; the rung C run has 19.)
+
+#### The failures are not positional, and the rate is not reproducible
+
+The 38 failing indices are 8, 12, 24, 31, 32, 37, 40, 41, 43, 45, 49, 52,
+53, 65, 67, 69, 71, 73, 81, 82, 87, 88, 89, 92, 94, 95, 97, 99, 100, 101,
+102, 105, 110, 114, 122, 124, 125, 128 — spread from index 8 to 128, with
+5 / 8 / 13 / 12 falling in successive quarters of launch order. They are not
+clustered at the head or the tail. That mild upward tilt is what a
+whole-run contention effect looks like as the burst saturates, not a
+threshold being crossed at a particular VM count and everything after it
+failing.
+
+The rate itself is highly run-to-run variable and should not be quoted as a
+property of the system. Three measurements of the same rung at the same N on
+the same rig now exist: **1/128** (PR #272 standalone), **52/128** (PR #272
+combined with the other rungs), **38/128** (this rerun, standalone with
+telemetry). This rerun's standalone number is nowhere near PR #272's own
+standalone number, which is the sharpest available evidence that what is
+being measured is a scheduling race, not a capacity threshold. Any future
+gate on this must be a repeated-trials distribution, not a single run's rate.
+
+Both runs also finished in seconds — 5.4s and 17.2s — not the minutes that
+PR #272's "heavy concurrent boot load" phrasing suggests, and not the slow
+grinding degradation a genuine resource-exhaustion failure usually produces.
+The 3.2× wall-time difference for an identical restore count is itself a
+measure of what the probe apparatus costs.
+
+#### What actually explains it, stated at the confidence the evidence supports
+
+Three differences separate the clean control from the 30%-failing rung C at
+the same N and the same restore path: rung C starts **128 additional
+host-side `python3` processes** (one listener per VM), it asks each guest to
+**spawn a `python3` interpreter and perform a real vsock round trip** instead
+of `true`, and it therefore holds each VM alive substantially longer. The
+restore count, the restore code path, the rig and the host-initiated Exec
+call are common to both. By elimination — memory measured and excluded,
+restore count excluded by the control — the cause lies in that added
+workload, and the plausible mechanism on a 4-vCPU rig is CPU/scheduling
+contention: ~256 extra userspace processes competing with 128 Firecracker
+VMMs and the guest agents whose Exec responses are precisely what fails to
+be read.
+
+Two honesty caveats on that, in the same spirit as E12's:
+
+- **CPU was never measured.** `e13-mem-telemetry.sh` samples `MemAvailable`
+  and the OOM killer, nothing else. "CPU/scheduling contention" is therefore
+  an inference from elimination plus the ~1.9 GB and 3.2× wall-time deltas,
+  not an observation. Confirming it needs host CPU-utilization and
+  run-queue-depth sampling across the burst, plus the cheap discriminating
+  experiment this run did not do: rerun the control at N=128 with `-command`
+  changed from `true` to the same guest-side `python3` payload but **no**
+  1025 listener, which separates the guest-side cost from the host-side
+  process cost.
+- **The 1025 hop was probably never reached in these 38 cases, and cannot be
+  cleared or blamed from these artifacts alone.** `read: EOF` is the
+  `guest_client`'s own transport error reading the framed response from
+  **vsock:1024**; the guest-side script that would connect to 1025 is
+  _delivered by_ that same Exec call. `"host_witness":"no"` on all 38 is
+  therefore an expected downstream consequence of the 1024 relay dying, not
+  independent evidence about 1025. What can be said is that the failure is
+  located in the port-1024 Exec relay and that no failure in this run is
+  attributable to the 1025 mechanism; what cannot be said from these
+  artifacts is that each guest definitively never attempted the 1025 connect.
+
+#### Prediction (spec-style, pinned in `predictions.json` id 7)
+
+> PR #272's rung C@128 connection failures are caused by host memory
+> exhaustion under 128x256MiB guest RAM demand against nested-m8i's 15 GiB
+> total (per issue #266's own admission-budget finding on this rig class),
+> not by a defect in the guest-initiated vsock-across-restore mechanism E12
+> added.
+
+Falsifier: "the control script's fail_count at N=128 is close to zero while
+PR #272's own rung C@128 fail_count stayed high, OR the telemetry rerun
+shows no OOM-killer activity and MemAvailable never drops near the control
+script's failures' timestamps."
+
+**Prediction 7 is falsified, and both disjuncts of its falsifier fired
+independently.** The first: control `fail_count=0` while rung C@128 stayed
+non-trivial at 38/128. The second: `oom_events_total=0` and a memory floor
+12.32 GiB clear of exhaustion. There is no tension to record here and no
+reading on which the prediction survives — unlike prediction id 6 above,
+whose falsifier fired on the letter of its text while the mechanism it
+existed to test was well-supported, this falsifier fired on both its letter
+and its substance. The claim's causal content was wrong.
+
+Its second clause — "not by a defect in the guest-initiated
+vsock-across-restore mechanism E12 added" — is not thereby shown false; it
+is simply not what the falsifier tested, and per the caveat above these
+artifacts locate the failure in the 1024 relay rather than in the 1025
+mechanism. But that clause was carried along by a claim whose stated cause
+is refuted, so it earns no credit from this run.
+
+Worth stating plainly, because it is the part neither this prediction nor PR
+#272 anticipated: the control result also falsifies PR #272's own
+alternative framing. Its write-up read C@128 as evidence that "128
+simultaneous restores exceed what a 4-vCPU rig can schedule reliably."
+128 simultaneous restores on this rig are fine — 128/128, in 5.4 seconds.
+It is 128 simultaneous restores _plus 256 extra userspace processes doing
+real work_ that are not.
+
+#### Effect on PR #268 and P4.1
+
+**T1 (route all sandbox egress over vsock) stands, and on firmer ground than
+after E12.** E12 established the mechanism across rungs A, B, D and C@8;
+E13 adds that the one rung that failed did not fail in the second-port
+CONNECT/data path, that its failures were not memory, and that they were not
+the restore concurrency the design would actually have to live with. Nothing
+in either run resembles the restore-mechanism failure that would force the
+NIC option (spec §2).
+
+**P4.1's open scale/capacity question should be re-scoped, not just carried
+forward.** E12 framed it as "how many concurrent egress connections a single
+host is expected to serve, and whether restores should be staggered or
+rate-limited." The restore-count half of that is answered in the negative at
+N=128 for a 4-vCPU rig, so staggering restores is not the lever. The
+question that survives is: **how much concurrent CPU-bound work the host and
+guests do alongside a restore burst, and whether the agent Exec channel on
+1024 stays healthy under it.** Concretely, for P4.1:
+
+1. **Do not carry E12's one-host-process-per-connection shape into the
+   implementation.** The probe's per-VM `python3` listener was fine for a
+   throwaway diagnostic and is the largest single difference between the
+   clean control and the failing rung. Production egress wants one
+   multiplexed host-side listener, not a process per VM or per connection.
+2. **Treat the Exec relay on 1024 as fallible under concurrent load.** The
+   observed failure is an unrelated channel's transport dying while the host
+   is busy. Whatever P4.1 builds on top of Exec needs a retry with backoff;
+   a single `read: EOF` must not be terminal.
+3. **Gate on a distribution, not a run.** 1/128, 52/128 and 38/128 for the
+   same rung at the same N means any acceptance threshold needs repeated
+   trials. A single clean run proves nothing here, and neither does a single
+   bad one.
+4. **Measure CPU next time.** The one telemetry axis that would have turned
+   this run's inference into a measurement was not collected.
