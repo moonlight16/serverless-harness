@@ -2046,6 +2046,8 @@ if [ -n "$al_body" ]; then
   printf '{"c": 8, "throughput": 1.0}\n' >"$al_tmpdir/e11-rung-x-c8.json"
   al_nostamp=$(
     (
+      # shellcheck disable=SC2034 # read by assemble_ladder once sourced below; this is the
+      # LEXICALLY LAST E11_RUN_ID assignment, which is where shellcheck reports the file-wide finding
       E11_RUN_ID="RUN-CURRENT"
       # shellcheck disable=SC1090
       . "$al_snippet"
