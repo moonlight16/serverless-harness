@@ -6,8 +6,8 @@ function sq(s: string): string {
 }
 
 /** The per-leaf worktree path inside the sandbox pod. */
-export function leafWorkspaceRef(runId: string): string {
-  return `/workspace/leaves/${runId}`;
+export function leafWorkspaceRef(sessionId: string): string {
+  return `/workspace/leaves/${sessionId}`;
 }
 
 /**
@@ -21,8 +21,8 @@ export function leafWorkspaceRef(runId: string): string {
  * flock so concurrent leaves on a fresh workspace don't race, and a missing/corrupt repo self-heals
  * via rm -rf + git init (a failed fetch retries once), closing the non-self-healing wedge in #59.
  */
-export function buildConvergeScript(repoUrl: string, ref: string, runId: string): string {
-  const LEAF = leafWorkspaceRef(runId);
+export function buildConvergeScript(repoUrl: string, ref: string, sessionId: string): string {
+  const LEAF = leafWorkspaceRef(sessionId);
   const fetch = `git -C "$REPO" fetch --quiet ${sq(repoUrl)} ${sq(ref)}`;
   const init = `rm -rf "$REPO"; git init -q "$REPO"`;
   return [
@@ -41,8 +41,8 @@ export function buildConvergeScript(repoUrl: string, ref: string, runId: string)
 }
 
 /** Remove the per-leaf worktree and prune orphans (best-effort; never fails the leaf). */
-export function buildCleanupScript(runId: string): string {
-  const LEAF = leafWorkspaceRef(runId);
+export function buildCleanupScript(sessionId: string): string {
+  const LEAF = leafWorkspaceRef(sessionId);
   return [
     `set -u`,
     `REPO=/workspace/repo; LEAF=${sq(LEAF)}`,
@@ -56,34 +56,37 @@ export async function convergeWorkspace(
   transport: SandboxTransport,
   repoUrl: string,
   ref: string,
-  runId: string,
+  sessionId: string,
 ): Promise<string> {
   const { stdout, exitCode, truncated } = await transport.exec(
-    buildConvergeScript(repoUrl, ref, runId),
+    buildConvergeScript(repoUrl, ref, sessionId),
     {
       timeout: 300,
     },
   );
   if (truncated)
     throw new Error(
-      `converge exceeded the sandbox output cap (converge output too large): ${runId}`,
+      `converge exceeded the sandbox output cap (converge output too large): ${sessionId}`,
     );
   if (exitCode !== 0) throw new Error(`converge failed (exit ${exitCode})`);
-  return stdout.toString().trim() || leafWorkspaceRef(runId);
+  return stdout.toString().trim() || leafWorkspaceRef(sessionId);
 }
 
 /** Best-effort worktree cleanup; swallows errors so it never masks a verdict. */
-export async function cleanupWorkspace(transport: SandboxTransport, runId: string): Promise<void> {
+export async function cleanupWorkspace(
+  transport: SandboxTransport,
+  sessionId: string,
+): Promise<void> {
   try {
-    await transport.exec(buildCleanupScript(runId), { timeout: 60 });
+    await transport.exec(buildCleanupScript(sessionId), { timeout: 60 });
   } catch {
     /* ignore */
   }
 }
 
 /** Stage every edit in the leaf worktree and print the resulting unified diff (vs the pinned base). */
-export function buildDiffCaptureScript(runId: string): string {
-  const LEAF = leafWorkspaceRef(runId);
+export function buildDiffCaptureScript(sessionId: string): string {
+  const LEAF = leafWorkspaceRef(sessionId);
   return [
     `set -eu`,
     `LEAF=${sq(LEAF)}`,
@@ -95,13 +98,13 @@ export function buildDiffCaptureScript(runId: string): string {
 /** Run the diff-capture script in the pod; return the patch (possibly empty). Throws on non-zero exit. */
 export async function captureWorkspaceDiff(
   transport: SandboxTransport,
-  runId: string,
+  sessionId: string,
 ): Promise<string> {
-  const { stdout, exitCode, truncated } = await transport.exec(buildDiffCaptureScript(runId), {
+  const { stdout, exitCode, truncated } = await transport.exec(buildDiffCaptureScript(sessionId), {
     timeout: 120,
   });
   if (truncated)
-    throw new Error(`diff capture exceeded the sandbox output cap (diff too large): ${runId}`);
+    throw new Error(`diff capture exceeded the sandbox output cap (diff too large): ${sessionId}`);
   if (exitCode !== 0) throw new Error(`diff capture failed (exit ${exitCode})`);
   const patch = stdout.toString();
   // A unified diff must end with a newline. `git diff` emits one, but some exec transports strip

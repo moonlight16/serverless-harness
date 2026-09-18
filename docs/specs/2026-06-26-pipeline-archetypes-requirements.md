@@ -5,7 +5,7 @@ Status: Reference (the evidence base behind the Capability Charter)
 Scope: Describes three independent, real agentic pipelines as **name-free archetypes** and
 consolidates **all** their requirements into one catalog, so the harness roadmap is grounded in
 observed demand rather than assumption. No project, product, or skill names appear here by design.
-Anchors: [Capability Charter](2026-06-26-leaf-session-backend-capability-charter.md) (the conclusions); [MVP Thin Slice](2026-06-26-mvp-leaf-session-contract-design.md) (the first build).
+Anchors: [Capability Charter](2026-06-26-leaf-session-backend-capability-charter.md) (the conclusions); [MVP Thin Slice](2026-06-26-mvp-leaf-session-contract-design.md) (the first build); [Glossary](../glossary.md) (canonical `session`/`turn` vocabulary).
 
 > **Method.** Three independent production-ish agentic pipelines were examined directly (source,
 > entrypoints, prompts, runtime packaging) and abstracted into archetypes A/B/C. The requirements in

@@ -57,7 +57,7 @@ function fakeLease(
     async load(pod) {
       return counts[pod] ?? 0;
     },
-    async acquire(pod, c, _runId, ttlMs) {
+    async acquire(pod, c, _sessionId, ttlMs) {
       if ((counts[pod] ?? 0) < c) {
         counts[pod] = (counts[pod] ?? 0) + 1;
         acquired.push(pod);

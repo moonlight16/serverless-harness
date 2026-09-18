@@ -333,6 +333,7 @@ gaps are exactly what Phase 2 closes.
 
 ## Documentation
 
+- [Glossary](docs/glossary.md) — canonical `session`/`turn` vocabulary; why `run` isn't a harness concept
 - [Deploy on OpenShift](deploy/knative/README-ocp.md) — `setup-ocp.sh` install guide (OCP 4.20+)
 - [Executive overview — leaf-session backend](docs/executive-overview-leaf-session.md)
 - [Milestone registry](docs/specs/README.md) — authoritative milestone numbering and status
