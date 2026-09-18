@@ -295,7 +295,7 @@ fi
 # ---------------------------------------------------------------------------
 echo "== host signal assembly against a Linux-shaped /proc (final review H2)"
 
-signals_body="$(extract_fns die require_numeric mem_available_bytes discover_pids pss_bytes_for_pids host_cpu_fraction host_signals_snapshot || true)"
+signals_body="$(extract_fns die require_numeric proc_meminfo_available mem_available_bytes discover_pids pss_bytes_for_pids host_cpu_fraction host_signals_snapshot || true)"
 check "die/require_numeric/mem_available_bytes/host_signals_snapshot all extractable" \
   "$([ -n "$signals_body" ] && echo yes || echo no)" "yes"
 
@@ -336,6 +336,62 @@ if [ -n "$signals_body" ]; then
   check "mem_available_bytes emits exactly ONE line on a Linux-shaped meminfo" \
     "$(printf '%s\n' "$mem_out" | wc -l | tr -d ' ')" "1"
   check "mem_available_bytes converts kB to bytes correctly" "$mem_out" "8388608000"
+
+  # --- REGRESSION, found by the first-ever execution on a Linux host with real memory.
+  # The old awk form was `print $2*1024`, and awk's OFMT defaults to "%.6g", so any product
+  # needing more than 6 significant digits printed in SCIENTIFIC NOTATION. require_numeric
+  # refuses that, so host_signals_snapshot failed and EVERY RUNG WAS REFUSED. This fixture's
+  # 8192000 kB is small enough to print as an integer, which is exactly why the suite stayed
+  # green while the driver could not record a single rung on any host with >~16 GiB available.
+  printf 'MemAvailable:    790000000 kB\n' >"$sig_proc/meminfo-huge"
+  # NON-VACUOUSNESS, and it is PLATFORM-DEPENDENT -- which is the other half of why this
+  # defect survived every review. awk's OFMT default of "%.6g" is what produces the scientific
+  # form, but implementations differ on whether an integral double is subject to it: Debian's
+  # mawk prints 8.0896e+11, while macOS's awk and gawk print 808960000000. CI runs ubuntu, so
+  # the proof below does fire there; on a dev macOS it cannot, and a check that FAILED there
+  # would be a false alarm about correct code. So the pathology is proven where it exists and
+  # explicitly skipped where it does not -- the FIX's own behaviour is asserted either way.
+  huge_awk="$(awk '/^MemAvailable:/{print $2*1024; exit}' "$sig_proc/meminfo-huge")"
+  case "$huge_awk" in
+  *e+* | *E+*)
+    check "non-vacuousness: this awk DOES emit scientific notation on a 754GiB-class host" \
+      "yes" "yes"
+    huge_rc=0
+    (
+      # shellcheck disable=SC1090
+      . "$sig_snippet"
+      require_numeric memAvailableBytes "$huge_awk"
+    ) >/dev/null 2>&1 || huge_rc=$?
+    check "  ...and require_numeric refuses it (this is what refused every rung on metal)" \
+      "$([ "$huge_rc" -ne 0 ] && echo yes || echo no)" "yes"
+    ;;
+  *)
+    echo "  (skip: this awk prints '$huge_awk' rather than scientific notation, so the pre-fix"
+    echo "   pathology is not reproducible on this platform -- it IS on Debian/mawk, which is"
+    echo "   where the first real execution hit it. The fix is still asserted below.)"
+    ;;
+  esac
+  # THE FIX: a bare 64-bit integer, whatever awk the host ships.
+  huge_out=$(
+    PROC_ROOT="$sig_proc"
+    export PROC_ROOT
+    # shellcheck disable=SC1090
+    . "$sig_snippet"
+    cp "$sig_proc/meminfo-huge" "$sig_proc/meminfo"
+    mem_available_bytes
+  )
+  check "mem_available_bytes emits a bare integer on a 754GiB-class host" "$huge_out" "808960000000"
+  check "  ...on exactly one line" "$(printf '%s\n' "$huge_out" | wc -l | tr -d ' ')" "1"
+  huge_ok_rc=0
+  (
+    # shellcheck disable=SC1090
+    . "$sig_snippet"
+    require_numeric memAvailableBytes "808960000000"
+  ) >/dev/null 2>&1 || huge_ok_rc=$?
+  check "  ...which require_numeric accepts, so the rung can be recorded" "$huge_ok_rc" "0"
+  printf 'MemTotal:       16384000 kB\nMemFree:            1000 kB\nMemAvailable:    8192000 kB\n' >"$sig_proc/meminfo"
+  check "mem_available_bytes no longer forks an awk (it uses the sampler's builtin reader)" \
+    "$(printf '%s\n' "$(extract_fn mem_available_bytes)" | grep -cE '\bawk\b')" "0"
 
   # A meminfo with no MemAvailable line at all: the END fallback, still one line.
   printf 'MemTotal:       16384000 kB\n' >"$sig_proc/meminfo-noavail"
@@ -1643,7 +1699,7 @@ check "  ...with the rung refused when any slot failed" \
 # ---------------------------------------------------------------------------
 echo "== pssBytes: 0 is refused on the microvm arm, and still legitimate on the container arm"
 
-vmm_body="$(extract_fns die require_numeric mem_available_bytes discover_pids pss_bytes_for_pids host_cpu_fraction host_signals_snapshot || true)"
+vmm_body="$(extract_fns die require_numeric proc_meminfo_available mem_available_bytes discover_pids pss_bytes_for_pids host_cpu_fraction host_signals_snapshot || true)"
 if [ -n "$vmm_body" ]; then
   vmm_tmpdir="$(mktemp -d)"
   vmm_snippet="$vmm_tmpdir/signals.sh"

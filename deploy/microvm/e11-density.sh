@@ -531,8 +531,27 @@ pss_bytes_for_pids() {
 # e10-lifecycle.sh), where `exit` merely terminates and cannot re-enter END. This was
 # the single instance of the shape. require_numeric below is the guard that keeps it
 # from being the last one.
+# FOUND BY THE FIRST-EVER EXECUTION of this driver on a Linux host with real memory
+# (issue #291's PR): the awk form above was `print $2*1024`, and awk's OFMT defaults to "%.6g",
+# so any product needing more than 6 significant digits was printed in SCIENTIFIC NOTATION --
+# `1.73035e+10` on a 16 GiB host, `8.0896e+11` on the documented 754 GiB metal box.
+# require_numeric refuses that (its regex is `-?[0-9]+(\.[0-9]+)?`), so host_signals_snapshot
+# returned non-zero and EVERY RUNG WAS REFUSED. The whole cluster-free suite passed throughout,
+# because its fixture uses 8192000 kB -- small enough to print as an integer.
+#
+# `printf "%d"` is NOT the fix: Debian's mawk clamps %d to 32 bits, so it prints 2147483647 --
+# silently recording 2 GB where the truth is 17 GB, which is the optimistic-direction wrongness
+# spec section 7.3's boxed warning exists to prevent. `printf "%.0f"` works, and so does
+# OFMT="%.17g", but both leave the value's correctness dependent on which awk the host ships.
+#
+# So this reads /proc/meminfo with the same builtin loop the in-rung sampler uses
+# (proc_meminfo_available, added for issue #291 item 1). Bash arithmetic is 64-bit, there is no
+# format string to get wrong, and it forks nothing. Clobbering SAMPLE_MEM_AVAILABLE_BYTES here is
+# safe: the only caller is the POST-LOAD snapshot, which runs after the sampler has been reaped
+# and after aggregation has already read the sampler's file.
 mem_available_bytes() {
-  awk '/^MemAvailable:/{found=1; print $2*1024; exit} END{if (!found) print 0}' "$PROC_ROOT/meminfo" 2>/dev/null || echo 0
+  proc_meminfo_available || SAMPLE_MEM_AVAILABLE_BYTES=0
+  printf '%s\n' "$SAMPLE_MEM_AVAILABLE_BYTES"
 }
 
 # require_numeric echoes value unchanged when it is exactly ONE line holding one bare
