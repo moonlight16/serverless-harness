@@ -959,6 +959,13 @@ samp_body="$(extract_fns die set_epoch_ms discover_pids pss_bytes_for_pids proc_
 samp_tick_solo="$(extract_fn host_sampler_tick || true)"
 check "host_sampler_tick alone is extractable (a guard extract_fns cannot fake)" \
   "$([ -n "$samp_tick_solo" ] && echo yes || echo no)" "yes"
+# Symmetric with the host_sampler_tick guard above: extract_fns prints each body as it
+# walks its name list and only fails at the first MISSING name, so a same-list check stays
+# non-empty even if the LAST-named function (host_sampler_loop) is absent. A standalone
+# extract_fn on that name alone has no earlier-landed name to hide behind.
+samp_loop_solo="$(extract_fn host_sampler_loop || true)"
+check "host_sampler_loop alone is extractable (a guard extract_fns cannot fake)" \
+  "$([ -n "$samp_loop_solo" ] && echo yes || echo no)" "yes"
 check "the sampler functions are extractable" "$([ -n "$samp_body" ] && echo yes || echo no)" "yes"
 
 # The every-tick path must contain no external command. awk, sleep, date, pgrep, python3 and
@@ -1603,6 +1610,7 @@ if [ -n "$trap_body" ]; then
     echo 'stop_host_sampler() { echo sampler >>"$ORDER"; }'
     echo 'stop_container_stack() { echo container >>"$ORDER"; }'
     echo 'stop_microvm_stack() { echo microvm >>"$ORDER"; }'
+    echo 'stop_null_stack() { echo null >>"$ORDER"; }'
     printf '%s\n' "$trap_body"
     echo 'trap cleanup_on_exit EXIT'
     echo 'exit 7'
@@ -1613,8 +1621,8 @@ if [ -n "$trap_body" ]; then
   # The sampler goes FIRST: it is a background subshell that polls for its stop file, so
   # after `rm -rf $E11_TMPDIR` that file can never appear and it would spin forever writing
   # to a deleted path (#291 item 1).
-  check "it kills the sampler and BOTH arms' stacks (kill before remove)" \
-    "$(tr '\n' ' ' <"$tr_order")" "sampler container microvm "
+  check "it kills the sampler and every arm's stack (kill before remove)" \
+    "$(tr '\n' ' ' <"$tr_order")" "sampler container microvm null "
   check "and it removes the temp root, so no mktemp -d slot dir survives a die" \
     "$([ -e "$doomed" ] && echo survived || echo gone)" "gone"
 
@@ -1882,6 +1890,111 @@ check "the redis image is overridable so an operator can pin a digest" \
   "$(grep -c 'SH_E11_REDIS_IMAGE' "$SCRIPT")" "2"
 check "redis is started with RDB snapshots disabled (--save '')" \
   "$([ "$(grep -c -- "--save ''" "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
+# ---------------------------------------------------------------------------
+# Issue #291 section 4: the driver-overhead control arm.
+#
+# The whole reason this artifact survived a metal run is that there was no arm whose latency
+# was known to be all driver. A third arm drives the IDENTICAL run_density_rung against
+# remote-worker/cmd/null-responder -- one End per Exec, no relay, no Redis, no worker, no VMM
+# -- so subtracting it at each c gives the driver's own contribution. If that share is large
+# at high c, a fixed-but-still-grpcurl driver would show a knee that is STILL an artifact and
+# item 3 of the issue becomes mandatory before the authoritative run.
+#
+# It is ON BY DEFAULT, opt-out. A control that has to be remembered is a control that will not
+# be run.
+# ---------------------------------------------------------------------------
+echo "== the driver-control arm runs by default and is driven by the same function (#291 section 4)"
+check "SH_E11_ARMS defaults to all three arms, control included" \
+  "$([ "$(grep -c 'SH_E11_ARMS:-container microvm driver-control' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "main() drives the control arm through run_density_rung, not a second function" \
+  "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -c 'run_density_rung driver-control')" "1"
+check "no arm-specific Exec-driving function was added for it" \
+  "$(grep -Ec '^run_density_rung_(container|microvm|driver_control|control)\(\)' "$SCRIPT")" "0"
+check "the control arm's stack is ONLY the null-responder (no redis, no relay, no worker)" \
+  "$(printf '%s\n' "$(extract_fn start_null_stack)" | grep -cE 'start_redis_loopback|sandbox-relay|cmd/worker|cmd/microvm-worker')" "0"
+check "  ...and it builds the binary Task 5 added" \
+  "$([ "$(printf '%s\n' "$(extract_fn start_null_stack)" | grep -c 'go build -o "\$E11_NULL_BIN" ./cmd/null-responder')" -ge 1 ] && echo yes || echo no)" "yes"
+check "  ...on loopback only" \
+  "$([ "$(printf '%s\n' "$(extract_fn start_null_stack)" | grep -c -- '-listen "127.0.0.1:')" -ge 1 ] && echo yes || echo no)" "yes"
+check "  ...and waits for it to listen rather than sleeping and hoping" \
+  "$([ "$(printf '%s\n' "$(extract_fn start_null_stack)" | grep -c 'wait_for_relay_port')" -ge 1 ] && echo yes || echo no)" "yes"
+check "the control arm is torn down from the EXIT trap like the others" \
+  "$([ "$(printf '%s\n' "$(extract_fn cleanup_on_exit)" | grep -c 'stop_null_stack')" -ge 1 ] && echo yes || echo no)" "yes"
+check "analyze_slice is SKIPPED for the control arm (a ladder with no cold acquires)" \
+  "$([ "$(grep -c 'analyze_slice skipped' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "  ...but its ladder is still assembled, because the subtraction needs it" \
+  "$(grep -c 'e11-ladder-driver-control.json' "$SCRIPT")" "2"
+
+echo "== only the three named arms validate, and shuffling covers whatever is configured"
+arms_body="$(extract_fns die validate_arms shuffle_e11_arms || true)"
+check "validate_arms is extractable" "$([ -n "$arms_body" ] && echo yes || echo no)" "yes"
+if [ -n "$arms_body" ]; then
+  arms_tmpdir="$(mktemp -d)"
+  arms_snippet="$arms_tmpdir/arms.sh"
+  printf '%s\n' "$arms_body" >"$arms_snippet"
+  run_arms() {
+    (
+      read -r -a E11_ARMS <<<"$1"
+      # shellcheck disable=SC1090
+      . "$arms_snippet"
+      validate_arms
+    )
+  }
+  for good in "container" "microvm" "driver-control" "container microvm driver-control" "microvm driver-control"; do
+    arms_rc=0
+    run_arms "$good" >/dev/null 2>&1 || arms_rc=$?
+    check "SH_E11_ARMS='$good' validates" "$arms_rc" "0"
+  done
+  arms_bad_rc=0
+  arms_bad_out="$(run_arms "container cloud-hypervisor" 2>&1)" || arms_bad_rc=$?
+  check "an invented arm is refused (nonzero)" \
+    "$([ "$arms_bad_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  case "$arms_bad_out" in *cloud-hypervisor*) arms_named=yes ;; *) arms_named=no ;; esac
+  check "  ...and the refusal names the bad value" "$arms_named" "yes"
+  arms_empty_rc=0
+  run_arms "" >/dev/null 2>&1 || arms_empty_rc=$?
+  check "an EMPTY arm list is refused: a sweep with no arms measures nothing" \
+    "$([ "$arms_empty_rc" -ne 0 ] && echo yes || echo no)" "yes"
+
+  shuf_out=$(
+    (
+      read -r -a E11_ARMS <<<"container microvm driver-control"
+      # shellcheck disable=SC1090
+      . "$arms_snippet"
+      shuffle_e11_arms | sort | tr '\n' ' '
+    )
+  )
+  check "shuffle_e11_arms emits exactly the configured arms, in some order" \
+    "$shuf_out" "container driver-control microvm "
+  shuf_two=$(
+    (
+      # shellcheck disable=SC2034 # read by shuffle_e11_arms once sourced below
+      read -r -a E11_ARMS <<<"container driver-control"
+      # shellcheck disable=SC1090
+      . "$arms_snippet"
+      shuffle_e11_arms | wc -l | tr -d ' '
+    )
+  )
+  check "  ...and it does not hardcode two arms any more" "$shuf_two" "2"
+  rm -rf "$arms_tmpdir"
+fi
+
+echo "== the control arm records a rung with null swept dimensions and no require_vmm trip"
+# It follows the CONTAINER path: dimension_literal maps its "-" dimensions to None, and
+# require_vmm stays 0 because that flag is gated on arm = microvm. Converge hits the responder
+# too, which is correct -- the control measures the driver's cost for BOTH phases.
+check "the control arm passes '-' for both swept dimensions, like the container arm" \
+  "$([ "$(grep -c 'run_density_rung driver-control - -' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+rv_rdr="$(extract_fn run_density_rung || true)"
+if [ -n "$rv_rdr" ]; then
+  check "require_vmm is gated on the microvm arm alone, so the control arm cannot trip it" \
+    "$(printf '%s\n' "$rv_rdr" | grep -c 'if \[ "\$arm" = "microvm" \] && \[ "\$d" != "0" \]')" "1"
+  check "the idle standby-residency poll is likewise microvm-only" \
+    "$(printf '%s\n' "$rv_rdr" | grep -c 'if \[ "\$arm" = "microvm" \]; then')" "1"
+  check "the control arm has its own relay-log path for assert_relay_alive" \
+    "$(printf '%s\n' "$rv_rdr" | grep -c 'e11-driver-control-responder.log')" "1"
+fi
 
 echo
 echo "Total failures: $fails"

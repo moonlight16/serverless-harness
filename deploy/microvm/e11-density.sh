@@ -169,6 +169,19 @@ read -r -a D_VALUES <<<"${SH_E11_D_VALUES:-2}"
 read -r -a RAM_MB_VALUES <<<"${SH_E11_GUEST_RAM_MB_VALUES:-256}"
 read -r -a ACTIVE_RUNS <<<"${SH_E11_ACTIVE_RUNS:-1 2 4 8}"
 
+# The arms driven, in randomized order (shuffle_e11_arms). "driver-control" is ON BY DEFAULT
+# (issue #291 section 4): it drives the identical run_density_rung against
+# remote-worker/cmd/null-responder -- one End per Exec, no relay, no Redis, no worker, no VMM
+# -- so subtracting it at each c gives the DRIVER's own contribution to observed latency. The
+# control whose absence let a driver artifact be published as a density finding should not be
+# opt-in. Set SH_E11_ARMS to opt out.
+read -r -a E11_ARMS <<<"${SH_E11_ARMS:-container microvm driver-control}"
+# The null-responder's loopback port. Deliberately NOT E11_RELAY_PORT: the control arm's
+# "stack" is one process and never coexists with a relay, but sharing the port would make a
+# stale relay from a previous arm answer the control arm's Execs, which is the one thing this
+# arm must never measure.
+NULL_RESPONDER_PORT="${SH_E11_NULL_RESPONDER_PORT:-8445}"
+
 ITERS_PER_SLOT="${SH_E11_ITERS_PER_SLOT:-20}"
 WARMUP_PER_SLOT="${SH_E11_WARMUP_PER_SLOT:-3}"
 
@@ -294,12 +307,15 @@ E11_WORKER_PID=""
 E11_RELAY_PID=""
 E11_WORKER_BIN=""
 E11_SAMPLER_PID=""
+E11_NULL_PID=""
+E11_NULL_BIN=""
 E11_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/e11-density.XXXXXX")"
 
 cleanup_on_exit() {
   stop_host_sampler || true
   stop_container_stack || true
   stop_microvm_stack || true
+  stop_null_stack || true
   [ -z "${E11_TMPDIR:-}" ] || rm -rf "$E11_TMPDIR"
 }
 trap cleanup_on_exit EXIT
@@ -353,6 +369,26 @@ validate_repo_cache_shape() {
   esac
 }
 
+# validate_arms refuses an SH_E11_ARMS value that is not one of the three arms this driver
+# implements, and refuses an empty list. An invented arm would otherwise fall through main()'s
+# case with no branch, so the sweep would "succeed" having driven nothing -- which is the
+# looks-like-success failure mode this file spends most of its refusals on. A Cloud
+# Hypervisor spelling in particular is a plausible typo and is NOT an arm here (see the
+# header for why: on this rig CH does not restore).
+validate_arms() {
+  [ "${#E11_ARMS[@]}" -gt 0 ] ||
+    die "SH_E11_ARMS is empty - a sweep with no arms would complete having measured nothing. The three arms are: container, microvm, driver-control."
+  local arm
+  for arm in "${E11_ARMS[@]}"; do
+    case "$arm" in
+    container | microvm | driver-control) : ;;
+    *)
+      die "SH_E11_ARMS contains '$arm', which is not one of this driver's three arms: container (today's remote-worker, the baseline), microvm (microvm-worker, Firecracker only), driver-control (the null-responder, issue #291 section 4). Cloud Hypervisor is not an arm here - see this file's header."
+      ;;
+    esac
+  done
+}
+
 # require_tool refuses a MISSING external binary by name, in preflight, rather than
 # letting a rung "run" against a command that is not there -- the same guard, and the same
 # wording, e10-lifecycle.sh already carries. E11 had NO tool preflight at all, and that is
@@ -385,6 +421,7 @@ preflight() {
   GOVERNOR_STATE="$(check_governor)"
   log "governor: $GOVERNOR_STATE"
   validate_repo_cache_shape
+  validate_arms
   mkdir -p "$RESULTS"
 }
 
@@ -1022,9 +1059,6 @@ drop_caches() {
   fi
 }
 
-# shuffle_e11_arms prints "container" and "microvm" in randomized order (spec
-# section 7.5: page-cache asymmetry between arms), same technique as
-# e10-lifecycle.sh's shuffle_arms.
 # wait_for_relay_port blocks until something is LISTENING on a loopback port, and dies
 # naming the log if it never happens. Both drivers previously did `sleep 2` and hoped.
 #
@@ -1098,8 +1132,13 @@ assert_relay_alive() {
   die "$what is no longer listening on 127.0.0.1:$port - it started and then DIED mid-run; its log is above and in $logfile. Every Exec from here would time out against a dead relay rather than measure anything."
 }
 
+# shuffle_e11_arms prints $E11_ARMS in randomized order (spec section 7.5: page-cache
+# asymmetry between arms), same technique as e10-lifecycle.sh's shuffle_arms. It reads the
+# configured list rather than a hardcoded pair, so adding the driver-control arm did not need
+# a second randomiser that could drift from this one.
 shuffle_e11_arms() {
-  printf 'container\nmicrovm\n' | awk -v seed="$(($$ + $(date +%s)))" 'BEGIN{srand(seed)} {print rand()"\t"$0}' | sort -n | cut -f2-
+  printf '%s\n' "${E11_ARMS[@]}" |
+    awk -v seed="$(($$ + $(date +%s)))" 'BEGIN{srand(seed)} {print rand()"\t"$0}' | sort -n | cut -f2-
 }
 
 # start_redis_loopback publishes this driver's scratch redis on LOOPBACK ONLY, and is
@@ -1219,6 +1258,36 @@ stop_microvm_stack() {
   return 0
 }
 
+# start_null_stack starts ONLY the null-responder (issue #291 section 4). No redis, no relay,
+# no worker, no VMM: the control arm exists to measure what the DRIVER costs, so anything else
+# left in the path would be measured along with it. That is also why this arm reuses neither
+# E11_RELAY_PORT nor start_redis_loopback.
+start_null_stack() {
+  [ "$E11_START_STACK" = "1" ] || {
+    log "driver-control stack: SH_E11_START_STACK=0, reusing an already-running null-responder"
+    return 0
+  }
+  E11_NULL_BIN="$RESULTS/.e11-null-responder-bin"
+  log "driver-control: building the null-responder"
+  (cd "$REMOTE_WORKER_DIR" && go build -o "$E11_NULL_BIN" ./cmd/null-responder) ||
+    die "go build ./cmd/null-responder failed - the driver-control arm has nothing to drive, so every Exec would time a missing binary rather than the driver's own overhead"
+
+  log "driver-control: starting the null-responder on 127.0.0.1:$NULL_RESPONDER_PORT"
+  "$E11_NULL_BIN" -listen "127.0.0.1:${NULL_RESPONDER_PORT}" \
+    >"$RESULTS/e11-driver-control-responder.log" 2>&1 &
+  E11_NULL_PID="$!"
+  wait_for_relay_port "$NULL_RESPONDER_PORT" "$RESULTS/e11-driver-control-responder.log" \
+    "the driver-control arm's null-responder"
+}
+
+stop_null_stack() {
+  [ "$E11_START_STACK" = "1" ] || return 0
+  # ${VAR:-} because this runs from the EXIT trap too, which can fire before it is assigned.
+  [ -n "${E11_NULL_PID:-}" ] && kill "${E11_NULL_PID:-}" 2>/dev/null
+  E11_NULL_PID=""
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # run_density_rung: THE per-rung driver. Called identically for the container arm
 # and the microvm arm (only sandbox_id, relay_port, and whether workspace_key is
@@ -1234,9 +1303,14 @@ run_density_rung() {
   log "rung: arm=$arm D=$d guest=${ram_mb}MiB c=$c"
 
   # Before issuing a single Exec: is the relay STILL there? See assert_relay_alive for the
-  # run this cost. The log name differs per arm, matching where each arm's relay writes.
+  # run this cost.
+  # The log name differs per arm, matching where each arm's server writes. assert_relay_alive
+  # tails it, so a wrong path here costs the operator the one message that says what died.
   local relay_log="$RESULTS/e11-container-relay.log"
-  [ "$arm" = "microvm" ] && relay_log="$RESULTS/e11-microvm-relay-d${d}-ram${ram_mb}.log"
+  case "$arm" in
+  microvm) relay_log="$RESULTS/e11-microvm-relay-d${d}-ram${ram_mb}.log" ;;
+  driver-control) relay_log="$RESULTS/e11-driver-control-responder.log" ;;
+  esac
   assert_relay_alive "$relay_port" "$relay_log" "the $arm arm's sandbox-relay"
 
   # Every temp path is under $E11_TMPDIR, named for the rung rather than mktemp-random, so
@@ -1664,7 +1738,7 @@ analyze_slice() {
 # ---------------------------------------------------------------------------
 main() {
   preflight
-  log "arms: container, microvm (Firecracker only - hardware-corrections F5)"
+  log "arms: ${E11_ARMS[*]} (microvm is Firecracker only - hardware-corrections F5; driver-control is the null-responder, issue #291 section 4)"
   log "D values: ${D_VALUES[*]}   guest RAM (MiB): ${RAM_MB_VALUES[*]}   active runs: ${ACTIVE_RUNS[*]}"
   [ -n "$MODEL_STUB_CMD" ] || log "no SH_E11_MODEL_STUB_CMD set - driving the Exec mix directly (disclosed limitation, see header)"
 
@@ -1682,7 +1756,8 @@ main() {
     fi
     first=0
 
-    if [ "$arm" = "container" ]; then
+    case "$arm" in
+    container)
       start_container_stack
       for c in "${ACTIVE_RUNS[@]}"; do
         run_density_rung container - - "$c" "e11-container" "$E11_RELAY_PORT" \
@@ -1691,7 +1766,23 @@ main() {
       stop_container_stack
       assemble_ladder "$RESULTS/e11-rung-container-c*.json" "$RESULTS/e11-ladder-container.json"
       analyze_slice "$RESULTS/e11-ladder-container.json" || log "analyze_slice(container) failed - see output above"
-    else
+      ;;
+    driver-control)
+      start_null_stack
+      for c in "${ACTIVE_RUNS[@]}"; do
+        run_density_rung driver-control - - "$c" "e11-driver-control" "$NULL_RESPONDER_PORT" \
+          "$RESULTS/e11-rung-driver-control-c${c}.json"
+      done
+      stop_null_stack
+      assemble_ladder "$RESULTS/e11-rung-driver-control-c*.json" "$RESULTS/e11-ladder-driver-control.json"
+      # analyze_slice is SKIPPED here: analyzeLadder scores a ladder of COLD ACQUIRES against
+      # sealed predictions about a VM pool, and this arm has no pool and no acquires, so its
+      # verdicts would be noise attached to real prediction ids. The ladder file is still
+      # assembled, because subtracting this arm from the other two at each c is the entire
+      # purpose of the arm.
+      log "driver-control: ladder assembled at $RESULTS/e11-ladder-driver-control.json (analyze_slice skipped - no pool and no cold acquires; subtract this arm from the others at each c to get the driver's own share)"
+      ;;
+    microvm)
       local d ram_mb
       for d in "${D_VALUES[@]}"; do
         for ram_mb in "${RAM_MB_VALUES[@]}"; do
@@ -1707,7 +1798,8 @@ main() {
             log "analyze_slice(microvm d=$d ram=$ram_mb) failed - see output above"
         done
       done
-    fi
+      ;;
+    esac
   done <<<"$order"
 
   log "done. Per-slice ladders and analyses are in $RESULTS/e11-ladder-*.json"
