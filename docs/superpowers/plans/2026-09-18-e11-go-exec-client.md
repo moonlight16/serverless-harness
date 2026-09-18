@@ -1471,6 +1471,13 @@ In `deploy/microvm/e11-density.sh`, immediately after `escaped_mix`'s closing br
 # Called BEFORE wall_t0 is stamped. Nothing in here may end up inside the timed window --
 # deploy/microvm/tests/e11-density.test.sh's fork guard asserts that python3 does not appear
 # between the two stamps.
+#
+# THE CLOSING BRACES AND BRACKETS IN THE PYTHON BODY BELOW ARE INDENTED ON PURPOSE. The test
+# suite extracts functions from this file by scanning for the closing bare `}` at column 0, and
+# it only knows to skip over an embedded `python3 -c "` block spelled with a DOUBLE quote (see
+# extract_fn). This block uses a single quote, so a `}` at column 0 here would terminate the
+# extraction early and the suite would source a truncated function. Python accepts an indented
+# closing delimiter, so this costs nothing; un-indenting it silently breaks two test sections.
 write_rung_plan() {
   local out_path="$1" target="$2" sandbox_id="$3" iters="$4" warmup="$5" exec_timeout_s="$6" deadline_s="$7" mix_count="$8" slot_count="$9"
   shift 9
@@ -1497,7 +1504,7 @@ slots = [
         "errFile": fields[i * 4 + 3],
     }
     for i in range(nslots)
-]
+    ]
 plan = {
     "target": target,
     "sandboxId": sandbox,
@@ -1507,7 +1514,7 @@ plan = {
     "callDeadlineS": int(deadline),
     "mix": mix,
     "slots": slots,
-}
+    }
 with open(out, "w") as fh:
     json.dump(plan, fh, indent=2)
 ' "$out_path" "$target" "$sandbox_id" "$iters" "$warmup" "$exec_timeout_s" "$deadline_s" "$mix_count" "$slot_count" "$@" ||
