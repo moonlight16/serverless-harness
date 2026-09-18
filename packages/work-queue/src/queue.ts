@@ -28,18 +28,64 @@ export interface WorkQueue {
 
 export class RedisWorkQueue implements WorkQueue {
   private client: RedisClientType;
-  private ready: Promise<void>;
+  private ready: Promise<void> | null;
   constructor(
     url = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379',
     private readonly stream = 'leaf-queue',
     private readonly group = 'leaf-workers',
   ) {
-    this.client = createClient({ url }) as RedisClientType;
-    this.ready = this.client.connect().then(() => undefined);
+    // Listener + bounded reconnect, and they only work as a pair. With no listener, an 'error' on an
+    // established connection exits the process (proven with `CLIENT KILL` on the pinned redis@6.2.1).
+    // With a listener but node-redis's DEFAULT strategy, the listener consumes the error that makes a
+    // failed connect() reject, so an absent Redis leaves connect() pending forever instead — a silent
+    // wedge in place of a loud crash. The bound keeps a transient blip recoverable and a genuinely
+    // absent Redis loud. Inline rather than shared: the equivalent helper is `resilientClientOptions` /
+    // `swallowRedisErrors` in @sh/session-backend (with the full rationale and the probe numbers), and
+    // a queue depending on the session store to reach it would invert the layering.
+    //
+    // Two notes from that shared rationale apply here verbatim. A REFUSED port rejects in ~5.5 s at this
+    // bound (its delays and nothing else), but a black-holed SYN -- the cluster shape, from a Service
+    // with no ready endpoints or a NetworkPolicy drop -- pays the full 5 s connectTimeout per attempt,
+    // so ~60 s to reject. And past this bound
+    // node-redis gives up PERMANENTLY and silently; the isOpen re-arm in open() is the other half of
+    // this fix, without which every later command rejects ClientClosedError for the life of the process.
+    this.client = createClient({
+      url,
+      socket: {
+        reconnectStrategy: (retries: number) =>
+          retries > 10
+            ? new Error(`redis at ${url} unreachable after ${retries} attempts`)
+            : Math.min(retries * 100, 1000),
+      },
+    }) as RedisClientType;
+    this.client.on('error', (err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[redis] work queue: ${message} (node-redis will reconnect)`);
+    });
+    this.ready = this.arm();
+  }
+
+  /** Connect, clearing the memo on rejection so the next call retries. Mirrors RedisSessionBackend.arm(). */
+  private arm(): Promise<void> {
+    const attempt = this.client.connect().then(() => undefined);
+    void attempt.catch(() => {
+      if (this.ready === attempt) this.ready = null;
+    });
+    return attempt;
+  }
+
+  /**
+   * Await the live attempt, re-arming if the last one FAILED or if node-redis permanently closed the
+   * socket past the bound above -- the second is invisible to the `.catch`, because that connect
+   * succeeded. See redis-errors.ts for the citations.
+   */
+  private open(): Promise<void> {
+    if (this.ready && !this.client.isOpen) this.ready = null;
+    return (this.ready ??= this.arm());
   }
 
   async ensureGroup(): Promise<void> {
-    await this.ready;
+    await this.open();
     try {
       // "0" = deliver from the start of the stream; MKSTREAM creates it if absent.
       await this.client.xGroupCreate(this.stream, this.group, '0', { MKSTREAM: true });
@@ -49,7 +95,7 @@ export class RedisWorkQueue implements WorkQueue {
   }
 
   async enqueue(envelope: unknown): Promise<string> {
-    await this.ready;
+    await this.open();
     return this.client.xAdd(this.stream, '*', { envelope: JSON.stringify(envelope) });
   }
 
@@ -57,7 +103,7 @@ export class RedisWorkQueue implements WorkQueue {
     consumerId: string,
     opts: { minIdleMs: number; blockMs: number },
   ): Promise<ClaimedEntry | null> {
-    await this.ready;
+    await this.open();
     // 1. Prefer reclaiming a stale (delivered-but-unacked) entry — crash recovery.
     const auto = await this.client.xAutoClaim(
       this.stream,
@@ -93,29 +139,29 @@ export class RedisWorkQueue implements WorkQueue {
   }
 
   async ack(entryId: string): Promise<void> {
-    await this.ready;
+    await this.open();
     await this.client.xAck(this.stream, this.group, entryId);
   }
 
   async touch(entryId: string, consumerId: string): Promise<void> {
-    await this.ready;
+    await this.open();
     // Reset idle time without re-fetching the payload, so a healthy long run is not reclaimed.
     await this.client.xClaimJustId(this.stream, this.group, consumerId, 0, [entryId]);
   }
 
   async pending(): Promise<number> {
-    await this.ready;
+    await this.open();
     const summary = await this.client.xPending(this.stream, this.group);
     return summary?.pending ?? 0;
   }
 
   async deleteConsumer(consumerId: string): Promise<void> {
-    await this.ready;
+    await this.open();
     await this.client.xGroupDelConsumer(this.stream, this.group, consumerId);
   }
 
   async gcIdleConsumers(minIdleMs: number): Promise<number> {
-    await this.ready;
+    await this.open();
     const info = await this.client.xInfoConsumers(this.stream, this.group);
     let removed = 0;
     for (const c of info) {
@@ -134,7 +180,7 @@ export class RedisWorkQueue implements WorkQueue {
     consumerId: string,
     opts: { minIdleMs: number; maxAttempts: number },
   ): Promise<Array<{ entryId: string; envelope: unknown }>> {
-    await this.ready;
+    await this.open();
     const deadLettered: Array<{ entryId: string; envelope: unknown }> = [];
     const pending = await this.client.xPendingRange(
       this.stream,
@@ -171,7 +217,7 @@ export class RedisWorkQueue implements WorkQueue {
   }
 
   async purge(): Promise<void> {
-    await this.ready;
+    await this.open();
     try {
       await this.client.xGroupDestroy(this.stream, this.group);
     } catch {
@@ -184,8 +230,12 @@ export class RedisWorkQueue implements WorkQueue {
     }
   }
 
+  /**
+   * Close what is open, without propagating a failed connect: `await this.ready` meant a client that
+   * never connected could not be closed AT ALL. Same bug, same fix as RedisSessionBackend.close().
+   */
   async close(): Promise<void> {
-    await this.ready;
-    await this.client.close();
+    await this.ready?.catch(() => {});
+    if (this.client.isOpen) await this.client.close();
   }
 }
