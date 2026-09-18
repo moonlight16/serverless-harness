@@ -696,6 +696,38 @@ Driver: `deploy/microvm/e10-lifecycle.sh`; cluster-free proof of its structure:
 
 ### E11 — density, the replenishment ceiling, and the write-up
 
+> **2026-09-17 — three of this section's conclusions are under repair (issue #291).** The
+> driver that produced these numbers had three mechanical defects, each affecting both arms
+> identically by construction, and any one of which is sufficient to produce the knee below
+> with no contribution from either backend: host resource signals were sampled on an idle
+> host after the window closed; roughly nine process spawns per Exec, two of them Python
+> interpreters, fell inside the timed window; and converge sat in the throughput denominator.
+> Two structurally different backends saturating at the same `c` with the same curve shape
+> was the tell.
+>
+> Specifically under repair, and not to be cited until a re-run:
+>
+> - **"`bound` is replenishment on both arms"** — the attribution, because a driver-bound
+>   ladder produces this shape on any backend.
+> - **"Nothing resembling a CPU or memory ceiling was reached"** — not a finding.
+>   `crosses('cpu')` tests `hostCpuFraction >= 0.9`, and a post-load `0.0006` makes that
+>   comparison structurally unable to fire at any rung. It is a restatement of the sampling
+>   bug.
+> - **The knee position, `c=8` on both arms** — the falsifiable question for the re-run is
+>   whether it stays there. If it moves or vanishes, the conclusion above is an artifact and
+>   needs retraction. If it holds with real under-load CPU data behind it, the conclusion was
+>   right and only its evidence was wrong.
+> - **Sealed prediction 3's SUPPORTED score** is derived from `coldAcquireRate`'s shape,
+>   which is a latency-classification proxy computed from the same contaminated latencies.
+>   Pending re-examination.
+>
+> The numbers stay. They are the record of what the broken instrument produced, and the
+> re-run is defined by comparison against them. Rung records written by the repaired driver
+> carry `samplingMode` — the ones below do not, and the two are not comparable on
+> `hostCpuFraction`, `memAvailableBytes`, `pssBytes` or `processCount`. The repaired driver
+> also adds a third arm, `driver-control`, whose latency is all driver; subtracting it at
+> each `c` is what will say whether the re-run can separate backend from driver at all.
+
 **RUN ON BARE METAL, 14 rungs, exit 0.** `SH_E11_ACTIVE_RUNS="1 2 4 8 16 32 64"`,
 `ITERS_PER_SLOT=20`, `SH_E11_COLD_LATENCY_MS=145`, same host and snapshot as E10.
 
