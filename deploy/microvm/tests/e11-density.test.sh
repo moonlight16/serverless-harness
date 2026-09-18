@@ -1583,8 +1583,11 @@ if [ -n "$bar_rdr" ]; then
   fi
   check "both phases derive the run id from ONE helper, so they cannot drift" \
     "$(printf '%s\n' "$bar_rdr" | grep -c 'slot_run_id ')" "2"
-  check "both phases derive the req_id base from ONE helper" \
-    "$(printf '%s\n' "$bar_rdr" | grep -c 'slot_req_base ')" "2"
+  # Three call sites since issue #294's Go plan: converge, the timed loop, and the
+  # plan-building loop that feeds write_rung_plan's reqBase -- all deriving from the
+  # SAME helper, so they cannot drift from each other.
+  check "all call sites derive the req_id base from ONE helper" \
+    "$(printf '%s\n' "$bar_rdr" | grep -c 'slot_req_base ')" "3"
 fi
 
 echo "== the slot-identity helpers are deterministic in (arm, d, ram_mb, c, i)"
@@ -1651,6 +1654,7 @@ if [ -n "$bar_body" ]; then
       PROC_ROOT="$bar_tmpdir/proc" VMM_PROC_PATTERN=__none__ VIRTIOFSD_PROC_PATTERN=__none__ \
       SAMPLE_INTERVAL_MS=1000 SAMPLE_SLICE_MS=100 SAMPLE_MIN_TICK_MS=200 SAMPLE_LOW_EVERY=5 \
       EXEC_MAX_TIME_S=45 PROTO_IMPORT_PATH=/tmp PROTO_REL_PATH=x.proto \
+      EXEC_CLIENT=grpcurl \
       bash "$bar_probe" container - - 2 e11-test 8444 "$bar_tmpdir/out.json"
   }
 
@@ -2555,6 +2559,78 @@ check "non-vacuousness: the position comparison reports no when the order is rev
 # in one place and preflight's own `mkdir -p "$RESULTS"` has already happened.
 check "the exec-driver binary path is under \$RESULTS" \
   "$(grep -c 'E11_EXEC_DRIVER_BIN="\$RESULTS/.e11-exec-driver-bin"' "$SCRIPT")" "1"
+
+
+# ---------------------------------------------------------------------------
+# write_rung_plan: the bash-to-Go boundary (issue #294)
+# ---------------------------------------------------------------------------
+echo "== write_rung_plan emits a plan exec-driver can consume, with disjoint req_id spaces (#294)"
+
+wrp_body="$(extract_fns write_rung_plan || true)"
+check "write_rung_plan is extractable" "$([ -n "$wrp_body" ] && echo yes || echo no)" "yes"
+
+plan_out="$(mktemp "${TMPDIR:-/tmp}/e11-plan.XXXXXX")"
+# Two slots, bases from the REAL slot_req_base, and a mix containing the exact characters a
+# hand-rolled bash JSON writer would corrupt: a double quote, a backslash, a pipe and a
+# redirect. If these survive, escaping is genuinely json.dumps's job.
+(
+  eval "$(extract_fns slot_req_base write_rung_plan)"
+  write_rung_plan "$plan_out" "localhost:8445" "e11-driver-control" \
+    7 2 30 45 3 2 \
+    'true' 'echo "a\b" > /tmp/x' 'grep -c e11 /tmp/x | wc -l' \
+    "$(slot_req_base 1)" '' "/tmp/slots/slot-1.times" "/tmp/slots/slot-1.err" \
+    "$(slot_req_base 2)" 'e11-microvm-d2-ram256-c2-slot2' "/tmp/slots/slot-2.times" "/tmp/slots/slot-2.err"
+)
+check "write_rung_plan wrote a non-empty plan" "$([ -s "$plan_out" ] && echo yes || echo no)" "yes"
+
+plan_read() { python3 -c "import json,sys; print(json.load(open(sys.argv[1]))$1)" "$plan_out"; }
+check "  target" "$(plan_read "['target']")" "localhost:8445"
+check "  sandboxId" "$(plan_read "['sandboxId']")" "e11-driver-control"
+check "  itersPerSlot" "$(plan_read "['itersPerSlot']")" "7"
+check "  warmupPerSlot" "$(plan_read "['warmupPerSlot']")" "2"
+check "  execTimeoutS" "$(plan_read "['execTimeoutS']")" "30"
+check "  callDeadlineS" "$(plan_read "['callDeadlineS']")" "45"
+check "  the whole mix is carried, in order" "$(plan_read "['mix'][0]")" "true"
+check "  a mix command with a quote and a backslash survives verbatim" \
+  "$(plan_read "['mix'][1]")" 'echo "a\b" > /tmp/x'
+check "  a mix command with a pipe survives verbatim" \
+  "$(plan_read "['mix'][2]")" 'grep -c e11 /tmp/x | wc -l'
+check "  slot count" "$(plan_read "['slots'].__len__()")" "2"
+# The req_id spaces come from the REAL slot_req_base, so this is the property that
+# exec-driver's validateReqIDRanges enforces, asserted at the source.
+check "  slot 1 reqBase is slot_req_base 1" "$(plan_read "['slots'][0]['reqBase']")" "1000000"
+check "  slot 2 reqBase is slot_req_base 2" "$(plan_read "['slots'][1]['reqBase']")" "2000000"
+check "  the container arm's empty workspace_key is preserved as empty" \
+  "$(plan_read "['slots'][0]['workspaceKey']")" ""
+check "  the microvm arm's workspace_key is carried" \
+  "$(plan_read "['slots'][1]['workspaceKey']")" "e11-microvm-d2-ram256-c2-slot2"
+check "  slot 1 timesFile" "$(plan_read "['slots'][0]['timesFile']")" "/tmp/slots/slot-1.times"
+check "  slot 2 errFile" "$(plan_read "['slots'][1]['errFile']")" "/tmp/slots/slot-2.err"
+rm -f "$plan_out"
+
+# A partial mix would silently shrink what every slot loops over -- the same defect the
+# existing escaped_mix count assertion guards on the grpcurl path.
+plan_out2="$(mktemp "${TMPDIR:-/tmp}/e11-plan.XXXXXX")"
+wrp_mismatch="$(
+  eval "$(extract_fns write_rung_plan)"
+  die() {
+    echo "DIED"
+    exit 1
+  }
+  write_rung_plan "$plan_out2" "localhost:8445" "sb" 7 2 30 45 3 1 \
+    'true' 'false' \
+    1000000 '' /tmp/a.times /tmp/a.err 2>/dev/null || echo REFUSED
+)"
+check "write_rung_plan refuses an argv that does not match its own counts" \
+  "$(printf '%s' "$wrp_mismatch" | grep -cE 'DIED|REFUSED')" "1"
+rm -f "$plan_out2"
+
+# DRIFT GUARD: the plan's execTimeoutS must equal the timeout_s grpc_exec_record puts on the
+# wire, or the two clients would be sending different Exec deadlines and their latencies would
+# not be comparable. Both are read out of the real source text.
+ger_timeout="$(extract_fn grpc_exec_record | grep -o '\\"timeout_s\\":[0-9]*' | head -n1 | cut -d: -f2)"
+rdr_timeout="$(extract_fn run_density_rung | grep -A3 'write_rung_plan "\$plan_file"' | grep -oE '"\$ITERS_PER_SLOT" "\$WARMUP_PER_SLOT" [0-9]+' | grep -oE '[0-9]+$')"
+check "the plan's execTimeoutS matches grpc_exec_record's timeout_s" "$rdr_timeout" "$ger_timeout"
 
 echo
 echo "Total failures: $fails"

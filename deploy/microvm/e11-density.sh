@@ -1122,6 +1122,76 @@ escaped_mix() {
   done < <(e11_tool_call_mix)
 }
 
+# write_rung_plan emits ONE rung's instruction set for remote-worker/cmd/exec-driver
+# (issue #294), as JSON, at $1.
+#
+# A PURE FUNCTION OF ITS ARGUMENTS -- no globals read -- so the test suite can drive it in
+# isolation, the same property static_settings_json's comment claims for the same reason.
+#
+# Everything travels through ARGV, and python3's json.dumps does every escape. bash passes each
+# array element as one argv entry, so a workspace key or a path containing a space, quote,
+# backslash or tab cannot be mis-split -- which a delimited temp file could not promise. It also
+# keeps JSON escaping in the one place this driver already puts it (json_escape), rather than
+# adding a second, hand-rolled implementation in bash.
+#
+# The mix and the slot fields are VARIADIC, after a count of each, because bash cannot pass
+# arrays by value: the alternative was reading caller arrays by name, which would make this
+# untestable in isolation. Slot fields come in groups of four, in order:
+# reqBase workspaceKey timesFile errFile.
+#
+# Called BEFORE wall_t0 is stamped. Nothing in here may end up inside the timed window --
+# deploy/microvm/tests/e11-density.test.sh's fork guard asserts that python3 does not appear
+# between the two stamps.
+#
+# THE CLOSING BRACES AND BRACKETS IN THE PYTHON BODY BELOW ARE INDENTED ON PURPOSE. The test
+# suite extracts functions from this file by scanning for the closing bare `}` at column 0, and
+# it only knows to skip over an embedded `python3 -c "` block spelled with a DOUBLE quote (see
+# extract_fn). This block uses a single quote, so a `}` at column 0 here would terminate the
+# extraction early and the suite would source a truncated function. Python accepts an indented
+# closing delimiter, so this costs nothing; un-indenting it silently breaks two test sections.
+write_rung_plan() {
+  local out_path="$1" target="$2" sandbox_id="$3" iters="$4" warmup="$5" exec_timeout_s="$6" deadline_s="$7" mix_count="$8" slot_count="$9"
+  shift 9
+  python3 -c '
+import json, sys
+
+out, target, sandbox, iters, warmup, tmo, deadline, nmix, nslots = sys.argv[1:10]
+nmix, nslots = int(nmix), int(nslots)
+rest = sys.argv[10:]
+if len(rest) != nmix + 4 * nslots:
+    sys.stderr.write(
+        "e11: write_rung_plan was given %d variadic argument(s) but its counts say %d mix "
+        "command(s) plus 4 fields for each of %d slot(s) = %d. Refusing to write a plan that "
+        "would silently shrink the mix every slot loops over, or drop a slot.\n"
+        % (len(rest), nmix, nslots, nmix + 4 * nslots))
+    sys.exit(1)
+mix = rest[:nmix]
+fields = rest[nmix:]
+slots = [
+    {
+        "reqBase": int(fields[i * 4]),
+        "workspaceKey": fields[i * 4 + 1],
+        "timesFile": fields[i * 4 + 2],
+        "errFile": fields[i * 4 + 3],
+    }
+    for i in range(nslots)
+    ]
+plan = {
+    "target": target,
+    "sandboxId": sandbox,
+    "itersPerSlot": int(iters),
+    "warmupPerSlot": int(warmup),
+    "execTimeoutS": int(tmo),
+    "callDeadlineS": int(deadline),
+    "mix": mix,
+    "slots": slots,
+    }
+with open(out, "w") as fh:
+    json.dump(plan, fh, indent=2)
+' "$out_path" "$target" "$sandbox_id" "$iters" "$warmup" "$exec_timeout_s" "$deadline_s" "$mix_count" "$slot_count" "$@" ||
+    die "write_rung_plan could not write the rung plan to $out_path (its reason is above) - the Go Exec client has nothing to drive, so refusing to enter the timed window"
+}
+
 # ---------------------------------------------------------------------------
 # The Exec RPC itself, extended from e10-lifecycle.sh's grpc_exec_ms with a
 # workspace_key (proto/sandbox/v1/sandbox.proto: Exec.workspace_key, field 6,
@@ -1614,7 +1684,7 @@ run_density_rung() {
   # commands and the slot's workspace_key once per slot, before timing starts". The
   # derivations now go through the same helpers phase 1 uses, so the two cannot drift.
   # ---------------------------------------------------------------------------
-  local -a mix_json=() ws_json_by_slot=()
+  local -a mix_json=() ws_json_by_slot=() ws_raw_by_slot=()
   local mix_expected_count
   mapfile -t mix_json < <(escaped_mix)
   [ "${#mix_json[@]}" -gt 0 ] ||
@@ -1625,8 +1695,29 @@ run_density_rung() {
   local run_id_i
   for i in $(seq 1 "$c"); do
     run_id_i="$(slot_run_id "$arm" "$d" "$ram_mb" "$c" "$i")"
-    ws_json_by_slot[i]="$(json_escape "$(slot_workspace_key "$arm" "$run_id_i")")"
+    # ONE slot_workspace_key call, two consumers: the pre-escaped form the grpcurl path
+    # interpolates, and the raw form the Go path's plan carries (json.dumps escapes it there).
+    # Deriving it twice is how the two paths would drift into sending different keys.
+    ws_raw_by_slot[i]="$(slot_workspace_key "$arm" "$run_id_i")"
+    ws_json_by_slot[i]="$(json_escape "${ws_raw_by_slot[i]}")"
   done
+
+  # The Go client's plan, written HERE -- before wall_t0 -- so nothing it costs lands inside the
+  # timed window (issue #294, and the fork guard in tests/e11-density.test.sh asserts it).
+  local plan_file="$E11_TMPDIR/plan-$rung_tag.json"
+  if [ "$EXEC_CLIENT" = "go" ]; then
+    local -a plan_argv=()
+    local plan_cmd
+    while IFS= read -r plan_cmd; do plan_argv+=("$plan_cmd"); done < <(e11_tool_call_mix)
+    for i in $(seq 1 "$c"); do
+      plan_argv+=("$(slot_req_base "$i")" "${ws_raw_by_slot[i]}" "$slot_dir/slot-$i.times" "$slot_dir/slot-$i.err")
+    done
+    # 30 is grpc_exec_record's own timeout_s, so both clients put the SAME Exec deadline on the
+    # wire; tests/e11-density.test.sh reads both out of this file and asserts they match.
+    write_rung_plan "$plan_file" "localhost:${relay_port}" "$sandbox_id" \
+      "$ITERS_PER_SLOT" "$WARMUP_PER_SLOT" 30 "$EXEC_MAX_TIME_S" \
+      "$mix_expected_count" "$c" "${plan_argv[@]}"
+  fi
 
   # ---------------------------------------------------------------------------
   # PHASE 2: the timed Exec loop, and nothing else.
