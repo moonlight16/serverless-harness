@@ -677,6 +677,215 @@ check "percentile's call sites no longer swallow its status with '|| echo 0'" \
 check "the five derived rung fields now go through require_numeric" \
   "$(grep -cE 'require_numeric (p95Ms|throughput|coldAcquireRate|convergeMsP50|wallSeconds)' "$SCRIPT")" "5"
 
+# ---------------------------------------------------------------------------
+# Issue #291 item 2: payload construction leaves the timed window.
+#
+# grpc_exec_record used to run mktemp, date, json_escape x2 (python3 x2), grpcurl, date,
+# rm, plus wc -l x2 in the caller's loop guard -- ~9 process creations per Exec, two of
+# them interpreter startups, and t0 was stamped BEFORE the compound whose argument list
+# contained both command substitutions, so both interpreter startups fell inside the
+# measured latency. At c=64 that is ~64 slots x ~9 spawns continuously, which is enough to
+# produce the observed c=8 knee with no contribution from the backend at all.
+#
+# Two properties are asserted: the payload is byte-identical to what json_escape produced
+# (the correctness risk in moving escaping out of the loop), and the timed window contains
+# none of the removed spawns (the regression that would silently undo the fix).
+# ---------------------------------------------------------------------------
+echo "== per-Exec payload construction is pre-escaped, outside the timed window (#291 item 2)"
+
+esc_body="$(extract_fns json_escape e11_tool_call_mix escaped_mix || true)"
+check "escaped_mix is extractable alongside json_escape and the mix" \
+  "$([ -n "$esc_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$esc_body" ]; then
+  esc_tmpdir="$(mktemp -d)"
+  esc_snippet="$esc_tmpdir/esc.sh"
+  printf '%s\n' "$esc_body" >"$esc_snippet"
+
+  # The hazardous command: a double quote AND a backslash, the two characters that make
+  # naive bash interpolation produce JSON that either fails to parse or silently changes
+  # the command the sandbox runs.
+  hazard='echo "a\b" > /tmp/x'
+
+  esc_pair=$(
+    # shellcheck disable=SC1090
+    . "$esc_snippet"
+    # Override the mix with the single hazardous command, so escaped_mix's own output can be
+    # compared against json_escape of the same string.
+    e11_tool_call_mix() { printf '%s\n' 'echo "a\b" > /tmp/x'; }
+    printf '%s\n%s\n' "$(escaped_mix)" "$(json_escape 'echo "a\b" > /tmp/x')"
+  )
+  esc_new="$(printf '%s\n' "$esc_pair" | sed -n 1p)"
+  esc_old="$(printf '%s\n' "$esc_pair" | sed -n 2p)"
+  check "escaped_mix is byte-identical to json_escape on a command with a quote and a backslash" \
+    "$esc_new" "$esc_old"
+
+  # And the assembled payload -- the thing grpcurl actually receives -- round-trips through
+  # the real consumer with the command unchanged.
+  esc_payload="{\"sandbox_id\":\"e11-test\",\"exec\":{\"req_id\":7,\"command\":$esc_new,\"timeout_s\":30,\"workspace_key\":\"ws-1\"}}"
+  esc_rt_rc=0
+  esc_rt="$(printf '%s' "$esc_payload" | python3 -c 'import json,sys; print(json.load(sys.stdin)["exec"]["command"])' 2>&1)" || esc_rt_rc=$?
+  check "the assembled payload parses as JSON" "$esc_rt_rc" "0"
+  check "  ...with the command byte-for-byte what was asked for" "$esc_rt" "$hazard"
+
+  # Ordering and count: the mix has 7 commands and escaped_mix must preserve both.
+  esc_count=$(
+    # shellcheck disable=SC1090
+    . "$esc_snippet"
+    escaped_mix | wc -l | tr -d ' '
+  )
+  check "escaped_mix emits one line per mix command (7)" "$esc_count" "7"
+  esc_first=$(
+    # shellcheck disable=SC1090
+    . "$esc_snippet"
+    escaped_mix | sed -n 1p
+  )
+  check "  ...in the mix's own order (first is 'true')" "$esc_first" '"true"'
+
+  rm -rf "$esc_tmpdir"
+fi
+
+echo "== the timed window forks nothing but grpcurl (#291 item 2, the regression guard)"
+# timed_window_body prints exactly what runs inside the measured window: run_density_rung's
+# lines strictly BETWEEN the wall_t0 and wall_t1 stamps (excluding both stamp lines
+# themselves -- neither stamp's own assignment runs DURING the interval it delimits), plus
+# the whole of grpc_exec_record, which every Exec in that window calls. Comments are
+# stripped, because the explanations of this defect name the removed commands.
+#
+# The `next` after `f=1` matters: awk evaluates every pattern-action rule against a record
+# in program order, so without it the SAME line that flips f to 1 would also satisfy the
+# later `f{print}` rule and print itself -- including the wall_t0 stamp (and its own
+# `date +%s%N`) in a window that is supposed to start strictly after it.
+timed_window_body() {
+  {
+    printf '%s\n' "$(extract_fn run_density_rung)" |
+      awk '/wall_t0="/{f=1; next} /wall_t1="/{exit} f{print}'
+    extract_fn grpc_exec_record
+  } | grep -v '^[[:space:]]*#'
+}
+tw_body="$(timed_window_body || true)"
+check "the timed window is extractable and non-empty" \
+  "$([ -n "$tw_body" ] && echo yes || echo no)" "yes"
+
+# NON-VACUOUSNESS: the detector must flag each removed command in a fixture that contains
+# it. Without this, "0 findings" below could mean the regex matches nothing.
+tw_detect() { printf '%s\n' "$1" | grep -cE '\bjson_escape\b|date \+%s%N|\bmktemp\b|\bwc -l\b'; }
+check "non-vacuousness: the detector flags a json_escape in the window" \
+  "$(tw_detect '  -d "{\"command\":$(json_escape "$cmd\")}"')" "1"
+check "non-vacuousness: the detector flags a date +%s%N in the window" \
+  "$(tw_detect '  t0="$(date +%s%N)"')" "1"
+check "non-vacuousness: the detector flags an mktemp in the window" \
+  "$(tw_detect '  err_log="$(mktemp "$E11_TMPDIR/errlog.XXXXXX")"')" "1"
+check "non-vacuousness: the detector flags a wc -l loop guard" \
+  "$(tw_detect '  while [ "$(wc -l <"$times_file")" -lt "$want" ]; do')" "1"
+
+if [ -n "$tw_body" ]; then
+  check "no json_escape, date, mktemp or wc runs inside the timed window" \
+    "$(tw_detect "$tw_body")" "0"
+  # The complement, so the check above cannot pass by the window having gone away.
+  check "  ...and grpcurl still does (the one spawn that is the measurement)" \
+    "$([ "$(printf '%s\n' "$tw_body" | grep -c 'grpcurl')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "  ...and latency is stamped from EPOCHREALTIME, a shell variable" \
+    "$([ "$(printf '%s\n' "$tw_body" | grep -c 'EPOCHREALTIME')" -ge 1 ] && echo yes || echo no)" "yes"
+fi
+
+echo "== epoch_delta_ms and the EPOCHREALTIME preflight"
+ep_body="$(extract_fns die epoch_delta_ms set_epoch_ms require_epochrealtime || true)"
+check "the epoch helpers are extractable" "$([ -n "$ep_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$ep_body" ]; then
+  ep_snippet="$(mktemp -d)/ep.sh"
+  printf '%s\n' "$ep_body" >"$ep_snippet"
+  ep() {
+    (
+      # shellcheck disable=SC1090
+      . "$ep_snippet"
+      epoch_delta_ms "$1" "$2"
+    )
+  }
+  check "epoch_delta_ms over 1.5s" "$(ep 1789672470.000000 1789672471.500000)" "1500"
+  check "epoch_delta_ms truncates sub-millisecond" "$(ep 1789672470.000000 1789672470.000999)" "0"
+  check "epoch_delta_ms handles a leading-zero microsecond field" \
+    "$(ep 1789672470.000000 1789672470.042000)" "42"
+  check "epoch_delta_ms across a second boundary" \
+    "$(ep 1789672470.900000 1789672471.100000)" "200"
+
+  # The preflight: a shell with no EPOCHREALTIME (bash < 5.0, which is /bin/bash on macOS)
+  # or a locale that renders a decimal comma both make every timed Exec an arithmetic
+  # error. This refuses in preflight instead.
+  ep_unset_rc=0
+  ep_unset_out=$(
+    (
+      # shellcheck disable=SC1090
+      . "$ep_snippet"
+      unset EPOCHREALTIME
+      require_epochrealtime
+    ) 2>&1
+  ) || ep_unset_rc=$?
+  check "require_epochrealtime refuses when EPOCHREALTIME is unset" \
+    "$([ "$ep_unset_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  case "$ep_unset_out" in *EPOCHREALTIME*) ep_named=yes ;; *) ep_named=no ;; esac
+  check "  ...and the refusal names EPOCHREALTIME" "$ep_named" "yes"
+  ep_comma_rc=0
+  ep_comma_out=$(
+    (
+      # shellcheck disable=SC1090
+      . "$ep_snippet"
+      # EPOCHREALTIME is a bash dynamic variable: per the bash manual, assigning to it
+      # while it still has its special properties is ignored on the NEXT read (which
+      # keeps returning the live clock, dot-formatted under this suite's LC_ALL=C) --
+      # only after `unset` does a plain string assignment actually stick. Without the
+      # unset here, this fixture would (mis)report a comma reading as accepted.
+      unset EPOCHREALTIME
+      EPOCHREALTIME='1789672470,123935'
+      require_epochrealtime
+    ) 2>&1
+  ) || ep_comma_rc=$?
+  check "require_epochrealtime refuses a locale decimal COMMA (LC_NUMERIC=de_DE)" \
+    "$([ "$ep_comma_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  case "$ep_comma_out" in *[Ll]ocale*) ep_loc=yes ;; *) ep_loc=no ;; esac
+  check "  ...and says so, so the fix is obvious" "$ep_loc" "yes"
+  ep_ok_rc=0
+  (
+    # shellcheck disable=SC1090
+    . "$ep_snippet"
+    EPOCHREALTIME='1789672470.123935'
+    require_epochrealtime
+  ) >/dev/null 2>&1 || ep_ok_rc=$?
+  check "require_epochrealtime accepts a well-formed reading (does not refuse everything)" \
+    "$ep_ok_rc" "0"
+  rm -rf "$(dirname "$ep_snippet")"
+fi
+
+check "LC_ALL is pinned and exported for the whole driver" \
+  "$([ "$(grep -c '^export LC_ALL$' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "preflight calls require_epochrealtime" \
+  "$([ "$(printf '%s\n' "$(extract_fn preflight)" | grep -c 'require_epochrealtime')" -ge 1 ] && echo yes || echo no)" "yes"
+check "the slot's error log is a fixed path under the trap-owned root, not an mktemp" \
+  "$([ "$(grep -c 'err_log="\$slot_dir/slot-\$i.err"' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+# Spec section 1 says the escaping happens BEFORE TIMING STARTS, not merely outside the
+# per-Exec loop. Assert the order structurally: the mix is escaped, and every slot's
+# workspace_key with it, above the wall_t0 stamp.
+pe_rdr="$(extract_fn run_density_rung || true)"
+if [ -n "$pe_rdr" ]; then
+  pe_line() { printf '%s\n' "$pe_rdr" | grep -n -- "$1" | head -n1 | cut -d: -f1; }
+  pe_mix="$(pe_line 'mapfile -t mix_json')"
+  pe_ws="$(pe_line 'ws_json_by_slot\[i\]=')"
+  pe_t0="$(pe_line 'wall_t0="')"
+  check "the mix is pre-escaped inside run_density_rung" \
+    "$([ -n "$pe_mix" ] && echo yes || echo no)" "yes"
+  check "each slot's workspace_key is pre-escaped too" \
+    "$([ -n "$pe_ws" ] && echo yes || echo no)" "yes"
+  if [ -n "$pe_mix" ] && [ -n "$pe_ws" ] && [ -n "$pe_t0" ]; then
+    check "the mix is escaped BEFORE wall_t0 (before timing starts)" \
+      "$([ "$pe_mix" -lt "$pe_t0" ] && echo yes || echo no)" "yes"
+    check "the workspace keys are escaped before wall_t0 too" \
+      "$([ "$pe_ws" -lt "$pe_t0" ] && echo yes || echo no)" "yes"
+  fi
+  check "the mix is escaped exactly once per rung, not once per slot" \
+    "$(printf '%s\n' "$pe_rdr" | grep -c 'mapfile -t mix_json')" "1"
+fi
+
 echo "== a FAILED converge is not recorded as a fast converge"
 # converge_slot used to discard grpcurl's status and return the timing anyway, so a converge
 # that never prepared the workspace still produced a small convergeMsP50 -- wrong in the

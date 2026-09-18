@@ -119,6 +119,15 @@
 #     bash deploy/microvm/e11-density.sh
 set -uo pipefail
 
+# LC_ALL is pinned for the WHOLE driver, and exported so awk, python3 and grpcurl inherit
+# it. $EPOCHREALTIME -- which replaces two `date +%s%N` forks per Exec below -- renders with
+# the LOCALE's decimal separator, so under e.g. LC_NUMERIC=de_DE it yields
+# "1789672470,123935". epoch_delta_ms strips a '.', not a ',', so the comma would survive
+# into `10#`, and every Exec's latency would become an arithmetic error INSIDE the timed
+# loop. require_epochrealtime in preflight proves the pin took.
+LC_ALL=C
+export LC_ALL
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -321,6 +330,7 @@ require_tool() {
 }
 
 preflight() {
+  require_epochrealtime
   # Every one of these is a HARD requirement for at least one arm, and each was found the
   # expensive way on the first execution. pnpm in particular is NOT optional: the container
   # arm's relay is `pnpm --filter @sh/sandbox-relay start`, so without it that whole arm --
@@ -529,6 +539,50 @@ host_signals_snapshot() {
 }
 
 # ---------------------------------------------------------------------------
+# Timing primitives (issue #291 item 2).
+#
+# $EPOCHREALTIME is a bash VARIABLE (bash >= 5.0), so reading it costs no process. It
+# replaces the two `date +%s%N` forks grpc_exec_record used to take per Exec -- and,
+# because t0 was stamped before the compound whose argument list held two python3 command
+# substitutions, those two interpreter startups were inside the measured latency.
+# Resolution drops from nanoseconds to microseconds, which is immaterial for millisecond
+# latencies.
+#
+# Both helpers avoid command substitution deliberately: `x="$(f)"` is a FORK, which is the
+# entire thing being removed here. epoch_delta_ms prints (it is called once per Exec, where
+# one fork for the substitution is what the caller already pays for the assignment), while
+# set_epoch_ms writes a global (it is called inside the sampler's tick loop, where nothing
+# may fork).
+# ---------------------------------------------------------------------------
+EPOCH_MS=0
+
+# epoch_delta_ms prints the whole milliseconds between two $EPOCHREALTIME readings.
+# Stripping the '.' turns <seconds>.<6 digits> into integer MICROSECONDS, which bash's
+# 64-bit arithmetic holds with room to spare (1.8e15 today). `10#` is defensive against a
+# reading whose integer part could ever begin with 0.
+epoch_delta_ms() {
+  local a="${1/./}" b="${2/./}"
+  echo $(((10#$b - 10#$a) / 1000))
+}
+
+# set_epoch_ms sets EPOCH_MS to now, in whole milliseconds, with no subprocess.
+set_epoch_ms() {
+  local e="${EPOCHREALTIME/./}"
+  # shellcheck disable=SC2034 # EPOCH_MS's reader is the sampler tick loop, issue #291 item 3/4 (not yet added)
+  EPOCH_MS=$((10#$e / 1000))
+}
+
+# require_epochrealtime refuses a shell whose $EPOCHREALTIME is missing or not
+# <digits>.<digits>. bash < 5.0 does not define it at all -- and bash 3.2 is both /bin/sh
+# and /bin/bash on macOS -- so under `set -u` the FIRST timed Exec would abort its slot,
+# every slot, and the rung would refuse with a message about converge. A locale rendering a
+# decimal comma is the other way this reads wrong; LC_ALL=C above pins it.
+require_epochrealtime() {
+  [[ "${EPOCHREALTIME:-}" =~ ^[0-9]+\.[0-9]+$ ]] ||
+    die "\$EPOCHREALTIME is '${EPOCHREALTIME:-<unset>}', not <seconds>.<microseconds>: this driver times every Exec from it (issue #291 item 2). Unset means bash < 5.0 (bash 3.2 is /bin/bash on macOS - run this under a bash 5 on PATH); a decimal comma means a locale is overriding the LC_ALL=C pin at the top of this file."
+}
+
+# ---------------------------------------------------------------------------
 # json_escape / percentile -- duplicated from e10-lifecycle.sh verbatim (see that
 # file's own copies); small enough that duplication beats sourcing a sibling
 # script for these two alone.
@@ -577,6 +631,19 @@ e11_tool_call_mix() {
   echo "rm -f /tmp/e11-mix-$$.tmp"
 }
 
+# escaped_mix prints one PRE-ESCAPED JSON string literal (surrounding double quotes
+# included) per command of e11_tool_call_mix, in the mix's own order. It is called ONCE PER
+# SLOT, before the slot's timed loop starts -- this is where the two python3 interpreter
+# startups per Exec went (issue #291 item 2). It uses the same json_escape the timed loop
+# used to call, so the bytes it produces are identical by construction rather than by a
+# reimplementation of JSON escaping in bash, which is where this change's real risk was.
+escaped_mix() {
+  local cmd
+  while IFS= read -r cmd; do
+    json_escape "$cmd"
+  done < <(e11_tool_call_mix)
+}
+
 # ---------------------------------------------------------------------------
 # The Exec RPC itself, extended from e10-lifecycle.sh's grpc_exec_ms with a
 # workspace_key (proto/sandbox/v1/sandbox.proto: Exec.workspace_key, field 6,
@@ -584,17 +651,25 @@ e11_tool_call_mix() {
 # for execErrorsByCause.
 # ---------------------------------------------------------------------------
 grpc_exec_record() {
-  local relay_port="$1" sandbox_id="$2" workspace_key="$3" cmd="$4" req_id="$5" out_file="$6"
-  local t0 t1 ms err_log cause status
-  err_log="$(mktemp "$E11_TMPDIR/errlog.XXXXXX")"
-  t0="$(date +%s%N)"
+  local relay_port="$1" sandbox_id="$2" ws_json="$3" cmd_json="$4" req_id="$5" out_file="$6" err_log="$7"
+  local t0 t1 ms cause status
+  # ws_json and cmd_json arrive ALREADY ESCAPED, quotes included (escaped_mix / the caller's
+  # one-shot workspace_key escape). err_log is a fixed per-slot path: `2>` truncates it on
+  # every call, so the old mktemp+rm pair bought nothing. req_id is a number and needs no
+  # escaping.
+  t0="$EPOCHREALTIME"
   if grpcurl -plaintext -max-time "$EXEC_MAX_TIME_S" -import-path "$PROTO_IMPORT_PATH" -proto "$PROTO_REL_PATH" \
-    -d "{\"sandbox_id\":\"$sandbox_id\",\"exec\":{\"req_id\":$req_id,\"command\":$(json_escape "$cmd"),\"timeout_s\":30,\"workspace_key\":$(json_escape "$workspace_key")}}" \
+    -d "{\"sandbox_id\":\"$sandbox_id\",\"exec\":{\"req_id\":$req_id,\"command\":$cmd_json,\"timeout_s\":30,\"workspace_key\":$ws_json}}" \
     "localhost:${relay_port}" sandbox.v1.SandboxExec/Exec >/dev/null 2>"$err_log"; then
+    t1="$EPOCHREALTIME"
     status="ok"
     cause="-"
   else
+    t1="$EPOCHREALTIME"
     status="err"
+    # These greps are the ONLY subprocesses left besides grpcurl, and they run only after an
+    # Exec has already failed -- so they cannot contribute to a healthy rung's latency, and a
+    # failed Exec's latency is not in the distribution p95 is taken over anyway.
     if grep -qi "workspace_key" "$err_log"; then
       cause="empty-workspace-key"
     elif grep -qi "mem" "$err_log"; then
@@ -609,10 +684,8 @@ grpc_exec_record() {
       cause="unknown"
     fi
   fi
-  t1="$(date +%s%N)"
-  ms=$(((t1 - t0) / 1000000))
+  ms="$(epoch_delta_ms "$t0" "$t1")"
   echo "$ms $status $cause" >>"$out_file"
-  rm -f "$err_log"
 }
 
 # build_converge_script reproduces harness/src/converge.ts:buildConvergeScript()
@@ -897,9 +970,31 @@ run_density_rung() {
   converge_file="$E11_TMPDIR/converge-$rung_tag"
   : >"$converge_file"
 
+  # Payload construction happens HERE, before timing starts -- spec section 1: "pre-escape
+  # the 7 mix commands and the slot's workspace_key once per slot, before timing starts".
+  # The mix is identical for every slot, so it is escaped once per RUNG; the workspace keys
+  # differ, so there is one per slot. Both are plain shell variables, which the slot
+  # subshells below inherit.
+  #
+  # json_escape (python3) is still what does the escaping, so the bytes are identical BY
+  # CONSTRUCTION rather than by a reimplementation of JSON escaping in bash -- which is where
+  # this change's real risk was. It just runs 7 + c times per rung instead of twice per Exec.
+  local -a mix_json=() ws_json_by_slot=()
+  mapfile -t mix_json < <(escaped_mix)
+  [ "${#mix_json[@]}" -gt 0 ] ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c: escaped_mix produced no commands, so every slot would loop forever issuing no Execs"
+  local i run_id_i wskey_i
+  for i in $(seq 1 "$c"); do
+    run_id_i="e11-${arm}-d${d}-ram${ram_mb}-c${c}-slot${i}"
+    wskey_i=""
+    if [ "$arm" = "microvm" ]; then
+      wskey_i="$run_id_i" # microvm arm REFUSES an empty workspace_key (proto doc comment)
+    fi                    # container arm may omit/empty it (today's single shared workspace)
+    ws_json_by_slot[i]="$(json_escape "$wskey_i")"
+  done
+
   local wall_t0 wall_t1 pids=()
   wall_t0="$(date +%s%N)"
-  local i
   for i in $(seq 1 "$c"); do
     (
       local wskey="" run_id="e11-${arm}-d${d}-ram${ram_mb}-c${c}-slot${i}"
@@ -931,20 +1026,24 @@ run_density_rung() {
         exit 1
       fi
 
-      local times_file="$slot_dir/slot-$i.times" req="$req_base"
-      # Create it empty first. The loop guard below reads it with `wc -l <"$times_file"`,
-      # and `2>/dev/null` there binds to wc -- NOT to the shell's own redirection, so a
-      # missing file printed "No such file or directory" to stderr on every slot's first
-      # iteration. The fallback made it harmless, but an operator reading the log saw what
-      # looked like a failure in the middle of a working rung.
+      local times_file="$slot_dir/slot-$i.times" err_log="$slot_dir/slot-$i.err" req="$req_base"
+      # Pre-escaped above, before wall_t0. Parameter expansion, not a command substitution:
+      # `local x="$(...)"` would trip SC2155, which is a WARNING and so a lint failure here.
+      local ws_json="${ws_json_by_slot[$i]}"
       : >"$times_file"
-      local want=$((ITERS_PER_SLOT + WARMUP_PER_SLOT))
-      while [ "$(wc -l <"$times_file" 2>/dev/null || echo 0)" -lt "$want" ]; do
-        while IFS= read -r cmd; do
+      : >"$err_log"
+      # A shell counter, not `wc -l` twice per Exec: the timed loop is this file's only
+      # writer, so the count is known without reading it back. `for mi in` over the array
+      # pre-escaped above also removes the process-substitution subshell the inner
+      # `while read` re-spawned on every pass over the mix.
+      local want=$((ITERS_PER_SLOT + WARMUP_PER_SLOT)) issued=0 mi
+      while [ "$issued" -lt "$want" ]; do
+        for mi in "${!mix_json[@]}"; do
           req=$((req + 1))
-          grpc_exec_record "$relay_port" "$sandbox_id" "$wskey" "$cmd" "$req" "$times_file"
-          [ "$(wc -l <"$times_file" 2>/dev/null || echo 0)" -ge "$want" ] && break
-        done < <(e11_tool_call_mix)
+          grpc_exec_record "$relay_port" "$sandbox_id" "$ws_json" "${mix_json[$mi]}" "$req" "$times_file" "$err_log"
+          issued=$((issued + 1))
+          [ "$issued" -ge "$want" ] && break
+        done
       done
     ) &
     pids+=("$!")
