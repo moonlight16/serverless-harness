@@ -504,7 +504,7 @@ if [ -n "$writer_body" ] && [ -n "$dim_body" ]; then
       # The in-rung sampled signals (#291 item 1). cpu_mean is what crosses('cpu') reads.
       cpu_mean=0.4100 cpu_peak=0.9700 cpu_min=0.0500 cpu_samples=12 cores_busy=29.5200
       mem_mean=8388608000 mem_min=8000000000
-      pss_mean=524288 pss_peak=1048576 pss_samples=3
+      pss_mean=524288 pss_peak=1048576 pss_samples=3 pss_refused_ticks=0
       proc_mean=0 proc_peak=2 proc_samples=3
       # The retained post-load snapshot, under its own names.
       post_cpu=0.0006 post_mem=8388608000 post_pss=0 post_proc=0
@@ -829,6 +829,25 @@ if [ -n "$tw_body" ]; then
     "$([ "$(printf '%s\n' "$tw_body" | grep -c 'EPOCHREALTIME')" -ge 1 ] && echo yes || echo no)" "yes"
 fi
 
+echo "== grpc_exec_record contains no command substitution at all, arithmetic aside (M10)"
+# \$\([^(] matches a command-substitution open, "$(", NOT immediately followed by a second
+# "(" -- so it flags "$(cmd)" while leaving "$((expr))" (arithmetic expansion, used for the
+# ms computation below) alone. A plain grep for '\$(' would wrongly flag that arithmetic
+# expansion too, since "$((" contains "$(" as a substring.
+ger_nosubst() { printf '%s\n' "$1" | grep -cE '\$\([^(]'; }
+check "non-vacuousness: the detector flags a real command substitution" \
+  "$(ger_nosubst 't0="$(date +%s%N)"')" "1"
+check "non-vacuousness: the detector does NOT flag arithmetic expansion" \
+  "$(ger_nosubst 'ms=$(( (10#$b - 10#$a) / 1000 ))')" "0"
+ger_body="$(extract_fn grpc_exec_record | grep -v '^[[:space:]]*#' || true)"
+check "grpc_exec_record is extractable" "$([ -n "$ger_body" ] && echo yes || echo no)" "yes"
+if [ -n "$ger_body" ]; then
+  check "  ...and its body runs no command substitution -- not even one avoided fork" \
+    "$(ger_nosubst "$ger_body")" "0"
+  check "  ...while still using \$((...)) arithmetic expansion for the ms computation" \
+    "$([ "$(printf '%s\n' "$ger_body" | grep -cE '\$\(\(')" -ge 1 ] && echo yes || echo no)" "yes"
+fi
+
 echo "== epoch_delta_ms and the EPOCHREALTIME preflight"
 ep_body="$(extract_fns die epoch_delta_ms set_epoch_ms require_epochrealtime || true)"
 check "the epoch helpers are extractable" "$([ -n "$ep_body" ] && echo yes || echo no)" "yes"
@@ -902,6 +921,59 @@ check "LC_ALL is pinned and exported for the whole driver" \
   "$([ "$(grep -c '^export LC_ALL$' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 check "preflight calls require_epochrealtime" \
   "$([ "$(printf '%s\n' "$(extract_fn preflight)" | grep -c 'require_epochrealtime')" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "== preflight only requires docker/pnpm/microVM hardware checks for arms that need them (issue #291 item 5)"
+ai_body="$(extract_fn arm_in_use || true)"
+check "arm_in_use is extractable" "$([ -n "$ai_body" ] && echo yes || echo no)" "yes"
+if [ -n "$ai_body" ]; then
+  ai_tmpdir="$(mktemp -d)"
+  ai_snippet="$ai_tmpdir/arm_in_use.sh"
+  printf '%s\n' "$ai_body" >"$ai_snippet"
+  run_arm_in_use() {
+    (
+      read -r -a E11_ARMS <<<"$2"
+      # shellcheck disable=SC1090
+      . "$ai_snippet"
+      arm_in_use "$1"
+    )
+  }
+  ai_rc=0
+  run_arm_in_use container "container driver-control" >/dev/null 2>&1 || ai_rc=$?
+  check "arm_in_use finds an arm that IS configured" "$ai_rc" "0"
+  ai_rc=0
+  run_arm_in_use microvm "container driver-control" >/dev/null 2>&1 || ai_rc=$?
+  check "  ...and refuses (nonzero) one that is NOT configured" \
+    "$([ "$ai_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  rm -rf "$ai_tmpdir"
+fi
+
+pf_body="$(extract_fn preflight || true)"
+check "preflight is extractable" "$([ -n "$pf_body" ] && echo yes || echo no)" "yes"
+if [ -n "$pf_body" ]; then
+  # Strip full-line comments first: this file's own header comments say "check_kvm" and
+  # "validate_arms" while explaining the ordering, which would otherwise satisfy grep -n
+  # before the real code line does and silently defeat the ordering assertions below.
+  pf_code="$(printf '%s\n' "$pf_body" | grep -v '^[[:space:]]*#')"
+  pf_line() { printf '%s\n' "$pf_code" | grep -n -- "$1" | head -n1 | cut -d: -f1; }
+  pf_validate="$(pf_line 'validate_arms')"
+  pf_guard="$(pf_line 'arm_in_use container')"
+  pf_docker="$(pf_line 'require_tool docker')"
+  pf_pnpm="$(pf_line 'require_tool pnpm')"
+  pf_vmm_guard="$(pf_line 'arm_in_use microvm')"
+  pf_kvm="$(pf_line 'check_kvm')"
+  check "validate_arms runs before any arm-conditional check reads E11_ARMS" \
+    "$([ -n "$pf_validate" ] && [ -n "$pf_guard" ] && [ "$pf_validate" -lt "$pf_guard" ] && echo yes || echo no)" "yes"
+  check "docker is required only inside an arm_in_use(container|microvm) guard" \
+    "$([ -n "$pf_docker" ] && [ -n "$pf_guard" ] && [ "$pf_guard" -lt "$pf_docker" ] && echo yes || echo no)" "yes"
+  check "pnpm is required only inside that same guard" \
+    "$([ -n "$pf_pnpm" ] && [ -n "$pf_guard" ] && [ "$pf_guard" -lt "$pf_pnpm" ] && echo yes || echo no)" "yes"
+  check "check_kvm is required only inside an arm_in_use(microvm) guard" \
+    "$([ -n "$pf_kvm" ] && [ -n "$pf_vmm_guard" ] && [ "$pf_vmm_guard" -lt "$pf_kvm" ] && echo yes || echo no)" "yes"
+  check "  ...and so are check_cgroups/check_swap/check_governor (all four gated together)" \
+    "$(printf '%s\n' "$pf_code" | awk '/arm_in_use microvm/{f=1} f' | grep -cE '^\s*(check_kvm|check_cgroups|check_swap|GOVERNOR_STATE="\$\(check_governor\)")$')" "4"
+  check "grpcurl and go stay unconditional -- every arm needs both" \
+    "$(printf '%s\n' "$pf_code" | grep -cE '^\s*require_tool (grpcurl|go) ')" "2"
+fi
 check "the slot's error log is a fixed path under the trap-owned root, not an mktemp" \
   "$([ "$(grep -c 'err_log="\$slot_dir/slot-\$i.err"' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 # Spec section 1 says the escaping happens BEFORE TIMING STARTS, not merely outside the
@@ -1197,6 +1269,56 @@ if [ -n "$samp_body" ]; then
   check "a window below SAMPLE_MIN_TICK_MS records NO sample rather than a noise diff" \
     "$(wc -l <"$sp_out" | tr -d ' ')" "0"
 
+  # A rung that has ALREADY landed a real full-interval tick gets no diluted extra sample at
+  # stop, even when SAMPLE_MIN_TICK_MS is tiny enough that the elapsed-time floor alone would
+  # otherwise let one through (issue #291 item 2). SAMPLE_MIN_TICK_MS=1 here is deliberate: it
+  # isolates the SAMPLE_TICK==0 gate as the ONLY thing standing between "at least one full tick
+  # already landed" and an extra stop-tick, so a regression that drops that gate turns this
+  # into a failure rather than passing by an unrelated floor.
+  #
+  # host_sampler_loop checks for the stop file only once per SLICE, at the top of its loop,
+  # BEFORE it sleeps -- so if the stop file appears while a slice's sleep is already in
+  # flight, that slice (and, if it is the last slice of a tick group, the tick that goes with
+  # it) still completes; the loop only notices stop on its NEXT top-of-loop check. A fixed
+  # "sleep N then write stop" cannot dodge that: whatever N is, there is no way to guarantee
+  # the write lands in the brief gap right after a tick rather than mid-slice. So instead of
+  # guessing a delay, POLL for the first tick to land and write the stop file within one poll
+  # tick of seeing it -- that reaction is a handful of the loop's own SAMPLE_SLICE_MS slices
+  # away from the second tick, giving a wide, timing-independent margin against mistaking a
+  # legitimately-scheduled second tick for the dilution bug this checks for.
+  : >"$sp_out"
+  rm -f "$sp_stop"
+  (
+    PROC_ROOT="$sp_proc"
+    # shellcheck disable=SC2034
+    SAMPLE_INTERVAL_MS=1000
+    # shellcheck disable=SC2034
+    SAMPLE_SLICE_MS=200
+    # shellcheck disable=SC2034
+    SAMPLE_MIN_TICK_MS=1
+    # shellcheck disable=SC2034 # read by host_sampler_loop once sourced
+    SAMPLE_LOW_EVERY=1000
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    host_sampler_loop "$sp_out" "$sp_stop"
+  ) &
+  sp_dil_pid=$!
+  sp_before=0
+  for _ in $(seq 1 400); do
+    sp_before="$(wc -l <"$sp_out" | tr -d ' ')"
+    [ "$sp_before" -ge 1 ] && break
+    sleep 0.02
+  done
+  : >"$sp_stop"
+  wait "$sp_dil_pid"
+  sp_after="$(wc -l <"$sp_out" | tr -d ' ')"
+  check "at least one full tick landed before stop was signalled (scenario sanity check)" \
+    "$([ "$sp_before" -ge 1 ] && echo yes || echo no)" "yes"
+  check "no diluted extra tick is appended once a full tick has already landed" \
+    "$sp_after" "$sp_before"
+
   rm -rf "$sp_tmpdir"
 fi
 
@@ -1278,6 +1400,47 @@ if [ -n "$sf_body" ]; then
     "$([ "$sf_ncpu" -ge 1 ] 2>/dev/null && echo yes || echo no)" "yes"
 
   rm -rf "$sf_tmpdir"
+fi
+
+echo "== a refused PSS read is counted, not silently dropped like an ordinary '-' tick (#291 item 4)"
+smc_body="$(extract_fns sampler_field sampler_marker_count || true)"
+check "sampler_field and sampler_marker_count are extractable" \
+  "$([ -n "$smc_body" ] && echo yes || echo no)" "yes"
+if [ -n "$smc_body" ]; then
+  smc_tmpdir="$(mktemp -d)"
+  smc_snippet="$smc_tmpdir/smc.sh"
+  printf '%s\n' "$smc_body" >"$smc_snippet"
+  # Five ticks in column 3 (pssBytes): one real reading, one ordinary un-sampled "-", two
+  # DISTINCT refusals (pss_bytes_for_pids died on an unreadable smaps_rollup), and one more
+  # real reading -- so pssRefusedTicks (refused=2) must differ from both pssSamples
+  # (sampler_field count=2, the two numeric ticks) and from a naive "non-dash" count (which
+  # would wrongly fold the refusals in as if they were data).
+  smc_file="$smc_tmpdir/samples"
+  {
+    echo '0.1000 8000000000 524288 2'
+    echo '0.2000 8000000000 - -'
+    echo '0.3000 8000000000 refused -'
+    echo '0.4000 8000000000 refused -'
+    echo '0.5000 8000000000 1048576 4'
+  } >"$smc_file"
+  smc() {
+    (
+      # shellcheck disable=SC1090
+      . "$smc_snippet"
+      "$@"
+    )
+  }
+  check "pssRefusedTicks counts exactly the 'refused' markers, via sampler_marker_count" \
+    "$(smc sampler_marker_count "$smc_file" 3 refused)" "2"
+  check "  ...and a marker no tick actually holds counts zero, not an error" \
+    "$(smc sampler_marker_count "$smc_file" 3 no-such-marker)" "0"
+  check "  ...an empty sampler file also counts zero refusals rather than failing" \
+    "$(smc sampler_marker_count "$smc_tmpdir/does-not-exist" 3 refused)" "0"
+  check "pssSamples (sampler_field count) is 2 -- the refusals are NOT folded in as data" \
+    "$(smc sampler_field "$smc_file" 3 count '%d')" "2"
+  check "  ...and pssBytes' mean is over only those 2 real readings, refusals excluded" \
+    "$(smc sampler_field "$smc_file" 3 mean '%.0f')" "786432"
+  rm -rf "$smc_tmpdir"
 fi
 
 echo "== the sampler brackets exactly the timed window, and nothing else (#291 item 1)"
@@ -1906,7 +2069,9 @@ check "redis is started with RDB snapshots disabled (--save '')" \
 # ---------------------------------------------------------------------------
 echo "== the driver-control arm runs by default and is driven by the same function (#291 section 4)"
 check "SH_E11_ARMS defaults to all three arms, control included" \
-  "$([ "$(grep -c 'SH_E11_ARMS:-container microvm driver-control' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+  "$([ "$(grep -c 'SH_E11_ARMS-container microvm driver-control' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "  ...via \${VAR-default}, not \${VAR:-default}: an explicit empty value must still refuse (issue #291 item 8)" \
+  "$([ "$(grep -c 'SH_E11_ARMS:-container microvm driver-control' "$SCRIPT")" -eq 0 ] && echo yes || echo no)" "yes"
 check "main() drives the control arm through run_density_rung, not a second function" \
   "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -c 'run_density_rung driver-control')" "1"
 check "no arm-specific Exec-driving function was added for it" \
@@ -1925,6 +2090,36 @@ check "analyze_slice is SKIPPED for the control arm (a ladder with no cold acqui
   "$([ "$(grep -c 'analyze_slice skipped' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 check "  ...but its ladder is still assembled, because the subtraction needs it" \
   "$(grep -c 'e11-ladder-driver-control.json' "$SCRIPT")" "2"
+
+echo "== SH_E11_ARMS unset defaults to all three arms; SH_E11_ARMS='' stays empty (issue #291 item 8)"
+# \${VAR-default} (no colon) only substitutes when VAR is UNSET, unlike \${VAR:-default} which
+# also substitutes when VAR is set-but-empty. Eval the real default-expansion line in isolation
+# (not the whole script, which has unrelated top-level side effects) to prove the two cases
+# actually differ, not just that the source text changed.
+arms_default_line="$(grep -m1 'read -r -a E11_ARMS <<<"\${SH_E11_ARMS' "$SCRIPT")"
+check "the E11_ARMS default-expansion line is found" \
+  "$([ -n "$arms_default_line" ] && echo yes || echo no)" "yes"
+if [ -n "$arms_default_line" ]; then
+  arms_unset_out=$(
+    (
+      unset SH_E11_ARMS
+      eval "$arms_default_line"
+      printf '%s\n' "${E11_ARMS[*]}"
+    )
+  )
+  check "  ...unset SH_E11_ARMS falls back to all three arms" \
+    "$arms_unset_out" "container microvm driver-control"
+  arms_empty_len=$(
+    (
+      # shellcheck disable=SC2034 # read by the eval'd default-expansion line below
+      SH_E11_ARMS=""
+      eval "$arms_default_line"
+      echo "${#E11_ARMS[@]}"
+    )
+  )
+  check "  ...SH_E11_ARMS='' (explicitly empty) is NOT defaulted -- stays zero arms" \
+    "$arms_empty_len" "0"
+fi
 
 echo "== only the three named arms validate, and shuffling covers whatever is configured"
 arms_body="$(extract_fns die validate_arms shuffle_e11_arms || true)"
