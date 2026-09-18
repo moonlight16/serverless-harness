@@ -255,6 +255,12 @@ E11_WORKER_BIN=""
 E11_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/e11-density.XXXXXX")"
 
 cleanup_on_exit() {
+  # Set BEFORE either stop_*_stack call so kill_relay_by_port can tell a trap-driven,
+  # best-effort teardown (log and move on) from a between-arm one (die - see
+  # kill_relay_by_port's own comment): die is a bare `exit 1`, which the `|| true`
+  # below cannot catch, so without this flag a stuck relay from stop_container_stack
+  # would abort the trap before stop_microvm_stack or the E11_TMPDIR cleanup ever ran.
+  E11_IN_CLEANUP=1
   stop_container_stack || true
   stop_microvm_stack || true
   [ -z "${E11_TMPDIR:-}" ] || rm -rf "$E11_TMPDIR"
@@ -329,6 +335,7 @@ preflight() {
   require_tool docker "both arms start their own scratch redis in a container; without it the relay has nowhere to publish its presence record"
   require_tool go "both arms build their own worker binary from ./cmd/worker and ./cmd/microvm-worker"
   require_tool pnpm "the container arm starts the real sandbox-relay via pnpm --filter @sh/sandbox-relay; without it the baseline arm cannot start at all"
+  require_tool ss "between-arm relay teardown identifies the listener by port via ss; without it kill_relay_by_port cannot tell a free port from a missing tool, and the next arm would attach to the previous arm's relay"
   # The proto must be PRESENT as a file, separately from how grpcurl is told to find it
   # (PROTO_IMPORT_PATH/PROTO_REL_PATH): a missing proto is otherwise indistinguishable from
   # a malformed grpcurl invocation, and both present as an unencodable Exec. e10 carries the
@@ -751,6 +758,38 @@ shuffle_e11_arms() {
   printf 'container\nmicrovm\n' | awk -v seed="$(($$ + $(date +%s)))" 'BEGIN{srand(seed)} {print rand()"\t"$0}' | sort -n | cut -f2-
 }
 
+# kill_relay_by_port kills whatever is listening on $1, BY PORT rather than by
+# E11_RELAY_PID. That PID comes from `pnpm ... start & echo $!` inside a subshell, and on
+# this host pnpm stays running as a supervisor over a separate node child rather than
+# exec-ing into it -- so killing E11_RELAY_PID kills pnpm and leaves its child holding the
+# port. The next arm's own relay then dies with EADDRINUSE, and because a worker's startup
+# check only confirms SOMETHING answers on the port, never which relay it is, that arm's
+# worker silently attaches to the STALE relay from the PREVIOUS arm instead -- the same
+# "silently wrong data" failure METAL-RUNBOOK.md section 3a already documents for a leaked
+# relay across separate invocations, except this is within a single e11-density.sh run,
+# between its own two arms. Verified against the port with ss, same as the runbook's own
+# manual cleanup recipe -- never against a process name or a captured PID.
+kill_relay_by_port() {
+  local port="$1" pid
+  # shellcheck disable=SC2034 # loop variable is the retry count itself, not read
+  for tries in 1 2 3 4 5 6 7 8 9 10; do
+    # sleep FIRST, not after the kill below: both call sites send SIGTERM to
+    # E11_RELAY_PID just before this runs, and without a grace window here every
+    # teardown escalates straight to SIGKILL before that SIGTERM has had a chance,
+    # which can truncate the relay log mid-write (see wait_for_relay_port, which
+    # leans on that log as its own failure evidence).
+    sleep 0.5
+    pid="$(ss -ltnp "sport = :${port}" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)"
+    [ -z "$pid" ] && return 0
+    kill -9 "$pid" 2>/dev/null
+  done
+  if [ -n "${E11_IN_CLEANUP:-}" ]; then
+    log "port $port still held by pid $pid after 10 kill attempts - continuing best-effort teardown (see kill_relay_by_port's comment)"
+    return 1
+  fi
+  die "port $port is still held by pid $pid after 10 kill attempts - the next arm's relay would bind onto a stale listener or fail with EADDRINUSE (see kill_relay_by_port's comment)"
+}
+
 # start_redis_loopback publishes this driver's scratch redis on LOOPBACK ONLY, and is
 # the single place either arm starts one (both arms had the same `docker run` line).
 #
@@ -808,6 +847,7 @@ stop_container_stack() {
   # assigned (build-snapshot.sh's cleanup_on_exit documents that exact failure).
   [ -n "${E11_WORKER_PID:-}" ] && kill "${E11_WORKER_PID:-}" 2>/dev/null
   [ -n "${E11_RELAY_PID:-}" ] && kill "${E11_RELAY_PID:-}" 2>/dev/null
+  kill_relay_by_port "$E11_RELAY_PORT"
   docker rm -f "sh-e11-redis-$$" >/dev/null 2>&1 || true
   E11_WORKER_PID=""
   E11_RELAY_PID=""
@@ -862,6 +902,7 @@ stop_microvm_stack() {
   # assigned (build-snapshot.sh's cleanup_on_exit documents that exact failure).
   [ -n "${E11_WORKER_PID:-}" ] && kill "${E11_WORKER_PID:-}" 2>/dev/null
   [ -n "${E11_RELAY_PID:-}" ] && kill "${E11_RELAY_PID:-}" 2>/dev/null
+  kill_relay_by_port "$E11_RELAY_PORT"
   docker rm -f "sh-e11-redis-$$" >/dev/null 2>&1 || true
   E11_WORKER_PID=""
   E11_RELAY_PID=""
