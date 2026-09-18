@@ -60,6 +60,46 @@ check "both failures below the low-water mark" \
   "$(python3 -c "import json; print(json.load(open('$OUT'))['failed_below_low_water'])")" "2"
 check "neither success below the low-water mark" \
   "$(python3 -c "import json; print(json.load(open('$OUT'))['ok_below_low_water'])")" "0"
+check "all 6 mem samples parsed" \
+  "$(python3 -c "import json; print(json.load(open('$OUT'))['mem_samples_total'])")" "6"
+check "well-formed timeline reports no torn final line" \
+  "$(python3 -c "import json; print(json.load(open('$OUT'))['mem_timeline_torn_final_line'])")" "False"
+
+# A malformed line that is NOT a torn final line means the file is not what
+# the caller says it is: refuse with the position, never skip the sample. A
+# silently dropped sample here would understate memory pressure in exactly
+# the direction that makes the memory hypothesis look falsified.
+BAD_MEM="$TMP/mem-malformed.log"
+printf '99.0 104857600\n100.0\n101.0 83886080\n' > "$BAD_MEM"
+BAD_ERR="$TMP/mem-malformed.err"
+python3 "$SCRIPT" --results-glob "$RESULTS/*.json" --boot-log-glob "$JAILS/*.boot.log" \
+  --mem-timeline "$BAD_MEM" --oom-events "$OOM" --out "$TMP/bad.json" >/dev/null 2>"$BAD_ERR"
+check "malformed interior line exits nonzero" "$?" "1"
+check "refusal names the line number" \
+  "$(grep -c 'mem-malformed.log:2: expected .epoch bytes.' "$BAD_ERR")" "1"
+check "refusal writes no summary" "$([ -f "$TMP/bad.json" ] && echo yes || echo no)" "no"
+
+# A torn final line (no trailing newline) is what a sampler killed mid-write
+# actually leaves. Tolerated, because every preceding sample is still sound -
+# but recorded in the summary and announced, never absorbed silently.
+#
+# The fixture's torn line is deliberately one that PARSES: "101.0 8" is a
+# well-formed line carrying a truncated integer, and accepting it would inject
+# a fake 8-byte MemAvailable reading - manufacturing the very memory pressure
+# this script tests for. The missing newline is what disqualifies it.
+TORN_MEM="$TMP/mem-torn.log"
+printf '99.0 104857600\n100.0 94371840\n101.0 8' > "$TORN_MEM"
+TORN_ERR="$TMP/mem-torn.err"
+TORN_OUT="$TMP/torn.json"
+python3 "$SCRIPT" --results-glob "$RESULTS/*.json" --boot-log-glob "$JAILS/*.boot.log" \
+  --mem-timeline "$TORN_MEM" --oom-events "$OOM" --out "$TORN_OUT" >/dev/null 2>"$TORN_ERR"
+check "torn final line exits zero" "$?" "0"
+check "torn final line is recorded in the summary" \
+  "$(python3 -c "import json; print(json.load(open('$TORN_OUT'))['mem_timeline_torn_final_line'])")" "True"
+check "the 2 complete samples are kept" \
+  "$(python3 -c "import json; print(json.load(open('$TORN_OUT'))['mem_samples_total'])")" "2"
+check "discarded final line is announced on stderr" \
+  "$(grep -c 'discarding unterminated final line' "$TORN_ERR")" "1"
 
 echo
 if [ "$fails" -ne 0 ]; then
