@@ -532,12 +532,20 @@ pss_bytes_for_pids() {
 # the single instance of the shape. require_numeric below is the guard that keeps it
 # from being the last one.
 # FOUND BY THE FIRST-EVER EXECUTION of this driver on a Linux host with real memory
-# (issue #291's PR): the awk form above was `print $2*1024`, and awk's OFMT defaults to "%.6g",
-# so any product needing more than 6 significant digits was printed in SCIENTIFIC NOTATION --
-# `1.73035e+10` on a 16 GiB host, `8.0896e+11` on the documented 754 GiB metal box.
-# require_numeric refuses that (its regex is `-?[0-9]+(\.[0-9]+)?`), so host_signals_snapshot
-# returned non-zero and EVERY RUNG WAS REFUSED. The whole cluster-free suite passed throughout,
-# because its fixture uses 8192000 kB -- small enough to print as an integer.
+# (issue #291's PR): the awk form above was `print $2*1024`, and awk's OFMT defaults to "%.6g".
+# On MAWK -- Debian's and Ubuntu's default awk -- that applies to an integral product too, so a
+# 16 GiB host printed `1.73035e+10`. require_numeric refuses that (its regex is
+# `-?[0-9]+(\.[0-9]+)?`), so host_signals_snapshot returned non-zero and EVERY RUNG WAS REFUSED.
+#
+# It is MAWK-SPECIFIC, and the scope was initially overstated in this comment: gawk and macOS awk
+# print `808960000000` for the same expression, because they apply OFMT only to non-integral
+# values. Both rigs this project runs on (the 72-cpu/754 GiB metal box and the nested-m8i EC2
+# instance) ship gawk and were never affected -- verified on both. So this fix did not rescue a
+# metal run; what it does is remove the dependence on which awk a host ships, which is the part
+# worth having, since a Debian/Ubuntu host would have recorded nothing at all.
+#
+# The cluster-free suite passed throughout on every platform, because its fixture uses
+# 8192000 kB -- small enough that even mawk prints it as an integer.
 #
 # `printf "%d"` is NOT the fix: Debian's mawk clamps %d to 32 bits, so it prints 2147483647 --
 # silently recording 2 GB where the truth is 17 GB, which is the optimistic-direction wrongness
