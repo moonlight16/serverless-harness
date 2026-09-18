@@ -934,13 +934,20 @@ microVM path itself, ratioed directly below) isolates the tax the issue asked ab
 **Rung 2 decomposition (parked variant), nested vs metal — this is the answer to the
 issue's question 1 ("which sub-cost inflates most"):**
 
-| sub-cost (rung 2, parked) | metal p50 | nested-m8i p50 | ratio                                                         |
-| ------------------------- | --------- | -------------- | ------------------------------------------------------------- |
-| acquire                   | 0.00 ms   | 0.00 ms        | — (both ≈0, standby pop)                                      |
-| resume                    | 28.58 ms  | 78.34 ms       | **2.74x**                                                     |
-| run                       | 2.85 ms   | 4.12 ms        | 1.45x                                                         |
-| destroy                   | 21.31 ms  | 118.45 ms      | **5.56x**                                                     |
-| total                     | 55.32 ms  | 209.72 ms      | 3.79x (matches the warm-hot-path ratio above within rounding) |
+| sub-cost (rung 2, parked)                   | metal p50 | nested-m8i p50 | ratio                                                         |
+| ------------------------------------------- | --------- | -------------- | ------------------------------------------------------------- |
+| acquire                                     | 0.00 ms   | 0.00 ms        | — (both ≈0, standby pop)                                      |
+| resume                                      | 28.58 ms  | 78.34 ms       | **2.74x**                                                     |
+| run                                         | 2.85 ms   | 4.12 ms        | 1.45x                                                         |
+| destroy                                     | 21.31 ms  | 118.45 ms      | **5.56x**                                                     |
+| total (separately measured; p50s don't sum) | 55.32 ms  | 209.72 ms      | 3.79x (matches the warm-hot-path ratio above within rounding) |
+
+`total` is the rung's own measured warm-hot-path p50 (same 55.32 / 209.72 as the E10 table
+above), not the sum of the four sub-costs — percentiles don't add, and the two columns are
+each off by a different amount (metal: 52.74 vs a stated 55.32, a ~2.6 ms gap; nested:
+200.91 vs a stated 209.72, a ~8.8 ms gap). Both sums still land on the ratio the row
+claims (209.72/55.32 = 3.79x ≈ the 3.81x warm-hot-path ratio), so the gap is presentation,
+not a measurement error.
 
 **Destroy is taxed harder than resume on this rig** (5.56x vs 2.74x), not evenly — a
 finding one level more specific than the design's own hypothesis that nested
@@ -999,18 +1006,22 @@ arm's p95 ratio sits at 1.85x–2.60x at _every_ c, including where the containe
 below 1 — nesting adds a roughly constant multiplicative tax to VM-exit-heavy work
 independent of load, not a tax that only shows up under contention.
 
-**The knee lands at the same c on both substrates: c=8.** That answers the issue's
-question 3 directly — replenishment saturates at the same concurrency here as on metal,
-it just costs ~2x more once it does. `bound` is `replenishment` on the microVM arm at
-every c through 32 (never memory or process-count on this arm); the sweep's own budget is
-what stops it from reaching 64, not the arm's own dynamics.
+**Nested's knee also lands at c=8, consistent with metal's** — a validation result, not a
+measurement of the knee's location under real concurrency (see the nested-run caveat
+above): replenishment saturates at the same concurrency here as on metal, it just costs
+~2x more once it does. `bound` is `replenishment` on the microVM arm at every c through 32
+(never memory or process-count on this arm); the sweep's own budget is what stops it from
+reaching 64, not the arm's own dynamics.
 
 **Predictions:** the container-arm mini-analysis scored prediction 3 (`inconclusive` at
 smoke scale, `supported` once real per-arm data existed) the same way metal's did; the
 combined analysis across both arms at the full `1 2 4 8 16 32` ladder came back
 `inconclusive` on every prediction, because `analyzeLadder`'s scorers were sealed against
 a `1 2 4 8 16 32 64` shape and a 6-rung ladder changes which rung is "the last one" for
-several of them — expected from dropping a rung, not a defect.
+several of them — expected from dropping a rung, not a defect. The knee corroboration
+above is read directly off the two ladders rather than through that scorer, which is why
+it stands alongside, not inside, this `inconclusive` verdict: the scorer's ladder-shape
+mismatch leaves it unable to confirm the knee match, not evidence against it.
 
 #### A real defect this run found, fixed, and left a regression test for
 

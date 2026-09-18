@@ -1109,13 +1109,17 @@ echo "== between-arm relay teardown kills by PORT, not just the captured PID"
 check "kill_relay_by_port helper is defined" \
   "$(grep -c '^kill_relay_by_port() {' "$SCRIPT")" "1"
 check "kill_relay_by_port finds its target via ss (by port), not pgrep -f (by name)" \
-  "$(grep -A12 '^kill_relay_by_port() {' "$SCRIPT" | grep -c 'ss -ltnp')" "1"
+  "$(sed -n '/^kill_relay_by_port() {/,/^}/p' "$SCRIPT" | grep -c 'ss -ltnp')" "1"
+check "kill_relay_by_port does not fall back to pgrep -f (by name)" \
+  "$(sed -n '/^kill_relay_by_port() {/,/^}/p' "$SCRIPT" | grep -c 'pgrep -f')" "0"
 check "stop_container_stack also kills by port (not only E11_RELAY_PID)" \
   "$(sed -n '/^stop_container_stack() {/,/^}/p' "$SCRIPT" | grep -c 'kill_relay_by_port')" "1"
 check "stop_microvm_stack also kills by port (not only E11_RELAY_PID)" \
   "$(sed -n '/^stop_microvm_stack() {/,/^}/p' "$SCRIPT" | grep -c 'kill_relay_by_port')" "1"
 check "kill_relay_by_port dies loudly rather than returning silently if the port never clears" \
-  "$(grep -A12 '^kill_relay_by_port() {' "$SCRIPT" | grep -c 'die ')" "1"
+  "$(sed -n '/^kill_relay_by_port() {/,/^}/p' "$SCRIPT" | grep -c 'die ')" "1"
+check "kill_relay_by_port's cleanup-trap path logs and returns instead of dying" \
+  "$(sed -n '/^kill_relay_by_port() {/,/^}/p' "$SCRIPT" | grep -c 'E11_IN_CLEANUP')" "1"
 
 echo
 echo "Total failures: $fails"
