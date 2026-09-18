@@ -705,6 +705,42 @@ for pair in "grpcurl:grpcurl-per-exec" "go:go-persistent-conn"; do
   check "exec_client_label maps '$client' to '$want'" "$got" "$want"
 done
 
+echo "== the two path-dependent disclosures are chosen by client, and differ (#294)"
+dn_body="$(extract_fns driver_control_note_for exec_error_note_for || true)"
+check "the disclosure functions are extractable" "$([ -n "$dn_body" ] && echo yes || echo no)" "yes"
+
+dcn_go="$(eval "$dn_body"; driver_control_note_for go)"
+dcn_gc="$(eval "$dn_body"; driver_control_note_for grpcurl)"
+een_go="$(eval "$dn_body"; exec_error_note_for go)"
+een_gc="$(eval "$dn_body"; exec_error_note_for grpcurl)"
+
+# Path-specific CONTENT, not just "non-empty". A swap between the branches is the failure this
+# catches: the go path must not claim an ExecError is recorded as ok, and the grpcurl path must not
+# claim it is recorded as err.
+check "the go exec-error disclosure says status=err" \
+  "$(printf '%s' "$een_go" | grep -Fc 'recorded as status=err')" "1"
+check "  ...and does NOT claim status=ok for itself" \
+  "$(printf '%s' "$een_go" | grep -Fc 'is recorded as status=ok')" "0"
+check "the grpcurl exec-error disclosure says status=ok" \
+  "$(printf '%s' "$een_gc" | grep -Fc 'recorded as status=ok')" "1"
+check "the go driver-control disclosure describes the tighter bound" \
+  "$(printf '%s' "$dcn_go" | grep -Fc 'tighter one than on the grpcurl path')" "1"
+check "the grpcurl driver-control disclosure keeps the STRICT LOWER BOUND wording" \
+  "$(printf '%s' "$dcn_gc" | grep -Fc 'STRICT LOWER BOUND')" "1"
+# The two paths must actually differ -- if both branches returned the same string, every check above
+# could still pass while the disclosure stopped distinguishing the clients at all.
+check "the two exec-error disclosures differ between clients" \
+  "$([ "$een_go" != "$een_gc" ] && echo differ || echo same)" "differ"
+check "the two driver-control disclosures differ between clients" \
+  "$([ "$dcn_go" != "$dcn_gc" ] && echo differ || echo same)" "differ"
+# An unknown client must fall to the grpcurl text, matching exec_client_label's own defaulting, so a
+# future third client cannot silently acquire the go disclosures.
+check "an unrecognised client gets the grpcurl disclosures" \
+  "$([ "$(eval "$dn_body"; exec_error_note_for xyzzy)" = "$een_gc" ] && echo yes || echo no)" "yes"
+# Apostrophe safety: these are interpolated into single-quoted python literals.
+check "no disclosure contains an apostrophe" \
+  "$(printf '%s%s%s%s' "$dcn_go" "$dcn_gc" "$een_go" "$een_gc" | tr -cd "'" | wc -c | tr -d ' ')" "0"
+
 # ---------------------------------------------------------------------------
 # percentile: a missing/empty input is a refusal, not a zero (review 4001908597).
 # ---------------------------------------------------------------------------

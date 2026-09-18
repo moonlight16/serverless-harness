@@ -474,6 +474,26 @@ exec_client_label() {
   esac
 }
 
+# driver_control_note_for and exec_error_note_for print the two proxyLimitations disclosures whose
+# text DEPENDS on which client ran. Pure functions of their argument, like exec_client_label above,
+# so the suite can drive both paths in isolation -- the branch that chose between these strings used
+# to live inline in run_density_rung, where no test could reach it, and a swap between the two would
+# have made every go-driven record assert something false about its own trustworthiness.
+# Neither string may contain an apostrophe: both are interpolated into single-quoted python literals.
+driver_control_note_for() {
+  case "$1" in
+  go) printf '%s' "driver-control remains a lower bound on driver-only cost, but a tighter one than on the grpcurl path: the Go client decodes the same ExecEvent stream on every arm, so the only residual difference is that the null-responder sends one End and no Chunk, while real Execs for mix commands producing stdout decode one or more Chunk events per call (#294)." ;;
+  *) printf '%s' "driver-control is a STRICT LOWER BOUND on driver-only cost, not an exact one: the null-responder sends one End and no Chunk events, so grpcurl never decodes a chunk-carrying stream on this arm, while real Execs for mix commands that produce stdout do decode one or more Chunk events per call on the container/microvm arms. Subtracting driver-control latency therefore over-attributes some residue to the backend rather than the driver (#291 item 3)." ;;
+  esac
+}
+
+exec_error_note_for() {
+  case "$1" in
+  go) printf '%s' "an in-stream ExecEvent.error is recorded as status=err with its cause classified from the message. The grpcurl path records it as ok, because the relay yields that event and then returns a gRPC OK status. The two clients therefore DISAGREE on throughput, p95 and execErrorsByCause for any rung that produced ExecErrors on the container or microvm arms; they agree exactly on driver-control, where the null-responder never sends one (#294)." ;;
+  *) printf '%s' "an in-stream ExecEvent.error is recorded as status=ok. The relay yields that event and then returns a gRPC OK status, so grpcurl exits 0: an ExecError-failed Exec counts toward throughput, enters the distribution p95 is taken over, and never reaches execErrorsByCause. Pre-existing on this path and fixed on the go path (#294)." ;;
+  esac
+}
+
 # arm_in_use reports, via exit status, whether $1 is present in E11_ARMS, so preflight
 # can skip a tool or hardware check that no configured arm actually needs (issue #291
 # item 5): a SH_E11_ARMS=driver-control run should not be refused over a missing docker
@@ -2018,13 +2038,8 @@ run_density_rung() {
   # paths -- a limitation that only appears on the path that does not have it is not a
   # disclosure. Neither string may contain an apostrophe: they are interpolated into
   # single-quoted python literals.
-  if [ "$EXEC_CLIENT" = "go" ]; then
-    driver_control_note="driver-control remains a lower bound on driver-only cost, but a tighter one than on the grpcurl path: the Go client decodes the same ExecEvent stream on every arm, so the only residual difference is that the null-responder sends one End and no Chunk, while real Execs for mix commands producing stdout decode one or more Chunk events per call (#294)."
-    exec_error_note="an in-stream ExecEvent.error is recorded as status=err with its cause classified from the message. The grpcurl path records it as ok, because the relay yields that event and then returns a gRPC OK status. The two clients therefore DISAGREE on throughput, p95 and execErrorsByCause for any rung that produced ExecErrors on the container or microvm arms; they agree exactly on driver-control, where the null-responder never sends one (#294)."
-  else
-    driver_control_note="driver-control is a STRICT LOWER BOUND on driver-only cost, not an exact one: the null-responder sends one End and no Chunk events, so grpcurl never decodes a chunk-carrying stream on this arm, while real Execs for mix commands that produce stdout do decode one or more Chunk events per call on the container/microvm arms. Subtracting driver-control latency therefore over-attributes some residue to the backend rather than the driver (#291 item 3)."
-    exec_error_note="an in-stream ExecEvent.error is recorded as status=ok. The relay yields that event and then returns a gRPC OK status, so grpcurl exits 0: an ExecError-failed Exec counts toward throughput, enters the distribution p95 is taken over, and never reaches execErrorsByCause. Pre-existing on this path and fixed on the go path (#294)."
-  fi
+  driver_control_note="$(driver_control_note_for "$EXEC_CLIENT")"
+  exec_error_note="$(exec_error_note_for "$EXEC_CLIENT")"
 
   python3 -c "
 import json
