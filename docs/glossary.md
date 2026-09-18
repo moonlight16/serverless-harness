@@ -32,8 +32,8 @@ treats `session_id` as opaque and holds no separate "run" identity.
 
 - As an English verb ("run to completion" vs. "one turn").
 - In the frozen, legacy data-plane route names `POST /runs` and its deprecated alias
-  `POST /run-leaf` (`packages/knative-server/src/server.ts`) — kept as-is because 14 scripts under
-  `deploy/knative/` already call them and a second rename cycle isn't worth the churn.
+  `POST /run-leaf` (`packages/knative-server/src/server.ts`) — kept as-is because the scripts
+  under `deploy/knative/` already call them and a second rename cycle isn't worth the churn.
 
 If a genuine grouping identity is ever needed inside the harness (e.g. parent/child lineage for a
 leaf dispatching a child leaf), it should be named `parentSessionId`, not `runId`.
