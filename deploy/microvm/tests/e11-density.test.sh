@@ -2683,6 +2683,29 @@ check "  ...and the grpcurl path keeps its per-slot refusal" \
 check "both paths are waited on through the same pids array" \
   "$(printf '%s\n' "$rdr_body" | grep -Fc 'wait "$pid" || exec_failures=$((exec_failures + 1))')" "1"
 
+# The ENQUEUE, not just the wait. The check above counts the shared wait loop, which stays at 1
+# whether or not the Go branch ever adds its pid to the array -- so on its own it cannot catch
+# the Go process being forked and then never waited on. That failure is silent and it corrupts
+# the measurement: wall_t1 would be stamped without blocking on the driver, so the rung's wall
+# time and throughput would describe a run that had not finished, and exec_failures would never
+# see a Go-side failure.
+# Scoped to the timed window on purpose: phase 1's converge loop has a third pids+= of its own,
+# outside the window, so a whole-function count would be 3 and would not say what we mean.
+check "both branches inside the timed window enqueue their pid" \
+  "$(printf '%s\n' "$win" | grep -Fc 'pids+=("$!")')" "2"
+# NON-VACUOUSNESS: the detector must be able to report a different number. Two literal
+# fixtures -- one with both enqueues, one with a single enqueue -- run through the same
+# grep -Fc prove it discriminates 2 from 1 rather than always reporting one fixed number.
+check "non-vacuousness: the enqueue detector reports 2 for a two-enqueue fixture" \
+  "$(printf 'pids+=("$!")\npids+=("$!")\n' | grep -Fc 'pids+=("$!")')" "2"
+check "non-vacuousness: the enqueue detector reports 1 for a one-enqueue fixture" \
+  "$(printf 'pids+=("$!")\n' | grep -Fc 'pids+=("$!")')" "1"
+
+# Position, not just presence: two enqueues inside the window could both sit in one branch.
+# This asserts the Go invocation is immediately followed by its own enqueue.
+check "the Go branch's invocation is immediately followed by its own pids+=" \
+  "$(printf '%s\n' "$win" | grep -A1 -F '"$E11_EXEC_DRIVER_BIN" --plan "$plan_file"' | grep -Fc 'pids+=("$!")')" "1"
+
 # Converge stays on grpcurl on BOTH paths -- a stated non-goal. It is already outside the timed
 # window and reported separately as convergeMsP50, so routing it through the new client would
 # move a number this work is not measuring, inside the same PR that moves the one it is.
