@@ -223,4 +223,75 @@ describe('E11 ladder analysis', () => {
     ]);
     expect(gradual.predictions[3]).toBe('falsified');
   });
+
+  // Issue #291: the four host signals are now sampled DURING the timed window, and the
+  // record carries the extremes and sample counts beside each mean. This module's job is to
+  // ACCEPT those fields and score exactly as before -- the whole repair is upstream, in the
+  // driver, and a scorer change smuggled in alongside it would make the re-run
+  // uninterpretable.
+  const enriched = (over: Partial<RungSample> & { c: number }): RungSample => ({
+    ...rung(over),
+    hostCpuFractionPeak: (over.hostCpuFraction ?? 0.2) + 0.3,
+    hostCpuFractionMin: 0.01,
+    hostCpuSamples: 12,
+    coresBusy: (over.hostCpuFraction ?? 0.2) * 72,
+    memAvailableBytesMin: (over.memAvailableBytes ?? 100e9) * 0.9,
+    pssBytesPeak: (over.pssBytes ?? 1e9) * 2,
+    pssSamples: 3,
+    processCountPeak: (over.processCount ?? 10 * over.c) + 2,
+    processCountSamples: 3,
+    samplingMode: 'in-rung-1hz-mean',
+    postLoadHostCpuFraction: 0.0006,
+    postLoadMemAvailableBytes: over.memAvailableBytes ?? 100e9,
+    postLoadPssBytes: over.pssBytes ?? 1e9,
+    postLoadProcessCount: over.processCount ?? 10 * over.c,
+  });
+
+  it("accepts the #291 record's new fields and scores identically without them", () => {
+    const ladder: Array<Partial<RungSample> & { c: number }> = [
+      { c: 1 },
+      { c: 2 },
+      { c: 4 },
+      { c: 8, p95Ms: 400, coldAcquireRate: 0.4 },
+    ];
+    const plain = analyzeLadder(ladder.map(rung));
+    const withNew = analyzeLadder(ladder.map(enriched));
+    expect(withNew).toEqual(plain);
+  });
+
+  it('scores the cpu bound off hostCpuFraction, which is now the under-load mean', () => {
+    // The pre-fix records had hostCpuFraction ~0.0006 at every rung, which made
+    // crosses('cpu') -- `>= 0.9` -- STRUCTURALLY unable to fire anywhere in a ladder. So
+    // "nothing resembling a CPU ceiling was reached" was a restatement of the sampling bug,
+    // not a finding. With a real under-load mean the same untouched comparison can fire.
+    const idle = analyzeLadder([
+      rung({ c: 1, hostCpuFraction: 0.0006 }),
+      rung({ c: 2, hostCpuFraction: 0.0006 }),
+      rung({ c: 4, hostCpuFraction: 0.0006, p95Ms: 400 }),
+    ]);
+    expect(idle.bound).not.toBe('cpu');
+
+    const loaded = analyzeLadder([
+      enriched({ c: 1, hostCpuFraction: 0.1 }),
+      enriched({ c: 2, hostCpuFraction: 0.5 }),
+      enriched({ c: 4, hostCpuFraction: 0.95, p95Ms: 400 }),
+    ]);
+    expect(loaded.bound).toBe('cpu');
+  });
+
+  it('ignores postLoadHostCpuFraction entirely: it is the record, not the signal', () => {
+    // The idle snapshot is retained under its own name so it can never again pass as an
+    // under-load reading. Nothing in this module may read it.
+    const r = analyzeLadder([
+      enriched({ c: 1, hostCpuFraction: 0.95 }),
+      enriched({ c: 2, hostCpuFraction: 0.95 }),
+      enriched({ c: 4, hostCpuFraction: 0.95, p95Ms: 400 }),
+    ]);
+    const alsoIdle = analyzeLadder([
+      { ...enriched({ c: 1, hostCpuFraction: 0.95 }), postLoadHostCpuFraction: 0.99 },
+      { ...enriched({ c: 2, hostCpuFraction: 0.95 }), postLoadHostCpuFraction: 0.99 },
+      { ...enriched({ c: 4, hostCpuFraction: 0.95, p95Ms: 400 }), postLoadHostCpuFraction: 0.99 },
+    ]);
+    expect(alsoIdle).toEqual(r);
+  });
 });
