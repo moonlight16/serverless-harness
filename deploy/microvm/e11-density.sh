@@ -282,6 +282,23 @@ PROTO_FILE="$REPO_ROOT/proto/sandbox/v1/sandbox.proto"
 # failure.
 EXEC_MAX_TIME_S="${SH_E11_EXEC_MAX_TIME_S:-45}"      # guards timeout_s:30
 CONVERGE_MAX_TIME_S="${SH_E11_CONVERGE_MAX_TIME_S:-360}" # guards timeout_s:300
+
+# SH_E11_EXEC_CLIENT selects WHICH CLIENT issues the timed Execs (issue #294).
+#
+#   grpcurl - one grpcurl process per Exec. The reference path, and the default.
+#   go      - remote-worker/cmd/exec-driver: one process and ONE grpc.ClientConn for a whole
+#             rung, c goroutines in place of c subshells.
+#
+# Why this is opt-in rather than a replacement: measured on metal with the driver-control arm
+# (no relay, no Redis, no worker, no VMM), the grpcurl driver ALONE peaked at c=8 and then
+# declined, burning 64 of 72 cores at c=64 with its own p95 of 753ms -- the same knee position
+# and curve shape EXPERIMENTS.md published for both real arms. The Go client exists to remove
+# that, but the number that proves it must come from running BOTH against the null-responder on
+# one host with nothing else changed. Until that comparison exists, the bash path is the
+# reference and stays the default.
+EXEC_CLIENT="${SH_E11_EXEC_CLIENT:-grpcurl}"
+# Built once per run by build_exec_driver, beside the null-responder's binary.
+E11_EXEC_DRIVER_BIN="$RESULTS/.e11-exec-driver-bin"
 PROTO_IMPORT_PATH="$REPO_ROOT/proto"
 PROTO_REL_PATH="sandbox/v1/sandbox.proto"
 
@@ -433,6 +450,19 @@ validate_arms() {
   done
 }
 
+# validate_exec_client refuses any SH_E11_EXEC_CLIENT that is not one of the two real paths.
+# A typo must not fall through to a default: the value is stamped into every rung record as
+# execClient, and a ladder recorded under the wrong one would be compared against the wrong
+# table -- the same class of defect as a stale rung assembled into a fresh ladder.
+validate_exec_client() {
+  case "$EXEC_CLIENT" in
+  grpcurl | go) : ;;
+  *)
+    die "SH_E11_EXEC_CLIENT is '$EXEC_CLIENT', which is neither 'grpcurl' (one process per Exec, the reference path, the default) nor 'go' (remote-worker/cmd/exec-driver, one persistent connection per rung -- issue #294). Refusing to guess which was meant: the value is recorded as execClient in every rung, so guessing wrong mislabels a whole ladder."
+    ;;
+  esac
+}
+
 # arm_in_use reports, via exit status, whether $1 is present in E11_ARMS, so preflight
 # can skip a tool or hardware check that no configured arm actually needs (issue #291
 # item 5): a SH_E11_ARMS=driver-control run should not be refused over a missing docker
@@ -462,6 +492,9 @@ preflight() {
   # an invented arm name must be refused before any of them run, not after (also see
   # arm_in_use above).
   validate_arms
+  # Before anything that depends on the value: build_exec_driver in main() reads it, and the
+  # record writer stamps it.
+  validate_exec_client
   # grpcurl and go are hard requirements for every arm: grpcurl drives every arm's Exec
   # RPCs, and go builds whichever binary that arm needs (./cmd/worker, ./cmd/microvm-worker,
   # or ./cmd/null-responder). Everything else in this function is conditional on which arms
@@ -1497,6 +1530,18 @@ stop_null_stack() {
   return 0
 }
 
+# build_exec_driver compiles the Go Exec client ONCE per run, when it is the selected client.
+#
+# A no-op on the reference path: a grpcurl run must not fail over ./cmd/exec-driver not
+# compiling, because it never invokes it. `go` is already an unconditional require_tool in
+# preflight (every arm builds some binary), so this adds no new tool requirement.
+build_exec_driver() {
+  [ "$EXEC_CLIENT" = "go" ] || return 0
+  log "exec-driver: building the persistent-connection Go Exec client (SH_E11_EXEC_CLIENT=go, issue #294)"
+  (cd "$REMOTE_WORKER_DIR" && go build -o "$E11_EXEC_DRIVER_BIN" ./cmd/exec-driver) ||
+    die "go build ./cmd/exec-driver failed - SH_E11_EXEC_CLIENT=go has no client to drive, so every rung would time a missing binary rather than an Exec"
+}
+
 # ---------------------------------------------------------------------------
 # run_density_rung: THE per-rung driver. Called identically for all three arms --
 # container, microvm, and driver-control (only sandbox_id, relay_port, and whether
@@ -1995,6 +2040,8 @@ analyze_slice() {
 # ---------------------------------------------------------------------------
 main() {
   preflight
+  # After preflight, which validated EXEC_CLIENT and created $RESULTS.
+  build_exec_driver
   log "arms: ${E11_ARMS[*]} (microvm is Firecracker only - hardware-corrections F5; driver-control is the null-responder, issue #291 section 4)"
   log "D values: ${D_VALUES[*]}   guest RAM (MiB): ${RAM_MB_VALUES[*]}   active runs: ${ACTIVE_RUNS[*]}"
   [ -n "$MODEL_STUB_CMD" ] || log "no SH_E11_MODEL_STUB_CMD set - driving the Exec mix directly (disclosed limitation, see header)"

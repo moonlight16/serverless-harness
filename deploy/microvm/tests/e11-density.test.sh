@@ -2467,6 +2467,71 @@ check "kill_relay_by_port dies loudly rather than returning silently if the port
   "$(sed -n '/^kill_relay_by_port() {/,/^}/p' "$SCRIPT" | grep -c 'die ')" "1"
 check "kill_relay_by_port's cleanup-trap path logs and returns instead of dying" \
   "$(sed -n '/^kill_relay_by_port() {/,/^}/p' "$SCRIPT" | grep -c 'E11_IN_CLEANUP')" "1"
+# ---------------------------------------------------------------------------
+# SH_E11_EXEC_CLIENT: which client issues the timed Execs (issue #294)
+# ---------------------------------------------------------------------------
+echo "== the Exec client is selectable, defaults to grpcurl, and refuses anything else (#294)"
+
+# The DEFAULT is the property that makes "opt-in" true rather than claimed: #294's own
+# acceptance requires the bash path to stay the reference until the two are compared on one
+# host, and a default of "go" would silently retire it.
+check "SH_E11_EXEC_CLIENT defaults to grpcurl" \
+  "$(grep -c 'EXEC_CLIENT="${SH_E11_EXEC_CLIENT:-grpcurl}"' "$SCRIPT")" "1"
+
+vec_body="$(extract_fn validate_exec_client || true)"
+check "validate_exec_client is extractable" "$([ -n "$vec_body" ] && echo yes || echo no)" "yes"
+
+# Both accepted values, and a refusal for everything else. A typo would otherwise record a
+# ladder under the wrong execClient and it would be compared against the wrong table.
+for client in grpcurl go; do
+  out="$(
+    EXEC_CLIENT="$client"
+    eval "$vec_body"
+    die() {
+      echo "DIED: $*"
+      exit 1
+    }
+    validate_exec_client && echo ACCEPTED
+  )"
+  check "validate_exec_client accepts '$client'" "$out" "ACCEPTED"
+done
+out="$(
+  # shellcheck disable=SC2034 # read by validate_exec_client, sourced via eval above
+  EXEC_CLIENT="grpcurl-go"
+  eval "$vec_body"
+  die() {
+    echo "DIED: $*"
+    exit 1
+  }
+  validate_exec_client && echo ACCEPTED
+)"
+check "validate_exec_client refuses an unrecognised value" \
+  "$(printf '%s' "$out" | grep -c '^DIED:')" "1"
+check "  ...and its refusal names both accepted values" \
+  "$(printf '%s' "$out" | grep -c "grpcurl.*go\|go.*grpcurl")" "1"
+
+# preflight must validate it BEFORE any work: the build below depends on the value.
+pf_body="$(extract_fn preflight || true)"
+check "preflight validates the Exec client" \
+  "$(printf '%s\n' "$pf_body" | grep -c 'validate_exec_client')" "1"
+
+# build_exec_driver is a NO-OP on the reference path: a grpcurl run must not need a Go
+# toolchain moment it never uses, and must not fail over ./cmd/exec-driver not compiling.
+bed_body="$(extract_fn build_exec_driver || true)"
+check "build_exec_driver is extractable" "$([ -n "$bed_body" ] && echo yes || echo no)" "yes"
+check "build_exec_driver returns early unless the Go client was selected" \
+  "$(printf '%s\n' "$bed_body" | grep -c '\[ "\$EXEC_CLIENT" = "go" \] || return 0')" "1"
+check "build_exec_driver builds ./cmd/exec-driver" \
+  "$(printf '%s\n' "$bed_body" | grep -c 'go build -o "\$E11_EXEC_DRIVER_BIN" ./cmd/exec-driver')" "1"
+check "build_exec_driver dies with a reason when the build fails" \
+  "$(printf '%s\n' "$bed_body" | grep -c 'die "go build ./cmd/exec-driver failed')" "1"
+check "main builds the Exec driver after preflight" \
+  "$(printf '%s\n' "$(extract_fn main)" | grep -c 'build_exec_driver')" "1"
+
+# The binary lives under $RESULTS, like the null-responder's, so a run leaves its artifacts
+# in one place and preflight's own `mkdir -p "$RESULTS"` has already happened.
+check "the exec-driver binary path is under \$RESULTS" \
+  "$(grep -c 'E11_EXEC_DRIVER_BIN="\$RESULTS/.e11-exec-driver-bin"' "$SCRIPT")" "1"
 
 echo
 echo "Total failures: $fails"
