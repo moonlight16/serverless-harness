@@ -732,6 +732,27 @@ Driver: `deploy/microvm/e10-lifecycle.sh`; cluster-free proof of its structure:
 > producing stdout incur on the other two arms, meaning it slightly under-counts driver cost
 > and over-attributes the remainder to the backend (recorded per rung as
 > `driverControlChunkDecode` in `proxyLimitations`).
+> **2026-09-18 — that subtraction has now been measured, and the answer is that the
+> instrument could not separate backend from driver.** On the same bare-metal rig, at
+> `ITERS_PER_SLOT=200` and `SAMPLE_INTERVAL_MS=250`, the `driver-control` arm — no relay, no
+> Redis, no worker, no VMM, and a responder that executes nothing — peaked at `c=8` and then
+> declined, reaching `coresBusy` 64.13 of 72 and `hostCpuFractionPeak` 0.9598 at `c=64` with
+> its own p95 of 753 ms against the published microVM arm's 1686 ms. The published `c=8` knee
+> is reproduced by an arm with no backend at all. Corroborating that the arm measures what it
+> claims: `postLoadHostCpuFraction` sits at 0.0006–0.0010 at every rung, so the pre-#291
+> sampling method reproduces this section's "0.001 flat across the entire ladder" exactly
+> while the under-load mean climbs to 0.89.
+>
+> The cause is one `execve` per Exec: `grpcurl` re-parses the proto descriptor set and opens a
+> fresh TCP connection and HTTP/2 session per call. Issue #294 replaced it with
+> `remote-worker/cmd/exec-driver`, which holds one `grpc.ClientConn` for a whole rung and runs
+> `c` goroutines in place of `c` bash subshells. Select it with `SH_E11_EXEC_CLIENT=go`; every
+> rung record carries `execClient`, and records from the two clients are **not** comparable
+> except deliberately, as the two halves of that comparison.
+>
+> Until both clients have run against the null-responder on the host that produced the table
+> above, **this section's conclusions stay under repair**: a sweep run now would measure the
+> driver's knee again. The runbook is `docs/notes/e11-go-exec-client-comparison-runbook.md`.
 
 **RUN ON BARE METAL, 14 rungs, exit 0.** `SH_E11_ACTIVE_RUNS="1 2 4 8 16 32 64"`,
 `ITERS_PER_SLOT=20`, `SH_E11_COLD_LATENCY_MS=145`, same host and snapshot as E10.
