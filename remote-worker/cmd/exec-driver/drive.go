@@ -154,7 +154,15 @@ func runSlot(ctx context.Context, client pb.SandboxExecClient, p *plan, s slot) 
 // measured that binding; if the Go client's throughput plateaus while coresBusy stays low,
 // sharding slots across N connections is the first thing to try.
 func drive(ctx context.Context, p *plan) error {
-	cc, err := dialReady(ctx, p.Target)
+	// The DIAL is bounded; the rung is not. grpcurl's -max-time covered its connection setup
+	// as well as its call, so without this the Go path hangs forever against an unreachable
+	// target where the reference path failed fast -- and run_density_rung waits on this
+	// process, so that hang stalls the whole ladder rather than one rung. The Exec phase below
+	// stays unbounded deliberately: a rung-level timeout would cap legitimate slow rungs at
+	// high c, which is the regime being measured.
+	dialCtx, cancelDial := context.WithTimeout(ctx, time.Duration(p.CallDeadlineS)*time.Second)
+	defer cancelDial()
+	cc, err := dialReady(dialCtx, p.Target)
 	if err != nil {
 		return err
 	}

@@ -293,6 +293,14 @@ func TestDrivePreservesIssueOrder(t *testing.T) {
 
 // A setup failure IS fatal: an unreachable target must not produce a times file full of
 // plausible error lines that a rung would then aggregate and record.
+//
+// This proves the PRODUCTION call path, not a test-only bound: drive is called with
+// context.Background(), exactly as main.go calls it, with no caller-supplied timeout. The
+// bound that stops this from hanging forever must come from drive itself (via the plan's
+// CallDeadlineS), not from the test's context. The wall-clock assertion below is load-bearing:
+// without it, this test would still pass even if that internal bound were later removed and
+// the surrounding test binary's own timeout fired instead, which would prove nothing about
+// the production path.
 func TestDriveFailsWhenTheTargetIsUnreachable(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -303,10 +311,13 @@ func TestDriveFailsWhenTheTargetIsUnreachable(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 	p := planFor(t, target, 1, 1, 0, []string{"true"})
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := drive(ctx, p); err == nil {
+	p.CallDeadlineS = 1
+	start := time.Now()
+	if err := drive(context.Background(), p); err == nil {
 		t.Fatal("drive accepted a target nothing is listening on")
+	}
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Fatalf("drive took %s to fail against an unreachable target with no caller-supplied bound: it is hanging instead of using CallDeadlineS to fail fast", elapsed)
 	}
 }
 
