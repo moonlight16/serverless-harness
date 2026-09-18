@@ -569,6 +569,11 @@ if [ -n "$writer_body" ] && [ -n "$dim_body" ]; then
       errors_json='{}'
       SUBSTRATE=nested-m8i REPO_CACHE_SHAPE=accept-cold-fetch COLD_LATENCY_MS=50
       E11_RUN_ID=RUN-FIXTURE
+      # #294's interpolations. The label is what the checks below assert; the two notes stand
+      # in for the long disclosure strings, whose presence (not text) is what matters here.
+      exec_client_json=grpcurl-per-exec
+      driver_control_note='driver-control is a STRICT LOWER BOUND on driver-only cost'
+      exec_error_note='an in-stream ExecEvent.error is recorded as status=ok'
       eval "$writer_body"
     )
   }
@@ -628,6 +633,17 @@ print("missing:" + ",".join(missing) if missing else "all-present")
     "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["samplingMode"])' "$ok_out")" "in-rung-1hz-mean"
   check "the PSS/processCount cadence is disclosed in the record's own proxyLimitations" \
     "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("yes" if any("sampler tick" in v for v in d["proxyLimitations"].values()) else "no")' "$ok_out")" "yes"
+  # Provenance: which client issued the Execs this record's latencies came from (#294). Without
+  # it a go-driven ladder and a grpcurl-driven one are indistinguishable JSON, and comparing
+  # them is the whole point of building the second client.
+  check "the record carries execClient" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["execClient"])' "$ok_out")" "grpcurl-per-exec"
+  check "  ...and drivingModel is unchanged (open-loop is out of scope for #294)" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["drivingModel"])' "$ok_out")" "closed-loop-per-slot"
+  # The ExecError disclosure belongs in EVERY record, not only the Go ones: on the grpcurl path
+  # it is a live defect an operator reading these numbers needs to know about.
+  check "proxyLimitations discloses the ExecError status behaviour" \
+    "$(python3 -c 'import json,sys; print("execErrorStatus" in json.load(open(sys.argv[1]))["proxyLimitations"])' "$ok_out")" "True"
 
   # --- And the microvm arm's numbers stay NUMBERS (null there would be the sweep losing
   # the dimension it is sweeping, so dimension_literal refuses it).
@@ -674,6 +690,20 @@ print("missing:" + ",".join(missing) if missing else "all-present")
 
   rm -rf "$wr_tmpdir"
 fi
+
+echo "== execClient labels both clients, and nothing else (#294)"
+ecl_body="$(extract_fn exec_client_label || true)"
+check "exec_client_label is extractable" "$([ -n "$ecl_body" ] && echo yes || echo no)" "yes"
+for pair in "grpcurl:grpcurl-per-exec" "go:go-persistent-conn"; do
+  client="${pair%%:*}"
+  want="${pair##*:}"
+  got="$(
+    EXEC_CLIENT="$client"
+    eval "$ecl_body"
+    exec_client_label
+  )"
+  check "exec_client_label maps '$client' to '$want'" "$got" "$want"
+done
 
 # ---------------------------------------------------------------------------
 # percentile: a missing/empty input is a refusal, not a zero (review 4001908597).
