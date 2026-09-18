@@ -293,9 +293,11 @@ log() { echo "e11: $*" >&2; }
 E11_WORKER_PID=""
 E11_RELAY_PID=""
 E11_WORKER_BIN=""
+E11_SAMPLER_PID=""
 E11_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/e11-density.XXXXXX")"
 
 cleanup_on_exit() {
+  stop_host_sampler || true
   stop_container_stack || true
   stop_microvm_stack || true
   [ -z "${E11_TMPDIR:-}" ] || rm -rf "$E11_TMPDIR"
@@ -662,6 +664,73 @@ host_sampler_loop() {
     set_epoch_ms
     last_ms="$EPOCH_MS"
   done
+}
+
+# stop_host_sampler kills the backgrounded sampler if one is running. It runs FIRST in
+# cleanup_on_exit, before the `rm -rf $E11_TMPDIR`, because host_sampler_loop polls for a
+# stop file under that root: once the root is gone the file can never appear, and the
+# subshell would spin forever appending to a deleted path. `${VAR:-}` because the trap can
+# fire before this is ever assigned.
+stop_host_sampler() {
+  [ -n "${E11_SAMPLER_PID:-}" ] || return 0
+  kill "${E11_SAMPLER_PID:-}" 2>/dev/null
+  E11_SAMPLER_PID=""
+  return 0
+}
+
+# sampler_field prints one statistic over one COLUMN of a sampler file. `stat` is
+# mean|peak|min|count; `fmt` is a printf format (default %.4f -- pass %.0f for the byte and
+# count columns, whose consumers want integers, and whose mean is rounded rather than
+# truncated).
+#
+# Cells holding "-" are SKIPPED, not read as zero: that marker means the tick did not carry
+# the low-cadence signals, and a 0 in a mean is a claim about memory while an absent sample
+# is not. It is also why pssSamples can legitimately be smaller than hostCpuSamples.
+#
+# An empty file, or a column with no numeric cell, is the ABSENCE of a measurement and
+# returns non-zero rather than printing 0 -- the same refusal percentile makes, for the same
+# reason. `count` is the exception: it prints 0, so a caller can tell "no samples" from
+# "the aggregation failed".
+#
+# One awk per statistic per rung, after the sampler has been reaped: nothing here can
+# perturb a measurement.
+sampler_field() {
+  local file="$1" col="$2" stat="$3" fmt="${4:-%.4f}"
+  [ -s "$file" ] || {
+    [ "$stat" = "count" ] && { echo 0; return 0; }
+    return 1
+  }
+  awk -v col="$col" -v stat="$stat" -v fmt="$fmt" '
+    $col != "-" {
+      v = $col + 0
+      n++
+      s += v
+      if (n == 1 || v > mx) mx = v
+      if (n == 1 || v < mn) mn = v
+    }
+    END {
+      if (stat == "count") { print n + 0; exit 0 }
+      if (n == 0) { exit 1 }
+      if (stat == "mean") { printf fmt, s / n }
+      else if (stat == "peak") { printf fmt, mx }
+      else if (stat == "min") { printf fmt, mn }
+      else { exit 1 }
+    }' "$file"
+}
+
+# host_cpu_count prints the online CPU count, for coresBusy. `getconf _NPROCESSORS_ONLN` is
+# the portable fallback (it works on darwin, where the test suite runs, and nproc may not
+# be installed). One fork per rung.
+host_cpu_count() {
+  local n=""
+  if command -v nproc >/dev/null 2>&1; then
+    n="$(nproc 2>/dev/null)" || n=""
+  fi
+  if [ -z "$n" ]; then
+    n="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" || n=""
+  fi
+  [ -n "$n" ] || n=1
+  printf '%s' "$n"
 }
 
 # host_signals_snapshot prints one JSON object: pssBytes (VMM + virtiofsd, PSS
@@ -1231,6 +1300,15 @@ run_density_rung() {
   # ---------------------------------------------------------------------------
   local wall_t0 wall_t1
   wall_t0="$(date +%s%N)"
+  # The sampler brackets EXACTLY this window (issue #291 item 1). It is started after
+  # wall_t0 and reaped after wall_t1, and the converge barrier above is what makes that
+  # honest: with converge still inside the window, the git fetch's CPU would land in this
+  # mean and a fresh artifact would have been built.
+  local sampler_file="$E11_TMPDIR/sampler-$rung_tag" sampler_stop="$E11_TMPDIR/sampler-stop-$rung_tag"
+  : >"$sampler_file"
+  rm -f "$sampler_stop"
+  host_sampler_loop "$sampler_file" "$sampler_stop" &
+  E11_SAMPLER_PID="$!"
   pids=()
   for i in $(seq 1 "$c"); do
     (
@@ -1267,6 +1345,9 @@ run_density_rung() {
     wait "$pid" || exec_failures=$((exec_failures + 1))
   done
   wall_t1="$(date +%s%N)"
+  : >"$sampler_stop"
+  wait "$E11_SAMPLER_PID" 2>/dev/null || true
+  E11_SAMPLER_PID=""
   [ "$exec_failures" -eq 0 ] ||
     die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c had $exec_failures of $c slot(s) fail inside the timed loop - refusing to record a rung whose slots were not all measuring the same thing"
   local wall_s
@@ -1341,28 +1422,71 @@ run_density_rung() {
   converge_p50="$(require_numeric convergeMsP50 "$converge_p50")" ||
     die "rung arm=$arm c=$c: convergeMsP50 failed validation (see the refusal above)"
 
-  local signals pss_bytes mem_bytes cpu_frac proc_count
-  # `|| die`, in run_density_rung's OWN shell (main calls it directly, not in a
-  # subshell), so a bad snapshot stops the sweep here instead of producing a rung with no
-  # record. Section 7.3's whole point is that a wrong density number is worse than none;
-  # a sweep that completes having recorded nothing is worse still, because it looks
-  # exactly like success (final review H2).
+  # ---------------------------------------------------------------------------
+  # The four host signals, now sampled DURING the window (issue #291 item 1).
   #
-  # require_vmm=1 only for the microvm arm's IN-RUNG snapshot, taken immediately after the
-  # slots finish: with D >= 1 at least one standby VMM is necessarily still resident there
-  # (StandbyIdle is 90s), so zero matching processes means the sampler is looking in the
-  # wrong place, not that memory is free. The two exceptions are deliberate: the container
-  # arm has no VMM at all, and a D=0 sweep legitimately keeps no standby resident.
+  # hostCpuFraction becomes the MEAN. That is not "mean is more representative": with today's
+  # idle samples both firstCrossing('cpu') and firstCrossing('memory') are Infinity and
+  # scorePrediction1 reads inconclusive, but if CPU crosses 0.9 anywhere while memory and
+  # process-count never do, `memOrProcAt <= cpuAt` is false and sealed prediction 1 flips
+  # straight to FALSIFIED. Scoring that off a single one-second peak -- a GC pause, a
+  # drop_caches, an unrelated process on a shared box -- would be the same class of error as
+  # the artifact being fixed, pointed the other way. The mean matches what crosses('cpu')
+  # asserts: THIS RUNG WAS CPU-SATURATED, not "this rung once touched saturation". Nothing is
+  # lost, because the peak is recorded beside it.
+  # ---------------------------------------------------------------------------
+  local cpu_samples cpu_mean cpu_peak cpu_min cores_busy ncpu
+  local mem_mean mem_min pss_mean pss_peak pss_samples proc_mean proc_peak proc_samples
+  cpu_samples="$(require_numeric hostCpuSamples "$(sampler_field "$sampler_file" 1 count '%d')")" ||
+    die "rung arm=$arm c=$c could not count its own host samples (see the refusal above)"
+  [ "$cpu_samples" -gt 0 ] ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c produced ZERO host samples over its timed window ($sampler_file is empty), so it has no under-load hostCpuFraction, memAvailableBytes, pssBytes or processCount at all. Refusing to backfill from the post-load snapshot: that idle reading IS the defect issue #291 item 1 is about, and crosses('cpu') can never fire on one. The window was shorter than ${SAMPLE_MIN_TICK_MS}ms - raise SH_E11_ITERS_PER_SLOT, or lower SH_E11_SAMPLE_INTERVAL_MS and SH_E11_SAMPLE_MIN_TICK_MS."
+  cpu_mean="$(require_numeric hostCpuFraction "$(sampler_field "$sampler_file" 1 mean '%.4f')")" ||
+    die "rung arm=$arm c=$c: the sampled hostCpuFraction mean failed validation (see above)"
+  cpu_peak="$(require_numeric hostCpuFractionPeak "$(sampler_field "$sampler_file" 1 peak '%.4f')")" ||
+    die "rung arm=$arm c=$c: hostCpuFractionPeak failed validation (see above)"
+  cpu_min="$(require_numeric hostCpuFractionMin "$(sampler_field "$sampler_file" 1 min '%.4f')")" ||
+    die "rung arm=$arm c=$c: hostCpuFractionMin failed validation (see above)"
+  ncpu="$(host_cpu_count)"
+  # coresBusy, because "0.043 cores busy" is a number a human can act on where 0.0006 is not
+  # -- and 0.0006 on a 72-cpu host next to ~370 process creations a second is precisely the
+  # self-falsifying pair that exposed this bug.
+  cores_busy="$(require_numeric coresBusy "$(awk -v m="$cpu_mean" -v n="$ncpu" 'BEGIN{printf "%.4f", m*n}')")" ||
+    die "rung arm=$arm c=$c: coresBusy failed validation (see above)"
+  mem_mean="$(require_numeric memAvailableBytes "$(sampler_field "$sampler_file" 2 mean '%.0f')")" ||
+    die "rung arm=$arm c=$c: the sampled memAvailableBytes mean failed validation (see above)"
+  mem_min="$(require_numeric memAvailableBytesMin "$(sampler_field "$sampler_file" 2 min '%.0f')")" ||
+    die "rung arm=$arm c=$c: memAvailableBytesMin failed validation (see above)"
+  pss_samples="$(require_numeric pssSamples "$(sampler_field "$sampler_file" 3 count '%d')")" ||
+    die "rung arm=$arm c=$c: pssSamples failed validation (see above)"
+  pss_mean="$(require_numeric pssBytes "$(sampler_field "$sampler_file" 3 mean '%.0f')")" ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c sampled $cpu_samples host ticks but not one carried a PSS reading, so Sigma PSS -- the one number spec section 7.3 insists must not be wrong -- has no under-load value for this rung. SH_E11_SAMPLE_LOW_EVERY is ${SAMPLE_LOW_EVERY}; tick 1 always carries it, so an empty column means pss_bytes_for_pids refused on every low-cadence tick (see its own refusals above)."
+  pss_peak="$(require_numeric pssBytesPeak "$(sampler_field "$sampler_file" 3 peak '%.0f')")" ||
+    die "rung arm=$arm c=$c: pssBytesPeak failed validation (see above)"
+  proc_samples="$(require_numeric processCountSamples "$(sampler_field "$sampler_file" 4 count '%d')")" ||
+    die "rung arm=$arm c=$c: processCountSamples failed validation (see above)"
+  proc_mean="$(require_numeric processCount "$(sampler_field "$sampler_file" 4 mean '%.0f')")" ||
+    die "rung arm=$arm c=$c: the sampled processCount mean failed validation (see above)"
+  proc_peak="$(require_numeric processCountPeak "$(sampler_field "$sampler_file" 4 peak '%.0f')")" ||
+    die "rung arm=$arm c=$c: processCountPeak failed validation (see above)"
+
+  # The POST-LOAD snapshot is KEPT, under explicitly different names. Its refusals are still
+  # the ones that matter most: require_vmm=1 on the microvm arm with D >= 1 means at least one
+  # standby VMM is necessarily still resident (StandbyIdle is 90s), so zero matching processes
+  # means the sampler is looking in the wrong place, not that memory is free. Keeping it under
+  # postLoad* names is what makes it impossible for an idle reading to pass as an under-load
+  # one ever again.
   local require_vmm=0
   if [ "$arm" = "microvm" ] && [ "$d" != "0" ]; then
     require_vmm=1
   fi
+  local signals post_pss post_mem post_cpu post_proc
   signals="$(host_signals_snapshot "$require_vmm")" ||
-    die "host signal snapshot failed for rung arm=$arm c=$c (see the refusal above) - refusing to write a rung record from signals that could not be sampled"
-  pss_bytes="$(python3 -c "import json,sys; print(json.load(sys.stdin)['pssBytes'])" <<<"$signals")"
-  mem_bytes="$(python3 -c "import json,sys; print(json.load(sys.stdin)['memAvailableBytes'])" <<<"$signals")"
-  cpu_frac="$(python3 -c "import json,sys; print(json.load(sys.stdin)['hostCpuFraction'])" <<<"$signals")"
-  proc_count="$(python3 -c "import json,sys; print(json.load(sys.stdin)['processCount'])" <<<"$signals")"
+    die "post-load host signal snapshot failed for rung arm=$arm c=$c (see the refusal above) - refusing to write a rung record from signals that could not be sampled"
+  post_pss="$(python3 -c "import json,sys; print(json.load(sys.stdin)['pssBytes'])" <<<"$signals")"
+  post_mem="$(python3 -c "import json,sys; print(json.load(sys.stdin)['memAvailableBytes'])" <<<"$signals")"
+  post_cpu="$(python3 -c "import json,sys; print(json.load(sys.stdin)['hostCpuFraction'])" <<<"$signals")"
+  post_proc="$(python3 -c "import json,sys; print(json.load(sys.stdin)['processCount'])" <<<"$signals")"
 
   # standbysResident: disclosed proxy (see header). idleStandbyResidency + reclaim
   # convergence: poll the same process-count proxy after every slot has finished,
@@ -1370,9 +1494,9 @@ run_density_rung() {
   # sampling at ReclaimScanInterval. Skipped for the container arm, which has no
   # standby concept at all -- recorded as 0 rather than waited-for.
   local standbys_resident=0 idle_residency=0 reclaim_converge_s=0
-  standbys_resident=$((proc_count > c ? proc_count - c : 0))
+  standbys_resident=$((proc_mean > c ? proc_mean - c : 0))
   if [ "$arm" = "microvm" ]; then
-    local waited=0 budget=135 interval=23 last_count="$proc_count" idle_snapshot
+    local waited=0 budget=135 interval=23 last_count="$post_proc" idle_snapshot
     while [ "$waited" -lt "$budget" ]; do
       sleep "$interval"
       waited=$((waited + interval))
@@ -1423,10 +1547,32 @@ rec = {
   'p95Ms': $p95,
   'coldAcquireRate': $cold_rate,
   'coldLatencyThresholdMs': $COLD_LATENCY_MS,
-  'pssBytes': $pss_bytes,
-  'memAvailableBytes': $mem_bytes,
-  'hostCpuFraction': $cpu_frac,
-  'processCount': $proc_count,
+  # The four RungSample host signals, now sampled DURING the timed window (#291 item 1).
+  # Same names, same place in the contract, under-load values.
+  'hostCpuFraction': $cpu_mean,
+  'memAvailableBytes': $mem_mean,
+  'pssBytes': $pss_mean,
+  'processCount': $proc_mean,
+  # Extremes and sample counts, so a mean can always be checked against what it averaged.
+  # hostCpuSamples exposes thin rungs: a mean of 2 samples deserves a visible caveat.
+  'hostCpuFractionPeak': $cpu_peak,
+  'hostCpuFractionMin': $cpu_min,
+  'hostCpuSamples': $cpu_samples,
+  'coresBusy': $cores_busy,
+  'memAvailableBytesMin': $mem_min,
+  'pssBytesPeak': $pss_peak,
+  'pssSamples': $pss_samples,
+  'processCountPeak': $proc_peak,
+  'processCountSamples': $proc_samples,
+  # Old and new records both carry hostCpuFraction meaning different things; without this
+  # marker someone compares them later and is misled by the fix itself.
+  'samplingMode': 'in-rung-1hz-mean',
+  # The retained post-load snapshot, explicitly named so an idle reading can never again
+  # pass as an under-load one.
+  'postLoadHostCpuFraction': $post_cpu,
+  'postLoadMemAvailableBytes': $post_mem,
+  'postLoadPssBytes': $post_pss,
+  'postLoadProcessCount': $post_proc,
   'standbysResident': $standbys_resident,
   'idleStandbyResidency': $idle_residency,
   'leaseSaturations': 0,
@@ -1446,6 +1592,7 @@ rec = {
     'leaseSaturations': 'always 0 - driver bypasses the harness lease layer entirely',
     'coldAcquireRate': 'latency-classification proxy (>= ${COLD_LATENCY_MS}ms), not the real replenishment signal - no stats endpoint exists',
     'standbysResident': 'proxy: max(processCount - c, 0) - no pool introspection endpoint exists',
+    'pssBytesCadence': 'pssBytes and processCount are sampled every ${SAMPLE_LOW_EVERY}th sampler tick (and always tick 1), not every tick: pgrep plus an N-file smaps_rollup walk at 1 Hz perturbs the density ceiling being measured. crosses(memory) reads memAvailableBytes, which IS every tick, so the bound classification is unaffected; PSS feeds the narrative. See pssSamples and processCountSamples for the actual counts (#291).',
   },
 }
 open('$out_json_path', 'w').write(json.dumps(rec, indent=2))
@@ -1466,7 +1613,7 @@ open('$out_json_path', 'w').write(json.dumps(rec, indent=2))
   # which one.
   [ -s "$out_json_path" ] ||
     die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c wrote no record to $out_json_path - the record writer failed (its Python traceback is above). A sweep that completes having recorded nothing is the worst outcome for a benchmark, because it looks like success."
-  rm -rf "$slot_dir" "$all_times" "${all_times}.ok" "$converge_file"
+  rm -rf "$slot_dir" "$all_times" "${all_times}.ok" "$converge_file" "$sampler_file" "$sampler_stop"
 }
 
 # assemble_ladder collects every per-rung JSON file for one (arm, D, guest RAM)

@@ -501,7 +501,14 @@ if [ -n "$writer_body" ] && [ -n "$dim_body" ]; then
       out_json_path="$2"
       arm=container d=- ram_mb=-
       c=1 throughput=0.5000 p95=12 cold_rate=0.0000
-      pss_bytes=0 mem_bytes=8388608000 cpu_frac=0.1000 proc_count=0
+      # The in-rung sampled signals (#291 item 1). cpu_mean is what crosses('cpu') reads.
+      cpu_mean=0.4100 cpu_peak=0.9700 cpu_min=0.0500 cpu_samples=12 cores_busy=29.5200
+      mem_mean=8388608000 mem_min=8000000000
+      pss_mean=524288 pss_peak=1048576 pss_samples=3
+      proc_mean=0 proc_peak=2 proc_samples=3
+      # The retained post-load snapshot, under its own names.
+      post_cpu=0.0006 post_mem=8388608000 post_pss=0 post_proc=0
+      SAMPLE_LOW_EVERY=5
       standbys_resident=0 idle_residency=0 reclaim_converge_s=0 converge_p50=7
       errors_json='{}'
       SUBSTRATE=nested-m8i REPO_CACHE_SHAPE=accept-cold-fetch COLD_LATENCY_MS=50
@@ -539,6 +546,31 @@ if [ -n "$writer_body" ] && [ -n "$dim_body" ]; then
   parsed="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["standbyDepth"], d["guestRamMb"], d["c"], d["p95Ms"])' "$ok_out" 2>&1)" || parsed_rc=$?
   check "  ...and json.load parses it (the real consumer of every rung record)" "$parsed_rc" "0"
   check "  ...with the not-applicable dimensions as JSON null, not 0" "$parsed" "None None 1 12"
+
+  new_fields_rc=0
+  new_fields="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+want = ["hostCpuFraction","hostCpuFractionPeak","hostCpuFractionMin","hostCpuSamples",
+        "coresBusy","memAvailableBytes","memAvailableBytesMin","pssBytes","pssBytesPeak",
+        "pssSamples","processCount","processCountPeak","processCountSamples","samplingMode",
+        "postLoadHostCpuFraction","postLoadMemAvailableBytes","postLoadPssBytes",
+        "postLoadProcessCount"]
+missing = [k for k in want if k not in d]
+print("missing:" + ",".join(missing) if missing else "all-present")
+' "$ok_out" 2>&1)" || new_fields_rc=$?
+  check "the record carries every field the #291 schema adds" "$new_fields" "all-present"
+  check "  ...and json.load accepted it" "$new_fields_rc" "0"
+  check "hostCpuFraction in the record is the UNDER-LOAD mean, not the post-load 0.0006" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hostCpuFraction"])' "$ok_out")" "0.41"
+  check "  ...and the idle reading is still there, under its own name" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["postLoadHostCpuFraction"])' "$ok_out")" "0.0006"
+  check "coresBusy is recorded, because 29.52 cores is legible where 0.41 is not" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["coresBusy"])' "$ok_out")" "29.52"
+  check "samplingMode marks how these numbers were taken" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["samplingMode"])' "$ok_out")" "in-rung-1hz-mean"
+  check "the PSS/processCount cadence is disclosed in the record's own proxyLimitations" \
+    "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("yes" if any("sampler tick" in v for v in d["proxyLimitations"].values()) else "no")' "$ok_out")" "yes"
 
   # --- And the microvm arm's numbers stay NUMBERS (null there would be the sweep losing
   # the dimension it is sweeping, so dimension_literal refuses it).
@@ -917,6 +949,16 @@ fi
 echo "== the sampler's every-tick path uses only builtins (#291 item 1)"
 
 samp_body="$(extract_fns die set_epoch_ms discover_pids pss_bytes_for_pids proc_stat_totals proc_meminfo_available host_sampler_tick host_sampler_loop || true)"
+# The concatenated extract_fns form above is only a strengthened guard when paired with the
+# single-name form: extract_fns PRINTS each function's body as it walks the list and only
+# FAILS at the first MISSING name, so bodies from functions that landed in earlier tasks
+# (die, set_epoch_ms, discover_pids, pss_bytes_for_pids) would keep $samp_body non-empty
+# even if every sampler-specific name below were absent. extract_fn on a single sampler
+# name has no such earlier-landed name to hide behind: it is empty if and only if that
+# function does not exist.
+samp_tick_solo="$(extract_fn host_sampler_tick || true)"
+check "host_sampler_tick alone is extractable (a guard extract_fns cannot fake)" \
+  "$([ -n "$samp_tick_solo" ] && echo yes || echo no)" "yes"
 check "the sampler functions are extractable" "$([ -n "$samp_body" ] && echo yes || echo no)" "yes"
 
 # The every-tick path must contain no external command. awk, sleep, date, pgrep, python3 and
@@ -1150,6 +1192,124 @@ if [ -n "$samp_body" ]; then
 
   rm -rf "$sp_tmpdir"
 fi
+
+echo "== sampler_field's arithmetic over a fixed synthetic sample file (#291 item 1)"
+sf_body="$(extract_fns sampler_field host_cpu_count || true)"
+check "sampler_field and host_cpu_count are extractable" \
+  "$([ -n "$sf_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$sf_body" ]; then
+  sf_tmpdir="$(mktemp -d)"
+  sf_snippet="$sf_tmpdir/sf.sh"
+  printf '%s\n' "$sf_body" >"$sf_snippet"
+  # Three ticks. Ticks 1 and 3 carry the low-cadence signals; tick 2 does not, and its "-"
+  # cells must be SKIPPED rather than read as zero -- a 0 in a mean is a claim, an absent
+  # sample is not.
+  sf_file="$sf_tmpdir/samples"
+  {
+    echo '0.1000 8000000000 524288 2'
+    echo '0.5000 4000000000 - -'
+    echo '0.9000 6000000000 1048576 4'
+  } >"$sf_file"
+  sf() {
+    (
+      # shellcheck disable=SC1090
+      . "$sf_snippet"
+      sampler_field "$sf_file" "$1" "$2" "${3:-%.4f}"
+    )
+  }
+  check "cpu mean over 3 ticks" "$(sf 1 mean)" "0.5000"
+  check "cpu peak" "$(sf 1 peak)" "0.9000"
+  check "cpu min" "$(sf 1 min)" "0.1000"
+  check "cpu sample count" "$(sf 1 count '%d')" "3"
+  check "memAvailable mean, as an integer" "$(sf 2 mean '%.0f')" "6000000000"
+  check "memAvailable min (the only extreme that can indicate pressure)" "$(sf 2 min '%.0f')" "4000000000"
+  check "pss mean SKIPS the '-' tick (2 samples, not 3)" "$(sf 3 mean '%.0f')" "786432"
+  check "pss peak" "$(sf 3 peak '%.0f')" "1048576"
+  check "pss sample count is 2, exposing the reduced cadence" "$(sf 3 count '%d')" "2"
+  check "processCount mean, rounded to an integer" "$(sf 4 mean '%.0f')" "3"
+  check "processCount peak" "$(sf 4 peak '%.0f')" "4"
+  check "processCount sample count" "$(sf 4 count '%d')" "2"
+
+  # An empty file is the ABSENCE of a measurement, not a zero -- same refusal shape as
+  # percentile. count prints 0 so the caller can distinguish "no samples" from "failed".
+  sf_empty="$sf_tmpdir/empty"
+  : >"$sf_empty"
+  sf_empty_rc=0
+  (
+    # shellcheck disable=SC1090
+    . "$sf_snippet"
+    sampler_field "$sf_empty" 1 mean '%.4f'
+  ) >/dev/null 2>&1 || sf_empty_rc=$?
+  check "an empty sample file is a refusal, not a 0.0000 mean" \
+    "$([ "$sf_empty_rc" -ne 0 ] && echo yes || echo no)" "yes"
+
+  # A column that is "-" on EVERY tick is likewise absent, not zero.
+  sf_alldash="$sf_tmpdir/alldash"
+  printf '0.1000 8000000000 - -\n0.2000 8000000000 - -\n' >"$sf_alldash"
+  sf_dash_rc=0
+  (
+    # shellcheck disable=SC1090
+    . "$sf_snippet"
+    sampler_field "$sf_alldash" 3 mean '%.0f'
+  ) >/dev/null 2>&1 || sf_dash_rc=$?
+  check "an all-'-' column is a refusal too" \
+    "$([ "$sf_dash_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  sf_dash_count=$(
+    # shellcheck disable=SC1090
+    . "$sf_snippet"
+    sampler_field "$sf_alldash" 3 count '%d'
+  )
+  check "  ...while its count is 0, which is what the record shows" "$sf_dash_count" "0"
+
+  sf_ncpu=$(
+    # shellcheck disable=SC1090
+    . "$sf_snippet"
+    host_cpu_count
+  )
+  check "host_cpu_count prints a positive integer (coresBusy = mean x this)" \
+    "$([ "$sf_ncpu" -ge 1 ] 2>/dev/null && echo yes || echo no)" "yes"
+
+  rm -rf "$sf_tmpdir"
+fi
+
+echo "== the sampler brackets exactly the timed window, and nothing else (#291 item 1)"
+sw_rdr="$(extract_fn run_density_rung || true)"
+if [ -n "$sw_rdr" ]; then
+  sw_line() { printf '%s\n' "$sw_rdr" | grep -n -- "$1" | head -n1 | cut -d: -f1; }
+  sw_t0="$(sw_line 'wall_t0="')"
+  sw_start="$(sw_line 'host_sampler_loop ')"
+  sw_t1="$(sw_line 'wall_t1="')"
+  sw_snap="$(sw_line 'host_signals_snapshot "\$require_vmm"')"
+  check "the sampler is started inside run_density_rung" \
+    "$([ -n "$sw_start" ] && echo yes || echo no)" "yes"
+  if [ -n "$sw_t0" ] && [ -n "$sw_start" ] && [ -n "$sw_t1" ]; then
+    check "the sampler starts AFTER wall_t0 (never before the window it describes)" \
+      "$([ "$sw_t0" -lt "$sw_start" ] && echo yes || echo no)" "yes"
+    check "the sampler starts BEFORE the first Exec is issued" \
+      "$([ "$sw_start" -lt "$(sw_line 'grpc_exec_record ')" ] && echo yes || echo no)" "yes"
+  fi
+  if [ -n "$sw_t1" ] && [ -n "$sw_snap" ]; then
+    check "the post-load snapshot is still taken, AFTER wall_t1" \
+      "$([ "$sw_t1" -lt "$sw_snap" ] && echo yes || echo no)" "yes"
+  fi
+  check "the sampler is reaped before aggregation (a wait on its pid)" \
+    "$([ "$(printf '%s\n' "$sw_rdr" | grep -c 'wait "\$E11_SAMPLER_PID"')" -ge 1 ] && echo yes || echo no)" "yes"
+fi
+check "hostCpuFraction is recorded from the sampler's MEAN, not the post-load snapshot" \
+  "$([ "$(grep -c "'hostCpuFraction': \$cpu_mean," "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "the post-load snapshot keeps its own four explicitly named fields" \
+  "$(grep -cE "'postLoad(HostCpuFraction|MemAvailableBytes|PssBytes|ProcessCount)':" "$SCRIPT")" "4"
+check "samplingMode marks these records so they cannot be compared with pre-fix ones" \
+  "$(grep -c "'samplingMode': 'in-rung-1hz-mean'," "$SCRIPT")" "1"
+check "the reduced PSS/processCount cadence is disclosed in proxyLimitations" \
+  "$([ "$(grep -c 'sampled every .* sampler tick' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "a rung with zero host samples is REFUSED, not backfilled from the idle snapshot" \
+  "$([ "$(grep -c 'produced ZERO host samples over its timed window' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "standbysResident is derived from the SAMPLED process count, not the post-load one" \
+  "$([ "$(grep -c 'standbys_resident=\$((proc_mean > c' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "the sampler is killed from the EXIT trap, so a die mid-rung cannot orphan it" \
+  "$([ "$(printf '%s\n' "$(extract_fn cleanup_on_exit)" | grep -c 'stop_host_sampler')" -ge 1 ] && echo yes || echo no)" "yes"
 
 # ---------------------------------------------------------------------------
 # Issue #291 item 3: converge is out of the throughput denominator.
@@ -1440,6 +1600,7 @@ if [ -n "$trap_body" ]; then
   : >"$doomed/slots-container-d--ram--c1/slot-1.times"
   {
     echo 'set -uo pipefail'
+    echo 'stop_host_sampler() { echo sampler >>"$ORDER"; }'
     echo 'stop_container_stack() { echo container >>"$ORDER"; }'
     echo 'stop_microvm_stack() { echo microvm >>"$ORDER"; }'
     printf '%s\n' "$trap_body"
@@ -1449,8 +1610,11 @@ if [ -n "$trap_body" ]; then
   tr_rc=0
   ORDER="$tr_order" E11_TMPDIR="$doomed" bash "$tr_probe" || tr_rc=$?
   check "the trap does not swallow the script's exit status" "$tr_rc" "7"
-  check "it kills BOTH arms' stacks (kill before remove, as build-snapshot.sh does)" \
-    "$(tr '\n' ' ' <"$tr_order")" "container microvm "
+  # The sampler goes FIRST: it is a background subshell that polls for its stop file, so
+  # after `rm -rf $E11_TMPDIR` that file can never appear and it would spin forever writing
+  # to a deleted path (#291 item 1).
+  check "it kills the sampler and BOTH arms' stacks (kill before remove)" \
+    "$(tr '\n' ' ' <"$tr_order")" "sampler container microvm "
   check "and it removes the temp root, so no mktemp -d slot dir survives a die" \
     "$([ -e "$doomed" ] && echo survived || echo gone)" "gone"
 
@@ -1644,8 +1808,10 @@ check "SH_VMM=firecracker is set when starting the microvm worker" \
   "$(grep -c 'SH_VMM=firecracker' "$SCRIPT")" "1"
 
 echo "== virtiofsd's legitimate absence on the Firecracker-only arm is documented"
+# Three since the in-rung sampler landed (#291 item 1): the config binding, the post-load
+# snapshot, and the sampler's low-cadence tick.
 check "virtiofsd is still sampled for (summed, can legitimately be 0)" \
-  "$(grep -c 'VIRTIOFSD_PROC_PATTERN' "$SCRIPT")" "2"
+  "$(grep -c 'VIRTIOFSD_PROC_PATTERN' "$SCRIPT")" "3"
 check "the header states 0 virtiofsd PSS here is expected, not a bug" \
   "$([ "$(grep -c 'EXPECTED result of an absent process' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 
