@@ -1736,36 +1736,49 @@ run_density_rung() {
   host_sampler_loop "$sampler_file" "$sampler_stop" &
   E11_SAMPLER_PID="$!"
   pids=()
-  for ((i = 1; i <= c; i++)); do
-    (
-      # No run_id or workspace_key derivation in here: phase 2 needs only the pre-escaped key
-      # and the req_id base, so nothing that forks happens inside the timed window.
-      local req_base req
-      req_base="$(slot_req_base "$i")"
-      req="$req_base"
-
-      local times_file="$slot_dir/slot-$i.times" err_log="$slot_dir/slot-$i.err"
-      # Pre-escaped above, before wall_t0. Parameter expansion, not a command substitution:
-      # `local x="$(...)"` would trip SC2155, which is a WARNING and so a lint failure here.
-      local ws_json="${ws_json_by_slot[$i]}"
-      : >"$times_file"
-      : >"$err_log"
-      # A shell counter, not `wc -l` twice per Exec: the timed loop is this file's only
-      # writer, so the count is known without reading it back. `for mi in` over the array
-      # pre-escaped above also removes the process-substitution subshell the inner
-      # `while read` re-spawned on every pass over the mix.
-      local want=$((ITERS_PER_SLOT + WARMUP_PER_SLOT)) issued=0 mi
-      while [ "$issued" -lt "$want" ]; do
-        for mi in "${!mix_json[@]}"; do
-          req=$((req + 1))
-          grpc_exec_record "$relay_port" "$sandbox_id" "$ws_json" "${mix_json[$mi]}" "$req" "$times_file" "$err_log"
-          issued=$((issued + 1))
-          [ "$issued" -ge "$want" ] && break
-        done
-      done
-    ) &
+  # ONE process for the whole rung on the Go path (issue #294), c subshells on the grpcurl path.
+  #
+  # Both branches push onto the same pids array and are reaped by the same wait loop below, so
+  # the guarantee that follows -- a rung whose slots were not all measuring the same thing is
+  # never recorded -- holds identically for both.
+  #
+  # The grpcurl branch is UNCHANGED. It is the reference the Go client is compared against, so
+  # it must not be tidied, rewrapped or "improved" while the comparison is outstanding.
+  if [ "$EXEC_CLIENT" = "go" ]; then
+    "$E11_EXEC_DRIVER_BIN" --plan "$plan_file" >>"$RESULTS/e11-exec-driver.log" 2>&1 &
     pids+=("$!")
-  done
+  else
+    for ((i = 1; i <= c; i++)); do
+      (
+        # No run_id or workspace_key derivation in here: phase 2 needs only the pre-escaped key
+        # and the req_id base, so nothing that forks happens inside the timed window.
+        local req_base req
+        req_base="$(slot_req_base "$i")"
+        req="$req_base"
+
+        local times_file="$slot_dir/slot-$i.times" err_log="$slot_dir/slot-$i.err"
+        # Pre-escaped above, before wall_t0. Parameter expansion, not a command substitution:
+        # `local x="$(...)"` would trip SC2155, which is a WARNING and so a lint failure here.
+        local ws_json="${ws_json_by_slot[$i]}"
+        : >"$times_file"
+        : >"$err_log"
+        # A shell counter, not `wc -l` twice per Exec: the timed loop is this file's only
+        # writer, so the count is known without reading it back. `for mi in` over the array
+        # pre-escaped above also removes the process-substitution subshell the inner
+        # `while read` re-spawned on every pass over the mix.
+        local want=$((ITERS_PER_SLOT + WARMUP_PER_SLOT)) issued=0 mi
+        while [ "$issued" -lt "$want" ]; do
+          for mi in "${!mix_json[@]}"; do
+            req=$((req + 1))
+            grpc_exec_record "$relay_port" "$sandbox_id" "$ws_json" "${mix_json[$mi]}" "$req" "$times_file" "$err_log"
+            issued=$((issued + 1))
+            [ "$issued" -ge "$want" ] && break
+          done
+        done
+      ) &
+      pids+=("$!")
+    done
+  fi
   local exec_failures=0
   for pid in "${pids[@]}"; do
     wait "$pid" || exec_failures=$((exec_failures + 1))
@@ -1774,8 +1787,15 @@ run_density_rung() {
   : >"$sampler_stop"
   wait "$E11_SAMPLER_PID" 2>/dev/null || true
   E11_SAMPLER_PID=""
-  [ "$exec_failures" -eq 0 ] ||
+  if [ "$exec_failures" -ne 0 ]; then
+    # The message differs because the FAILURE differs. One Go process drives all c slots, so a
+    # non-zero exit says nothing about how many slots got timings -- it says the rung has none
+    # that can be trusted. Reporting "1 of 8 slot(s) failed" there would understate it.
+    if [ "$EXEC_CLIENT" = "go" ]; then
+      die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c: the Go exec-driver exited non-zero (see $RESULTS/e11-exec-driver.log) - one process drives all $c slots, so a non-zero exit means no slot's timings can be trusted; refusing to record the rung"
+    fi
     die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c had $exec_failures of $c slot(s) fail inside the timed loop - refusing to record a rung whose slots were not all measuring the same thing"
+  fi
   local wall_s
   wall_s="$(require_numeric wallSeconds "$(awk -v ns=$((wall_t1 - wall_t0)) 'BEGIN{printf "%.4f", ns/1000000000.0}')")" ||
     die "rung arm=$arm c=$c could not measure its own wall time (see the refusal above) - throughput is derived from it, so there is nothing to record"

@@ -866,7 +866,16 @@ check "the timed window is extractable and non-empty" \
 
 # NON-VACUOUSNESS: the detector must flag each removed command in a fixture that contains
 # it. Without this, "0 findings" below could mean the regex matches nothing.
-tw_detect() { printf '%s\n' "$1" | grep -cE '\bjson_escape\b|date \+%s%N|\bmktemp\b|\bwc -l\b'; }
+# python3 joins the list for issue #294. An interpreter startup inside the window is the same
+# defect class as the two json_escape interpreters #291 item 2 removed, reintroduced by the fix
+# for the spawn they were removed alongside.
+#
+# SCOPE, stated because it is easy to over-trust: this catches a LITERAL python3 between the
+# stamps. It does NOT catch write_rung_plan's call being moved into the window, because that
+# call line contains no such token and this guard never expands into the callee's body. The
+# branch section below asserts the call site's position directly, and that is the check that
+# covers the move.
+tw_detect() { printf '%s\n' "$1" | grep -cE '\bjson_escape\b|date \+%s%N|\bmktemp\b|\bwc -l\b|\bpython3\b'; }
 check "non-vacuousness: the detector flags a json_escape in the window" \
   "$(tw_detect '  -d "{\"command\":$(json_escape "$cmd\")}"')" "1"
 check "non-vacuousness: the detector flags a date +%s%N in the window" \
@@ -875,6 +884,10 @@ check "non-vacuousness: the detector flags an mktemp in the window" \
   "$(tw_detect '  err_log="$(mktemp "$E11_TMPDIR/errlog.XXXXXX")"')" "1"
 check "non-vacuousness: the detector flags a wc -l loop guard" \
   "$(tw_detect '  while [ "$(wc -l <"$times_file")" -lt "$want" ]; do')" "1"
+check "non-vacuousness: the detector flags a literal python3 in the window" \
+  "$(tw_detect '  python3 -c "import json"')" "1"
+check "scope: the detector does NOT see python3 through a write_rung_plan call" \
+  "$(tw_detect '  write_rung_plan "$plan_file" "localhost:8445" "$sandbox_id"')" "0"
 
 if [ -n "$tw_body" ]; then
   check "no json_escape, date, mktemp or wc runs inside the timed window" \
@@ -2632,6 +2645,53 @@ ger_timeout="$(extract_fn grpc_exec_record | grep -o '\\"timeout_s\\":[0-9]*' | 
 rdr_timeout="$(extract_fn run_density_rung | grep -A3 'write_rung_plan "\$plan_file"' | grep -oE '"\$ITERS_PER_SLOT" "\$WARMUP_PER_SLOT" [0-9]+' | grep -oE '[0-9]+$')"
 check "the plan's execTimeoutS matches grpc_exec_record's timeout_s" "$rdr_timeout" "$ger_timeout"
 
+
+# ---------------------------------------------------------------------------
+# The phase-2 branch (issue #294)
+# ---------------------------------------------------------------------------
+echo "== phase 2 runs ONE exec-driver process on the Go path and c subshells on the grpcurl path (#294)"
+
+rdr_body="$(extract_fn run_density_rung || true)"
+check "run_density_rung is extractable" "$([ -n "$rdr_body" ] && echo yes || echo no)" "yes"
+
+# The window body, extracted exactly as the fork guard above does it.
+win="$(printf '%s\n' "$rdr_body" | awk '/wall_t0="/{f=1; next} /wall_t1="/{exit} f{print}' | grep -v '^[[:space:]]*#')"
+check "the Go path runs the exec-driver binary inside the timed window" \
+  "$(printf '%s\n' "$win" | grep -Fc '"$E11_EXEC_DRIVER_BIN" --plan "$plan_file"')" "1"
+check "  ...exactly once, not once per slot" \
+  "$(printf '%s\n' "$win" | grep -c 'for ((i = 1; i <= c; i++))')" "1"
+check "  ...and the grpcurl subshell loop is still there, unchanged" \
+  "$(printf '%s\n' "$win" | grep -Fc 'grpc_exec_record "$relay_port"')" "1"
+check "  ...selected by EXEC_CLIENT, not by arm" \
+  "$(printf '%s\n' "$win" | grep -Fc 'if [ "$EXEC_CLIENT" = "go" ]')" "1"
+# write_rung_plan must NOT be in the window: Task 5 put it before wall_t0 and the fork guard
+# above now flags python3, but assert the call site directly too, because that guard would also
+# pass if the call vanished entirely.
+check "write_rung_plan is called OUTSIDE the timed window" \
+  "$(printf '%s\n' "$win" | grep -c 'write_rung_plan')" "0"
+check "  ...and is called somewhere in run_density_rung" \
+  "$(printf '%s\n' "$rdr_body" | grep -Fc 'write_rung_plan "$plan_file"')" "1"
+
+# The refusal must not claim "1 of c slots" when one process drove all c of them.
+check "the Go path's refusal says the whole rung is invalid, not one slot" \
+  "$(printf '%s\n' "$rdr_body" | grep -c 'the Go exec-driver exited non-zero')" "1"
+check "  ...and the grpcurl path keeps its per-slot refusal" \
+  "$(printf '%s\n' "$rdr_body" | grep -c 'slot(s) fail inside the timed loop')" "1"
+
+# Both paths still go through the SAME wait-and-refuse shape, which is what makes "a rung whose
+# slots were not all measuring the same thing is never recorded" true for both.
+check "both paths are waited on through the same pids array" \
+  "$(printf '%s\n' "$rdr_body" | grep -Fc 'wait "$pid" || exec_failures=$((exec_failures + 1))')" "1"
+
+# Converge stays on grpcurl on BOTH paths -- a stated non-goal. It is already outside the timed
+# window and reported separately as convergeMsP50, so routing it through the new client would
+# move a number this work is not measuring, inside the same PR that moves the one it is.
+cs_body="$(extract_fn converge_slot || true)"
+check "converge_slot is extractable" "$([ -n "$cs_body" ] && echo yes || echo no)" "yes"
+check "converge still drives grpcurl, on every path" \
+  "$(printf '%s\n' "$cs_body" | grep -c 'grpcurl -plaintext')" "1"
+check "  ...and converge is not routed through EXEC_CLIENT at all" \
+  "$(printf '%s\n' "$cs_body" | grep -c 'EXEC_CLIENT')" "0"
 echo
 echo "Total failures: $fails"
 exit "$fails"
