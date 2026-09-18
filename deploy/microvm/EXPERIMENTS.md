@@ -726,7 +726,12 @@ Driver: `deploy/microvm/e10-lifecycle.sh`; cluster-free proof of its structure:
 > carry `samplingMode` — the ones below do not, and the two are not comparable on
 > `hostCpuFraction`, `memAvailableBytes`, `pssBytes` or `processCount`. The repaired driver
 > also adds a third arm, `driver-control`, whose latency is all driver; subtracting it at
-> each `c` is what will say whether the re-run can separate backend from driver at all.
+> each `c` is what will say whether the re-run can separate backend from driver at all. That
+> subtraction is a strict lower bound, not exact: the null-responder never emits a `Chunk`
+> event, so `driver-control` doesn't pay the per-Exec chunk-decode cost that real mix commands
+> producing stdout incur on the other two arms, meaning it slightly under-counts driver cost
+> and over-attributes the remainder to the backend (recorded per rung as
+> `driverControlChunkDecode` in `proxyLimitations`).
 
 **RUN ON BARE METAL, 14 rungs, exit 0.** `SH_E11_ACTIVE_RUNS="1 2 4 8 16 32 64"`,
 `ITERS_PER_SLOT=20`, `SH_E11_COLD_LATENCY_MS=145`, same host and snapshot as E10.

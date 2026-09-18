@@ -102,6 +102,16 @@ export interface RungSample {
    * `memAvailableBytes`, which IS every tick -- PSS feeds the narrative, not the bound.
    */
   pssSamples?: number;
+  /**
+   * Low-cadence ticks where the sampler DID try to read PSS but the read was refused (a
+   * still-live VMM/virtiofsd pid with an unreadable smaps_rollup -- spec section 7.3's boxed
+   * warning never falls back to RSS, so this fires instead). Not part of `pssSamples`, which
+   * only counts ticks that produced a number: a refusal is a distinct, countable event, not
+   * an ordinary un-sampled tick (issue #291 item 4). No scoring logic reads this field today;
+   * it exists so a rung with a suspiciously low `pssSamples` can be told apart from one that
+   * simply landed on few low-cadence ticks.
+   */
+  pssRefusedTicks?: number;
   processCountSamples?: number;
   /** Highest `processCount` tick over the timed window. */
   processCountPeak?: number;

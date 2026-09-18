@@ -13,10 +13,13 @@
 # in deploy/microvm/tests/e11-density.test.sh calls main(). See the scope note in the header
 # for the full disclosure of every proxy/limitation below.
 #
-# Two arms only (hardware-corrections F5): "container" (today's remote-worker, no
-# microVM at all -- the baseline E11 is priced against) and "microvm"
-# (microvm-worker, Firecracker ONLY). Cloud Hypervisor is not a third arm: on this
-# project's rig it dies during device restoration after logging
+# Three arms by default (hardware-corrections F5, extended by issue #291 item 3):
+# "container" (today's remote-worker, no microVM at all -- the baseline E11 is
+# priced against), "microvm" (microvm-worker, Firecracker ONLY), and
+# "driver-control" (a null-responder standing in for a backend, see
+# start_null_stack below -- it measures the driver's own cost, not either real
+# backend). Cloud Hypervisor is not one of the three: on this project's rig it
+# dies during device restoration after logging
 # "Restoring virtio-console __console", with no error propagated through its API,
 # and presents as a 30-second hang -- it does not restore, so there is nothing to
 # sweep. Where a CH column would appear in a write-up, that absence is the reason,
@@ -42,10 +45,15 @@
 #     for a real rate-based driver would only need to change how requests are
 #     scheduled onto the same grpc_exec_record() plumbing.
 #   - page-cache asymmetry between arms: drop_caches (dup of e10-lifecycle.sh's own
-#     function) runs between the container and microvm arms, and shuffle_e11_arms
-#     randomizes which arm goes first, exactly as E10 does for its own arms.
+#     function) runs between every pair of arms in the shuffled order (not just
+#     container/microvm -- driver-control gets the same treatment), and
+#     shuffle_e11_arms randomizes which arm goes first, exactly as E10 does for its
+#     own arms.
 #   - guest-side timing is garbage: every timestamp in this script is taken on the
-#     HOST around a grpcurl call (date +%s%N); no guest clock is ever read.
+#     HOST, never a guest clock. Per-Exec latency (grpc_exec_record) is now
+#     $EPOCHREALTIME read before/after the grpcurl call, with no subprocess fork
+#     in the timed path (issue #291 item 1); each rung's own wall time
+#     (wall_t0/wall_t1) still comes from date +%s%N.
 #   - CPU frequency / thermal drift: check_governor (dup of e10-lifecycle.sh's own
 #     function) still refuses a non-"performance" governor before any rung runs.
 #   - converge hides inside the rungs (section 4.5): converge_slot times ONE
@@ -175,7 +183,7 @@ read -r -a ACTIVE_RUNS <<<"${SH_E11_ACTIVE_RUNS:-1 2 4 8}"
 # -- so subtracting it at each c gives the DRIVER's own contribution to observed latency. The
 # control whose absence let a driver artifact be published as a density finding should not be
 # opt-in. Set SH_E11_ARMS to opt out.
-read -r -a E11_ARMS <<<"${SH_E11_ARMS:-container microvm driver-control}"
+read -r -a E11_ARMS <<<"${SH_E11_ARMS-container microvm driver-control}"
 # The null-responder's loopback port. Deliberately NOT E11_RELAY_PORT: the control arm's
 # "stack" is one process and never coexists with a relay, but sharing the port would make a
 # stale relay from a previous arm answer the control arm's Execs, which is the one thing this
@@ -208,14 +216,22 @@ VIRTIOFSD_PROC_PATTERN="${SH_E11_VIRTIOFSD_PROC_PATTERN:-virtiofsd}"
 # window; see host_sampler_loop for why there are two cadences and what each costs.
 #
 # 1 Hz by default: the every-tick path is builtins only, so its cost is a `sleep` fork per
-# slice and nothing else. SAMPLE_SLICE_MS is how often the loop checks the stop file, which
-# bounds how much post-window time the final tick can include -- 100ms, against a window of
-# seconds.
+# slice and nothing else. SAMPLE_SLICE_MS is how often the loop checks the stop file.
+#
+# The final tick at stop is taken ONLY when no full tick has already landed for this rung
+# (host_sampler_loop gates it on SAMPLE_TICK == 0). A rung that already has one or more real
+# ticks never gets an extra one at stop: that tick's window would be mostly post-window idle
+# time averaged in with equal weight to the real ticks, biasing the mean toward "the driver
+# was idle" -- the same failure mode issue #291 exists to fix, at reduced magnitude. When no
+# full tick has landed (a rung shorter than SAMPLE_INTERVAL_MS), the final tick is still taken
+# once SAMPLE_MIN_TICK_MS has elapsed, so a short rung gets exactly one sample rather than
+# none.
 SAMPLE_INTERVAL_MS="${SH_E11_SAMPLE_INTERVAL_MS:-1000}"
 SAMPLE_SLICE_MS="${SH_E11_SAMPLE_SLICE_MS:-100}"
-# The floor under the final tick at stop. A /proc/stat diff over a few milliseconds is jiffy
-# noise, not a measurement, so below this the stop tick records NOTHING and the rung's
-# hostCpuSamples is 0 -- which run_density_rung refuses, naming the fix.
+# The floor under the final tick at stop (see above -- only reachable when zero full ticks
+# have landed). A /proc/stat diff over a few milliseconds is jiffy noise, not a measurement,
+# so below this the stop tick records NOTHING and the rung's hostCpuSamples is 0 -- which
+# run_density_rung refuses, naming the fix.
 SAMPLE_MIN_TICK_MS="${SH_E11_SAMPLE_MIN_TICK_MS:-200}"
 # pssBytes and processCount need pgrep plus an N-file smaps_rollup walk, so they run every
 # Nth tick (and always on tick 1, so a rung with CPU samples can never have zero of them).
@@ -389,6 +405,19 @@ validate_arms() {
   done
 }
 
+# arm_in_use reports, via exit status, whether $1 is present in E11_ARMS, so preflight
+# can skip a tool or hardware check that no configured arm actually needs (issue #291
+# item 5): a SH_E11_ARMS=driver-control run should not be refused over a missing docker
+# or /dev/kvm that arm never touches. Called only after validate_arms has already run,
+# so E11_ARMS is known to hold nothing but the three recognized arm names.
+arm_in_use() {
+  local want="$1" arm
+  for arm in "${E11_ARMS[@]}"; do
+    [ "$arm" = "$want" ] && return 0
+  done
+  return 1
+}
+
 # require_tool refuses a MISSING external binary by name, in preflight, rather than
 # letting a rung "run" against a command that is not there -- the same guard, and the same
 # wording, e10-lifecycle.sh already carries. E11 had NO tool preflight at all, and that is
@@ -401,27 +430,40 @@ require_tool() {
 
 preflight() {
   require_epochrealtime
-  # Every one of these is a HARD requirement for at least one arm, and each was found the
-  # expensive way on the first execution. pnpm in particular is NOT optional: the container
-  # arm's relay is `pnpm --filter @sh/sandbox-relay start`, so without it that whole arm --
-  # the baseline the microvm arm is priced against -- cannot start.
-  require_tool grpcurl "both arms drive their Exec RPCs through grpcurl; without it every timing would measure a client-side error rather than a sandbox"
-  require_tool docker "both arms start their own scratch redis in a container; without it the relay has nowhere to publish its presence record"
-  require_tool go "both arms build their own worker binary from ./cmd/worker and ./cmd/microvm-worker"
-  require_tool pnpm "the container arm starts the real sandbox-relay via pnpm --filter @sh/sandbox-relay; without it the baseline arm cannot start at all"
+  # validate_arms runs FIRST: every check below reads E11_ARMS to decide what it needs, so
+  # an invented arm name must be refused before any of them run, not after (also see
+  # arm_in_use above).
+  validate_arms
+  # grpcurl and go are hard requirements for every arm: grpcurl drives every arm's Exec
+  # RPCs, and go builds whichever binary that arm needs (./cmd/worker, ./cmd/microvm-worker,
+  # or ./cmd/null-responder). Everything else in this function is conditional on which arms
+  # are actually configured (issue #291 item 5): a SH_E11_ARMS=driver-control run touches
+  # none of docker, pnpm, or the microVM hardware checks below, so refusing over a missing
+  # one would block a run that never needed it.
+  require_tool grpcurl "every arm drives its Exec RPCs through grpcurl; without it every timing would measure a client-side error rather than a sandbox"
+  require_tool go "the container arm builds ./cmd/worker, the microvm arm builds ./cmd/microvm-worker, and the driver-control arm builds ./cmd/null-responder"
+  if arm_in_use container || arm_in_use microvm; then
+    require_tool docker "the container and microvm arms both start their own scratch redis in a container; without it the relay has nowhere to publish its presence record"
+    require_tool pnpm "the container and microvm arms both start the real sandbox-relay via pnpm --filter @sh/sandbox-relay; without it neither arm can start at all"
+  fi
   # The proto must be PRESENT as a file, separately from how grpcurl is told to find it
   # (PROTO_IMPORT_PATH/PROTO_REL_PATH): a missing proto is otherwise indistinguishable from
   # a malformed grpcurl invocation, and both present as an unencodable Exec. e10 carries the
-  # same check for the same reason.
+  # same check for the same reason. Every arm drives grpcurl, so this stays unconditional.
   [ -f "$PROTO_FILE" ] ||
     die "the sandbox proto is missing at $PROTO_FILE - grpcurl cannot encode an Exec request without it, so every rung would time a client-side error"
-  check_kvm
-  check_cgroups
-  check_swap
-  GOVERNOR_STATE="$(check_governor)"
-  log "governor: $GOVERNOR_STATE"
+  # check_kvm/check_cgroups/check_swap/check_governor are all about the microVM guest this
+  # driver's microvm arm boots (KVM to run it, cgroups v2 for its restore latency, no swap
+  # so guest RAM is not paged out, a performance governor for its replenishment CPU burst) --
+  # none of them mean anything for a sweep that never boots a guest.
+  if arm_in_use microvm; then
+    check_kvm
+    check_cgroups
+    check_swap
+    GOVERNOR_STATE="$(check_governor)"
+    log "governor: $GOVERNOR_STATE"
+  fi
   validate_repo_cache_shape
-  validate_arms
   mkdir -p "$RESULTS"
 }
 
@@ -536,9 +578,10 @@ dimension_literal() {
   require_numeric "$field" "$value"
 }
 
-# host_cpu_fraction samples /proc/stat twice, SAMPLE_WINDOW_S apart, and returns
-# the busy fraction over that window -- never a single-sample /proc/stat snapshot,
-# which is meaningless (it is a cumulative counter since boot).
+# host_cpu_fraction samples /proc/stat twice, "$1" seconds apart (default 1, its only
+# caller besides tests passes none), and returns the busy fraction over that window --
+# never a single-sample /proc/stat snapshot, which is meaningless (it is a cumulative
+# counter since boot).
 host_cpu_fraction() {
   local window="${1:-1}" a b idle_a idle_b total_a total_b
   a="$(awk '/^cpu /{print; exit}' "$PROC_ROOT/stat" 2>/dev/null)"
@@ -614,10 +657,14 @@ proc_meminfo_available() {
 
 # host_sampler_tick appends ONE line to $1:
 #
-#     <cpuFraction> <memAvailableBytes> <pssBytes|-> <processCount|->
+#     <cpuFraction> <memAvailableBytes> <pssBytes|-|refused> <processCount|->
 #
 # "-" marks a tick that did not carry the low-cadence signals; sampler_field skips those,
 # which is how pssSamples can legitimately differ from hostCpuSamples in the record.
+# "refused" (pssBytes column only) marks a low-cadence tick that DID try, but
+# pss_bytes_for_pids died on an unreadable smaps_rollup for a still-live pid (spec section
+# 7.3's boxed warning) -- a distinct, countable event, not an absent sample. See
+# pssRefusedTicks in run_density_rung (issue #291 item 4).
 #
 # The CPU fraction is computed in scaled integer arithmetic and the decimal point spliced in
 # by `printf -v`, because awk or bc would be a fork per tick. It is clamped to [0, 1]: a
@@ -650,11 +697,15 @@ host_sampler_tick() {
     vmm_pids="$(discover_pids "$VMM_PROC_PATTERN")"
     virtiofsd_pids="$(discover_pids "$VIRTIOFSD_PROC_PATTERN")"
     # A `die` inside pss_bytes_for_pids exits only this command substitution's subshell, so
-    # the assignment lands empty with a non-zero status. Recording "-" for that tick is
-    # right: the refusal that matters (spec section 7.3's boxed warning) is enforced by
-    # host_signals_snapshot on the post-load path, which run_density_rung checks and dies on.
+    # the assignment lands empty with a non-zero status. That refusal (spec section 7.3's
+    # boxed warning: a still-live pid with an unreadable smaps_rollup) is a DIFFERENT event
+    # from an ordinary un-sampled tick, so it gets a distinct marker, "refused", rather than
+    # "-" -- otherwise it would silently vanish from this tick with no trace anywhere except
+    # the post-load snapshot's own separate refusal path, which only covers the moment after
+    # the window closes, not any in-window tick (issue #291 item 4). sampler_field and
+    # sampler_marker_count both know to treat "refused" as not-a-number.
     # shellcheck disable=SC2086 # word-splitting into pss_bytes_for_pids' "$@" is intended
-    pss="$(pss_bytes_for_pids $vmm_pids $virtiofsd_pids)" || pss="-"
+    pss="$(pss_bytes_for_pids $vmm_pids $virtiofsd_pids)" || pss="refused"
     [ -n "$pss" ] || pss="-"
     proc_count=0
     # shellcheck disable=SC2086
@@ -665,13 +716,23 @@ host_sampler_tick() {
   printf '%s %s %s %s\n' "$frac" "$SAMPLE_MEM_AVAILABLE_BYTES" "$pss" "$proc_count" >>"$out_file"
 }
 
-# host_sampler_loop ticks into $1 until $2 exists, then takes ONE final tick if at least
-# SAMPLE_MIN_TICK_MS has elapsed since the last one, and returns. Meant to be backgrounded
-# by run_density_rung immediately after wall_t0 and reaped immediately after wall_t1.
+# host_sampler_loop ticks into $1 until $2 exists, then, ONLY if no full tick has landed yet
+# (SAMPLE_TICK == 0), takes ONE final tick provided at least SAMPLE_MIN_TICK_MS has elapsed
+# since the loop started. Meant to be backgrounded by run_density_rung immediately after
+# wall_t0 and reaped immediately after wall_t1.
+#
+# The no-full-tick gate matters (issue #291 item 2): once a rung has a real, full-interval
+# tick, a second tick taken at stop is not a peer sample -- its window runs from the last
+# full tick to "sampler noticed the stop file", which for a rung that finishes near an
+# interval boundary is mostly post-window idle time. Averaging that in at equal weight with
+# real ticks biases hostCpuFraction toward "idle", the same direction as the original
+# driver-cost artifact. So once SAMPLE_TICK is nonzero, stop takes no extra tick -- the rung
+# keeps whatever full ticks it earned and nothing else. Only a rung shorter than one full
+# interval (SAMPLE_TICK still 0 at stop) uses the elapsed-time floor to still get exactly one
+# sample instead of zero.
 #
 # It waits in SAMPLE_SLICE_MS slices rather than one SAMPLE_INTERVAL_MS sleep so that the
-# stop file is noticed promptly: the final tick then covers at most one slice of post-window
-# time, against a window of seconds. That costs one `sleep` fork per slice -- ten a second
+# stop file is noticed promptly. That costs one `sleep` fork per slice -- ten a second
 # against the ~370 process creations a second issue #291 item 2 removed.
 host_sampler_loop() {
   local out_file="$1" stop_file="$2"
@@ -687,9 +748,11 @@ host_sampler_loop() {
   last_ms="$EPOCH_MS"
   while :; do
     if [ -e "$stop_file" ]; then
-      set_epoch_ms
-      if [ $((EPOCH_MS - last_ms)) -ge "$SAMPLE_MIN_TICK_MS" ]; then
-        host_sampler_tick "$out_file" || true
+      if [ "$SAMPLE_TICK" -eq 0 ]; then
+        set_epoch_ms
+        if [ $((EPOCH_MS - last_ms)) -ge "$SAMPLE_MIN_TICK_MS" ]; then
+          host_sampler_tick "$out_file" || true
+        fi
       fi
       return 0
     fi
@@ -716,13 +779,19 @@ stop_host_sampler() {
 }
 
 # sampler_field prints one statistic over one COLUMN of a sampler file. `stat` is
-# mean|peak|min|count; `fmt` is a printf format (default %.4f -- pass %.0f for the byte and
-# count columns, whose consumers want integers, and whose mean is rounded rather than
-# truncated).
+# mean|peak|min|count; `fmt` is a printf format (default %.4f -- pass %.0f for the byte
+# columns, whose consumers want integers, and whose mean is rounded rather than truncated).
 #
-# Cells holding "-" are SKIPPED, not read as zero: that marker means the tick did not carry
-# the low-cadence signals, and a 0 in a mean is a claim about memory while an absent sample
-# is not. It is also why pssSamples can legitimately be smaller than hostCpuSamples.
+# `fmt` is IGNORED for stat=count: a count cannot be fractional, so it always prints a bare
+# integer regardless of what is passed. Call sites below that ask for `count` omit the
+# fourth argument rather than passing a now-documented-as-inert '%d' (final review M12).
+#
+# Cells holding "-" OR "refused" are SKIPPED, not read as zero: "-" means the tick did not
+# carry the low-cadence signals, "refused" means it did but pss_bytes_for_pids died on an
+# unreadable smaps_rollup for a still-live pid (spec section 7.3's boxed warning) -- see
+# host_sampler_tick and pssRefusedTicks in run_density_rung (issue #291 item 4). Neither is a
+# 0, and a 0 in a mean is a claim about memory while an absent sample is not. It is also why
+# pssSamples can legitimately be smaller than hostCpuSamples.
 #
 # An empty file, or a column with no numeric cell, is the ABSENCE of a measurement and
 # returns non-zero rather than printing 0 -- the same refusal percentile makes, for the same
@@ -738,7 +807,7 @@ sampler_field() {
     return 1
   }
   awk -v col="$col" -v stat="$stat" -v fmt="$fmt" '
-    $col != "-" {
+    $col != "-" && $col != "refused" {
       v = $col + 0
       n++
       s += v
@@ -753,6 +822,18 @@ sampler_field() {
       else if (stat == "min") { printf fmt, mn }
       else { exit 1 }
     }' "$file"
+}
+
+# sampler_marker_count counts ticks in $1 whose column $2 holds exactly the literal $3
+# (e.g. "refused") rather than a number or "-". Used for pssRefusedTicks: a refusal is a
+# distinct, countable event, not indistinguishable from an ordinary un-sampled tick.
+sampler_marker_count() {
+  local file="$1" col="$2" marker="$3"
+  [ -s "$file" ] || {
+    echo 0
+    return 0
+  }
+  awk -v col="$col" -v marker="$marker" '$col == marker {n++} END{print n + 0}' "$file"
 }
 
 # host_cpu_count prints the online CPU count, for coresBusy. `getconf _NPROCESSORS_ONLN` is
@@ -936,7 +1017,7 @@ escaped_mix() {
 # ---------------------------------------------------------------------------
 grpc_exec_record() {
   local relay_port="$1" sandbox_id="$2" ws_json="$3" cmd_json="$4" req_id="$5" out_file="$6" err_log="$7"
-  local t0 t1 ms cause status
+  local t0 t1 a b ms cause status
   # ws_json and cmd_json arrive ALREADY ESCAPED, quotes included (escaped_mix / the caller's
   # one-shot workspace_key escape). err_log is a fixed per-slot path: `2>` truncates it on
   # every call, so the old mktemp+rm pair bought nothing. req_id is a number and needs no
@@ -951,9 +1032,11 @@ grpc_exec_record() {
   else
     t1="$EPOCHREALTIME"
     status="err"
-    # These greps are the ONLY subprocesses left besides grpcurl, and they run only after an
-    # Exec has already failed -- so they cannot contribute to a healthy rung's latency, and a
-    # failed Exec's latency is not in the distribution p95 is taken over anyway.
+    # Subprocess forks in this function: grpcurl above (always -- it is the thing being
+    # measured) and these greps (only after an Exec has already failed, so they cannot
+    # contribute to a healthy rung's latency, and a failed Exec's latency is not in the
+    # distribution p95 is taken over anyway). ms below is pure arithmetic expansion, no
+    # command substitution and no extra fork (issue #291 item 1) -- so that count is complete.
     if grep -qi "workspace_key" "$err_log"; then
       cause="empty-workspace-key"
     elif grep -qi "mem" "$err_log"; then
@@ -968,7 +1051,8 @@ grpc_exec_record() {
       cause="unknown"
     fi
   fi
-  ms="$(epoch_delta_ms "$t0" "$t1")"
+  a="${t0/./}"; b="${t1/./}"
+  ms=$(( (10#$b - 10#$a) / 1000 ))
   echo "$ms $status $cause" >>"$out_file"
 }
 
@@ -1262,6 +1346,17 @@ stop_microvm_stack() {
 # no worker, no VMM: the control arm exists to measure what the DRIVER costs, so anything else
 # left in the path would be measured along with it. That is also why this arm reuses neither
 # E11_RELAY_PORT nor start_redis_loopback.
+#
+# One known gap in that isolation (issue #291 item 3): the null-responder answers every Exec
+# with a single End event and no Chunk, so grpcurl on this arm never decodes a chunk-carrying
+# stream. Real Execs for mix commands that produce stdout DO decode one or more Chunk events
+# per call on the container/microvm arms. That decode cost is part of "what the driver costs"
+# too, and this arm doesn't pay it -- so driver-control is a STRICT LOWER BOUND on driver-only
+# cost, and subtracting it over-attributes some residue to the backend rather than the driver,
+# the same direction of error as the artifact this branch exists to fix, at reduced magnitude.
+# Recorded in every rung's proxyLimitations under 'driverControlChunkDecode'. Deliberately NOT
+# fixed by making the responder emit chunks: that would change what this control arm measures
+# mid-branch, and is out of scope here.
 start_null_stack() {
   [ "$E11_START_STACK" = "1" ] || {
     log "driver-control stack: SH_E11_START_STACK=0, reusing an already-running null-responder"
@@ -1289,10 +1384,11 @@ stop_null_stack() {
 }
 
 # ---------------------------------------------------------------------------
-# run_density_rung: THE per-rung driver. Called identically for the container arm
-# and the microvm arm (only sandbox_id, relay_port, and whether workspace_key is
-# empty differ at the CALL SITE, in main() below) -- this is what makes "both arms
-# driven by the same code path" true structurally rather than by claim.
+# run_density_rung: THE per-rung driver. Called identically for all three arms --
+# container, microvm, and driver-control (only sandbox_id, relay_port, and whether
+# workspace_key is empty differ at the CALL SITE, in main() below) -- this is what
+# makes "every arm driven by the same code path" true structurally rather than by
+# claim.
 #
 # Writes one RungSample-shaped JSON object (matching
 # experiments/src/microvm-density.ts's RungSample interface field-for-field) to
@@ -1360,9 +1456,13 @@ run_density_rung() {
   # derivations now go through the same helpers phase 1 uses, so the two cannot drift.
   # ---------------------------------------------------------------------------
   local -a mix_json=() ws_json_by_slot=()
+  local mix_expected_count
   mapfile -t mix_json < <(escaped_mix)
   [ "${#mix_json[@]}" -gt 0 ] ||
     die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c: escaped_mix produced no commands, so every slot would loop forever issuing no Execs"
+  mix_expected_count="$(e11_tool_call_mix | wc -l)"
+  [ "${#mix_json[@]}" -eq "$mix_expected_count" ] ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c: escaped_mix produced ${#mix_json[@]} command(s) but e11_tool_call_mix has $mix_expected_count -- a partial escape would silently shrink the mix every slot loops over"
   local run_id_i
   for i in $(seq 1 "$c"); do
     run_id_i="$(slot_run_id "$arm" "$d" "$ram_mb" "$c" "$i")"
@@ -1372,19 +1472,21 @@ run_density_rung() {
   # ---------------------------------------------------------------------------
   # PHASE 2: the timed Exec loop, and nothing else.
   # ---------------------------------------------------------------------------
+  local sampler_file="$E11_TMPDIR/sampler-$rung_tag" sampler_stop="$E11_TMPDIR/sampler-stop-$rung_tag"
+  : >"$sampler_file"
+  rm -f "$sampler_stop"
   local wall_t0 wall_t1
   wall_t0="$(date +%s%N)"
   # The sampler brackets EXACTLY this window (issue #291 item 1). It is started after
   # wall_t0 and reaped after wall_t1, and the converge barrier above is what makes that
   # honest: with converge still inside the window, the git fetch's CPU would land in this
-  # mean and a fresh artifact would have been built.
-  local sampler_file="$E11_TMPDIR/sampler-$rung_tag" sampler_stop="$E11_TMPDIR/sampler-stop-$rung_tag"
-  : >"$sampler_file"
-  rm -f "$sampler_stop"
+  # mean and a fresh artifact would have been built. sampler_file/sampler_stop are set up
+  # (and any stale sampler_stop removed) BEFORE wall_t0 is stamped, so that bookkeeping
+  # never lands inside the timed window either.
   host_sampler_loop "$sampler_file" "$sampler_stop" &
   E11_SAMPLER_PID="$!"
   pids=()
-  for i in $(seq 1 "$c"); do
+  for ((i = 1; i <= c; i++)); do
     (
       # No run_id or workspace_key derivation in here: phase 2 needs only the pre-escaped key
       # and the req_id base, so nothing that forks happens inside the timed window.
@@ -1511,7 +1613,8 @@ run_density_rung() {
   # ---------------------------------------------------------------------------
   local cpu_samples cpu_mean cpu_peak cpu_min cores_busy ncpu
   local mem_mean mem_min pss_mean pss_peak pss_samples proc_mean proc_peak proc_samples
-  cpu_samples="$(require_numeric hostCpuSamples "$(sampler_field "$sampler_file" 1 count '%d')")" ||
+  local pss_refused_ticks
+  cpu_samples="$(require_numeric hostCpuSamples "$(sampler_field "$sampler_file" 1 count)")" ||
     die "rung arm=$arm c=$c could not count its own host samples (see the refusal above)"
   [ "$cpu_samples" -gt 0 ] ||
     die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c produced ZERO host samples over its timed window ($sampler_file is empty), so it has no under-load hostCpuFraction, memAvailableBytes, pssBytes or processCount at all. Refusing to backfill from the post-load snapshot: that idle reading IS the defect issue #291 item 1 is about, and crosses('cpu') can never fire on one. The window was shorter than ${SAMPLE_MIN_TICK_MS}ms - raise SH_E11_ITERS_PER_SLOT, or lower SH_E11_SAMPLE_INTERVAL_MS and SH_E11_SAMPLE_MIN_TICK_MS."
@@ -1531,13 +1634,21 @@ run_density_rung() {
     die "rung arm=$arm c=$c: the sampled memAvailableBytes mean failed validation (see above)"
   mem_min="$(require_numeric memAvailableBytesMin "$(sampler_field "$sampler_file" 2 min '%.0f')")" ||
     die "rung arm=$arm c=$c: memAvailableBytesMin failed validation (see above)"
-  pss_samples="$(require_numeric pssSamples "$(sampler_field "$sampler_file" 3 count '%d')")" ||
+  pss_samples="$(require_numeric pssSamples "$(sampler_field "$sampler_file" 3 count)")" ||
     die "rung arm=$arm c=$c: pssSamples failed validation (see above)"
+  # pssRefusedTicks (issue #291 item 4): a low-cadence tick where pss_bytes_for_pids DIED on
+  # an unreadable smaps_rollup for a still-live pid (spec section 7.3's boxed warning) records
+  # "refused" in this column, not "-". Without this counter that refusal was indistinguishable
+  # from an ordinary un-sampled tick -- it just vanished from pssSamples along with the record
+  # of WHY. sampler_marker_count reads the sampler file directly, so a rung whose window ends
+  # with the sampler already reaped still gets an accurate count.
+  pss_refused_ticks="$(require_numeric pssRefusedTicks "$(sampler_marker_count "$sampler_file" 3 refused)")" ||
+    die "rung arm=$arm c=$c: pssRefusedTicks failed validation (see above)"
   pss_mean="$(require_numeric pssBytes "$(sampler_field "$sampler_file" 3 mean '%.0f')")" ||
-    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c sampled $cpu_samples host ticks but not one carried a PSS reading, so Sigma PSS -- the one number spec section 7.3 insists must not be wrong -- has no under-load value for this rung. SH_E11_SAMPLE_LOW_EVERY is ${SAMPLE_LOW_EVERY}; tick 1 always carries it, so an empty column means pss_bytes_for_pids refused on every low-cadence tick (see its own refusals above)."
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c sampled $cpu_samples host ticks but not one carried a PSS reading, so Sigma PSS -- the one number spec section 7.3 insists must not be wrong -- has no under-load value for this rung. SH_E11_SAMPLE_LOW_EVERY is ${SAMPLE_LOW_EVERY}; tick 1 always carries it, so an empty column means pss_bytes_for_pids refused on every low-cadence tick ($pss_refused_ticks recorded as 'refused' -- see its own refusals above) or none ever ran."
   pss_peak="$(require_numeric pssBytesPeak "$(sampler_field "$sampler_file" 3 peak '%.0f')")" ||
     die "rung arm=$arm c=$c: pssBytesPeak failed validation (see above)"
-  proc_samples="$(require_numeric processCountSamples "$(sampler_field "$sampler_file" 4 count '%d')")" ||
+  proc_samples="$(require_numeric processCountSamples "$(sampler_field "$sampler_file" 4 count)")" ||
     die "rung arm=$arm c=$c: processCountSamples failed validation (see above)"
   proc_mean="$(require_numeric processCount "$(sampler_field "$sampler_file" 4 mean '%.0f')")" ||
     die "rung arm=$arm c=$c: the sampled processCount mean failed validation (see above)"
@@ -1636,6 +1747,11 @@ rec = {
   'memAvailableBytesMin': $mem_min,
   'pssBytesPeak': $pss_peak,
   'pssSamples': $pss_samples,
+  # A low-cadence tick that DID try to sample PSS but pss_bytes_for_pids died on an
+  # unreadable smaps_rollup for a still-live pid (spec section 7.3's boxed warning). Counted
+  # separately from pssSamples so a refusal is visible rather than indistinguishable from an
+  # ordinary un-sampled tick (issue #291 item 4).
+  'pssRefusedTicks': $pss_refused_ticks,
   'processCountPeak': $proc_peak,
   'processCountSamples': $proc_samples,
   # Old and new records both carry hostCpuFraction meaning different things; without this
@@ -1667,6 +1783,7 @@ rec = {
     'coldAcquireRate': 'latency-classification proxy (>= ${COLD_LATENCY_MS}ms), not the real replenishment signal - no stats endpoint exists',
     'standbysResident': 'proxy: max(processCount - c, 0) - no pool introspection endpoint exists',
     'pssBytesCadence': 'pssBytes and processCount are sampled every ${SAMPLE_LOW_EVERY}th sampler tick (and always tick 1), not every tick: pgrep plus an N-file smaps_rollup walk at 1 Hz perturbs the density ceiling being measured. crosses(memory) reads memAvailableBytes, which IS every tick, so the bound classification is unaffected; PSS feeds the narrative. See pssSamples and processCountSamples for the actual counts (#291).',
+    'driverControlChunkDecode': 'driver-control is a STRICT LOWER BOUND on driver-only cost, not an exact one: the null-responder sends one End and no Chunk events, so grpcurl never decodes a chunk-carrying stream on this arm, while real Execs for mix commands that produce stdout do decode one or more Chunk events per call on the container/microvm arms. Subtracting driver-control latency therefore over-attributes some residue to the backend rather than the driver (#291 item 3).',
   },
 }
 open('$out_json_path', 'w').write(json.dumps(rec, indent=2))
