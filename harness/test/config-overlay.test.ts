@@ -56,9 +56,9 @@ describe('buildCacheAcquireScript', () => {
     expect(s).toContain(': > "$REFS/leaf-1"');
   });
 
-  it('rejects a runId that could escape the refs dir or aim the teardown’s rm', () => {
+  it('rejects a sessionId that could escape the refs dir or aim the teardown’s rm', () => {
     for (const bad of ['../../etc', 'a/b', '.', '..', '', 'a b', 'a;rm -rf /'])
-      expect(() => buildCacheAcquireScript(DIGEST, bad)).toThrow(/invalid runId/i);
+      expect(() => buildCacheAcquireScript(DIGEST, bad)).toThrow(/invalid sessionId/i);
   });
 
   it('registers the ref and reads the cache under ONE flock, matching converge.ts discipline', () => {

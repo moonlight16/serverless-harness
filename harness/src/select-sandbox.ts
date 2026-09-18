@@ -109,7 +109,7 @@ function defaultExecClient(_sandboxId: string, env: NodeJS.ProcessEnv): ExecClie
 export async function selectPoolSandbox(
   env: NodeJS.ProcessEnv,
   headCwd: string,
-  runId: string,
+  sessionId: string,
   opts: { cap: number; ttlMs: number; remoteSandbox?: boolean },
   deps: SelectDeps = {},
 ): Promise<SelectedSandbox | null> {
@@ -154,7 +154,7 @@ export async function selectPoolSandbox(
     candidates.map(async (name) => ({ pod: name, active: await lease.load(name) })),
   );
   for (const name of orderByLoad(loads)) {
-    if (await lease.acquire(name, opts.cap, runId, opts.ttlMs)) {
+    if (await lease.acquire(name, opts.cap, sessionId, opts.ttlMs)) {
       const config: K8sSandboxConfig = { pod: name, namespace, context, podCwd, headCwd };
       const rec = grpcById.get(name);
       const make = deps.makeTransport ?? GrpcRelayTransport;
@@ -162,19 +162,19 @@ export async function selectPoolSandbox(
         ? make(
             name,
             (deps.makeExecClient ?? ((id: string) => defaultExecClient(id, env)))(name),
-            // The lease's run id becomes the Exec's workspace_key. This is the ONLY
+            // The lease's session id becomes the Exec's workspace_key. This is the ONLY
             // harness change the microVM tier needs, and it is required for
             // correctness rather than convenience: without it, consecutive
-            // leaseholders of one sandbox_id inherit the previous run's workspace
+            // leaseholders of one sandbox_id inherit the previous session's workspace
             // (spec §3.4).
-            { workspaceKey: runId },
+            { workspaceKey: sessionId },
           )
         : undefined;
       return {
         config,
         transport,
-        heartbeat: () => lease.heartbeat(name, runId, opts.ttlMs),
-        release: () => lease.release(name, runId),
+        heartbeat: () => lease.heartbeat(name, sessionId, opts.ttlMs),
+        release: () => lease.release(name, sessionId),
       };
     }
   }

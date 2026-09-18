@@ -14,7 +14,7 @@ describe('swebench-setup script builders', () => {
     repoUrl: '/repos/django/django.git',
     baseCommit: 'abc1234',
     envKey: 'sweb.env.py.x86_64.deadbeef:latest',
-    runId: 'run-1',
+    sessionId: 'run-1',
   };
   it('derives env_dir by stripping a trailing :latest', () => {
     expect(envDirFromKey('sweb.env.py.x86_64.deadbeef:latest')).toBe('sweb.env.py.x86_64.deadbeef');
@@ -56,7 +56,7 @@ const swebenchArgs = {
   repoUrl: '/repos/django/django.git',
   baseCommit: 'abc1234',
   envKey: 'sweb.env.py.x86_64.deadbeef:latest',
-  runId: 'run-1',
+  sessionId: 'run-1',
 };
 
 describe('setupSwebenchWorkspace', () => {

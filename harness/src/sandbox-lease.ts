@@ -11,8 +11,8 @@ export function activeCount(members: { value: string; score: number }[], now: nu
 }
 
 /**
- * Atomic acquire. KEYS[1]=leaseKey. ARGV = [now, cap, runId, expiry].
- * Sweeps expired members, then adds {runId -> expiry} iff active < cap.
+ * Atomic acquire. KEYS[1]=leaseKey. ARGV = [now, cap, sessionId, expiry].
+ * Sweeps expired members, then adds {sessionId -> expiry} iff active < cap.
  * Returns 1 (acquired) or 0 (full). Crash reclaim is implicit: a dead leaf's
  * member ages past its expiry and is swept by the next acquire (spec §4.1).
  */
@@ -28,11 +28,11 @@ export interface LeaseStore {
   /** Active (non-expired) lease count for a pod; sweeps expired as a side effect. */
   load(pod: string): Promise<number>;
   /** Try to take a lease under the soft cap. */
-  acquire(pod: string, cap: number, runId: string, ttlMs: number): Promise<boolean>;
+  acquire(pod: string, cap: number, sessionId: string, ttlMs: number): Promise<boolean>;
   /** Refresh a held lease's expiry (called on an interval while the leaf runs). */
-  heartbeat(pod: string, runId: string, ttlMs: number): Promise<void>;
+  heartbeat(pod: string, sessionId: string, ttlMs: number): Promise<void>;
   /** Drop a held lease. */
-  release(pod: string, runId: string): Promise<void>;
+  release(pod: string, sessionId: string): Promise<void>;
 }
 
 /** Real node-redis-backed lease store. Connects lazily; reuses REDIS_URL. */
@@ -51,22 +51,22 @@ export class RedisLeaseStore implements LeaseStore {
     await this.client.zRemRangeByScore(leaseKey(pod), '-inf', this.now());
     return this.client.zCard(leaseKey(pod));
   }
-  async acquire(pod: string, cap: number, runId: string, ttlMs: number): Promise<boolean> {
+  async acquire(pod: string, cap: number, sessionId: string, ttlMs: number): Promise<boolean> {
     await this.ready;
     const now = this.now();
     const res = await this.client.eval(ACQUIRE_LUA, {
       keys: [leaseKey(pod)],
-      arguments: [String(now), String(cap), runId, String(now + ttlMs)],
+      arguments: [String(now), String(cap), sessionId, String(now + ttlMs)],
     });
     return res === 1;
   }
-  async heartbeat(pod: string, runId: string, ttlMs: number): Promise<void> {
+  async heartbeat(pod: string, sessionId: string, ttlMs: number): Promise<void> {
     await this.ready;
-    await this.client.zAdd(leaseKey(pod), { score: this.now() + ttlMs, value: runId });
+    await this.client.zAdd(leaseKey(pod), { score: this.now() + ttlMs, value: sessionId });
   }
-  async release(pod: string, runId: string): Promise<void> {
+  async release(pod: string, sessionId: string): Promise<void> {
     await this.ready;
-    await this.client.zRem(leaseKey(pod), runId);
+    await this.client.zRem(leaseKey(pod), sessionId);
   }
   async close(): Promise<void> {
     await this.ready;

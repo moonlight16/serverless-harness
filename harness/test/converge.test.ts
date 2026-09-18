@@ -9,7 +9,7 @@ import {
 } from '../src/converge.js';
 
 describe('leafWorkspaceRef', () => {
-  it('is /workspace/leaves/<runId>', () => {
+  it('is /workspace/leaves/<sessionId>', () => {
     expect(leafWorkspaceRef('run-a-item-1')).toBe('/workspace/leaves/run-a-item-1');
   });
 });
