@@ -38,12 +38,20 @@ check() { if [ "$2" = "$3" ]; then echo "  ok: $1"; else
 fi; }
 
 # extract_fn prints the source text of a top-level "name() { ... }" function
-# (opening line "name() {" and closing bare "}") from $SCRIPT.
+# (opening line "name() {" and closing bare "}") from $SCRIPT. A function's own embedded
+# `python3 -c "..."` heredoc (see extract_record_writer below) can contain a dict literal
+# whose closing brace sits at column 0, colliding with the bash-function-close convention
+# this scans for -- so that whole span is skipped while looking for the real close.
 extract_fn() {
   local name="$1" start end
   start=$(grep -n "^${name}() {" "$SCRIPT" | head -n1 | cut -d: -f1)
   [ -n "$start" ] || return 1
-  end=$(awk -v s="$start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  end=$(awk -v s="$start" '
+    NR<=s { next }
+    !inpy && $0 == "  python3 -c \"" { inpy = 1; next }
+    inpy && $0 == "\"" { inpy = 0; next }
+    !inpy && /^}$/ { print NR; exit }
+  ' "$SCRIPT")
   [ -n "$end" ] || return 1
   sed -n "${start},${end}p" "$SCRIPT"
 }
@@ -1143,6 +1151,145 @@ if [ -n "$samp_body" ]; then
   rm -rf "$sp_tmpdir"
 fi
 
+# ---------------------------------------------------------------------------
+# Issue #291 item 3: converge is out of the throughput denominator.
+#
+# wall_t0 was stamped, then each slot ran converge_slot -- a git fetch -- and only then its
+# Exec loop, and wall_t1 closed after all of it. throughput = successful Execs / wall
+# seconds, so a slow fetch WAS a throughput ceiling, on both arms, by construction. The
+# header's claim that converge is timed separately was true only of p50/p95.
+#
+# run_density_rung now runs two phases with a full drain between them. Each slot's run_id,
+# workspace_key and req_base are deterministic in (arm, d, ram_mb, c, i), so phase 2
+# recomputes them and lands on the workspace phase 1 prepared, and req_id spaces stay
+# disjoint across the barrier.
+# ---------------------------------------------------------------------------
+echo "== the timed window starts AFTER every slot has converged (#291 item 3)"
+
+bar_rdr="$(extract_fn run_density_rung || true)"
+check "run_density_rung is still extractable after the phase split" \
+  "$([ -n "$bar_rdr" ] && echo yes || echo no)" "yes"
+
+if [ -n "$bar_rdr" ]; then
+  bar_line() { printf '%s\n' "$bar_rdr" | grep -n -- "$1" | head -n1 | cut -d: -f1; }
+  bar_conv="$(bar_line 'converge_slot ')"
+  bar_conv_wait="$(bar_line 'wait "\$pid" || converge_failures=')"
+  bar_t0="$(bar_line 'wall_t0="')"
+  bar_exec="$(bar_line 'grpc_exec_record ')"
+  bar_t1="$(bar_line 'wall_t1="')"
+  for pair in "converge_slot:$bar_conv" "converge wait:$bar_conv_wait" "wall_t0:$bar_t0" \
+    "grpc_exec_record:$bar_exec" "wall_t1:$bar_t1"; do
+    check "the ${pair%%:*} line is present in run_density_rung" \
+      "$([ -n "${pair##*:}" ] && echo yes || echo no)" "yes"
+  done
+  if [ -n "$bar_conv" ] && [ -n "$bar_conv_wait" ] && [ -n "$bar_t0" ] && [ -n "$bar_exec" ] && [ -n "$bar_t1" ]; then
+    check "converge_slot runs before the converge phase is drained" \
+      "$([ "$bar_conv" -lt "$bar_conv_wait" ] && echo yes || echo no)" "yes"
+    check "the converge phase is drained BEFORE wall_t0 is stamped (the barrier)" \
+      "$([ "$bar_conv_wait" -lt "$bar_t0" ] && echo yes || echo no)" "yes"
+    check "wall_t0 is stamped before the first Exec is issued" \
+      "$([ "$bar_t0" -lt "$bar_exec" ] && echo yes || echo no)" "yes"
+    check "wall_t1 closes after the last Exec" \
+      "$([ "$bar_exec" -lt "$bar_t1" ] && echo yes || echo no)" "yes"
+    check "no converge_slot call remains between wall_t0 and wall_t1" \
+      "$(printf '%s\n' "$bar_rdr" | awk -v a="$bar_t0" -v b="$bar_t1" 'NR>a && NR<b' | grep -c 'converge_slot ')" "0"
+  fi
+  check "both phases derive the run id from ONE helper, so they cannot drift" \
+    "$(printf '%s\n' "$bar_rdr" | grep -c 'slot_run_id ')" "2"
+  check "both phases derive the req_id base from ONE helper" \
+    "$(printf '%s\n' "$bar_rdr" | grep -c 'slot_req_base ')" "2"
+fi
+
+echo "== the slot-identity helpers are deterministic in (arm, d, ram_mb, c, i)"
+id_body="$(extract_fns slot_run_id slot_workspace_key slot_req_base || true)"
+check "the slot-identity helpers are extractable" \
+  "$([ -n "$id_body" ] && echo yes || echo no)" "yes"
+if [ -n "$id_body" ]; then
+  id_snippet="$(mktemp -d)/id.sh"
+  printf '%s\n' "$id_body" >"$id_snippet"
+  idf() {
+    (
+      # shellcheck disable=SC1090
+      . "$id_snippet"
+      "$@"
+    )
+  }
+  check "slot_run_id is the documented shape" \
+    "$(idf slot_run_id microvm 2 256 8 3)" "e11-microvm-d2-ram256-c8-slot3"
+  check "slot_run_id is deterministic (same args, same id)" \
+    "$([ "$(idf slot_run_id microvm 2 256 8 3)" = "$(idf slot_run_id microvm 2 256 8 3)" ] && echo yes || echo no)" "yes"
+  check "slot_run_id distinguishes slots, so two slots cannot share a workspace" \
+    "$([ "$(idf slot_run_id microvm 2 256 8 3)" != "$(idf slot_run_id microvm 2 256 8 4)" ] && echo yes || echo no)" "yes"
+  check "the microvm arm gets a non-empty workspace_key (it REFUSES an empty one)" \
+    "$(idf slot_workspace_key microvm e11-x-slot1)" "e11-x-slot1"
+  check "the container arm gets an empty workspace_key (today's shared workspace)" \
+    "$(idf slot_workspace_key container e11-x-slot1)" ""
+  check "the driver-control arm follows the container path" \
+    "$(idf slot_workspace_key driver-control e11-x-slot1)" ""
+  check "slot_req_base spaces slots a million apart" "$(idf slot_req_base 3)" "3000000"
+  check "  ...so no two slots' req_id ranges can overlap at any sane ITERS_PER_SLOT" \
+    "$([ "$(idf slot_req_base 4)" -gt "$(($(idf slot_req_base 3) + 100000))" ] && echo yes || echo no)" "yes"
+  rm -rf "$(dirname "$id_snippet")"
+fi
+
+echo "== a converge failure in phase 1 refuses the rung, and phase 2 never starts"
+# The barrier's whole point, EXECUTED rather than grepped: the real run_density_rung is run
+# with converge_slot and grpc_exec_record stubbed, so the assertion is about the real
+# control flow. A marker file records whether any Exec was issued at all.
+bar_body="$(extract_fns die log require_numeric json_escape e11_tool_call_mix escaped_mix slot_run_id slot_workspace_key slot_req_base run_density_rung || true)"
+check "run_density_rung is extractable together with its slot helpers" \
+  "$([ -n "$bar_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$bar_body" ]; then
+  bar_tmpdir="$(mktemp -d)"
+  bar_probe="$bar_tmpdir/probe.sh"
+  mkdir -p "$bar_tmpdir/results" "$bar_tmpdir/tmp"
+  {
+    echo 'set -uo pipefail'
+    printf '%s\n' "$bar_body"
+    # Stubs, defined AFTER the real functions so they win.
+    echo 'assert_relay_alive() { :; }'
+    echo 'converge_slot() { echo 5; return "$BAR_CONVERGE_RC"; }'
+    echo 'grpc_exec_record() { : >"$BAR_MARKER"; echo "1 ok -" >>"$6"; }'
+    echo 'host_sampler_loop() { :; }'
+    echo 'percentile() { echo 1; }'
+    echo 'run_density_rung "$@"'
+  } >"$bar_probe"
+
+  bar_env() {
+    env BAR_CONVERGE_RC="$1" BAR_MARKER="$bar_tmpdir/exec-was-issued" \
+      E11_TMPDIR="$bar_tmpdir/tmp" RESULTS="$bar_tmpdir/results" \
+      ITERS_PER_SLOT=1 WARMUP_PER_SLOT=0 COLD_LATENCY_MS=50 \
+      SUBSTRATE=nested-m8i REPO_CACHE_SHAPE=accept-cold-fetch \
+      PROC_ROOT="$bar_tmpdir/proc" VMM_PROC_PATTERN=__none__ VIRTIOFSD_PROC_PATTERN=__none__ \
+      SAMPLE_INTERVAL_MS=1000 SAMPLE_SLICE_MS=100 SAMPLE_MIN_TICK_MS=200 SAMPLE_LOW_EVERY=5 \
+      EXEC_MAX_TIME_S=45 PROTO_IMPORT_PATH=/tmp PROTO_REL_PATH=x.proto \
+      bash "$bar_probe" container - - 2 e11-test 8444 "$bar_tmpdir/out.json"
+  }
+
+  rm -f "$bar_tmpdir/exec-was-issued"
+  bar_fail_rc=0
+  bar_fail_out="$(bar_env 1 2>&1)" || bar_fail_rc=$?
+  check "a converge failure in phase 1 makes the rung exit NONZERO" \
+    "$([ "$bar_fail_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  case "$bar_fail_out" in *"slot(s) fail before their timed loop"*) bar_named=yes ;; *) bar_named=no ;; esac
+  check "  ...with the refusal that names the rung and the count" "$bar_named" "yes"
+  check "  ...and NOT ONE Exec was issued: the barrier held" \
+    "$([ -e "$bar_tmpdir/exec-was-issued" ] && echo issued || echo none)" "none"
+  check "  ...and no rung record was written" \
+    "$([ -s "$bar_tmpdir/out.json" ] && echo wrote || echo nothing)" "nothing"
+
+  # NON-VACUOUSNESS: with converge SUCCEEDING, the same probe does reach phase 2. Without
+  # this, "none" above could mean the probe never ran at all. Only the marker is asserted --
+  # the probe is free to die later, in the record writer it has no real inputs for.
+  rm -f "$bar_tmpdir/exec-was-issued" "$bar_tmpdir/out.json"
+  bar_env 0 >/dev/null 2>&1 || true
+  check "non-vacuousness: with converge succeeding, phase 2 DOES issue Execs" \
+    "$([ -e "$bar_tmpdir/exec-was-issued" ] && echo issued || echo none)" "issued"
+
+  rm -rf "$bar_tmpdir"
+fi
+
 echo "== a FAILED converge is not recorded as a fast converge"
 # converge_slot used to discard grpcurl's status and return the timing anyway, so a converge
 # that never prepared the workspace still produced a small convergeMsP50 -- wrong in the
@@ -1151,8 +1298,13 @@ check "converge_slot returns the RPC's own status" \
   "$([ "$(printf '%s\n' "$(extract_fn converge_slot)" | grep -c 'return "\$rc"')" -ge 1 ] && echo yes || echo no)" "yes"
 check "a slot whose converge failed exits non-zero instead of continuing" \
   "$([ "$(grep -c 'converge FAILED after' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
-check "and every slot's exit status is checked, not discarded by a bare wait" \
-  "$(grep -c 'wait "\$pid" || slot_failures=' "$SCRIPT")" "1"
+# Two wait loops since the converge barrier landed (#291 item 3): one per phase, each
+# checking every slot's status. A bare `wait` in either would discard the reason a slot
+# failed.
+check "the converge phase checks every slot's exit status, not a bare wait" \
+  "$(grep -c 'wait "\$pid" || converge_failures=' "$SCRIPT")" "1"
+check "the timed phase checks every slot's exit status too" \
+  "$(grep -c 'wait "\$pid" || exec_failures=' "$SCRIPT")" "1"
 check "  ...with the rung refused when any slot failed" \
   "$([ "$(grep -c 'slot(s) fail before their timed loop' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 

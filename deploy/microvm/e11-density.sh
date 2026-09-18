@@ -898,6 +898,37 @@ SCRIPT
 # req_id is a PARAMETER, not the constant 0 it used to be. Every slot's converge used
 # req_id 0 against one shared sandbox_id, so at c>=2 two concurrent converges collided --
 # see run_density_rung's own comment for what that collision does.
+# ---------------------------------------------------------------------------
+# Slot identity (issue #291 item 3). Phase 2 RECOMPUTES a slot's identity rather than
+# inheriting it from phase 1 -- the two phases are different subshells -- so all three
+# derivations live in one place each and cannot drift into two slots sharing a workspace or
+# a req_id space.
+# ---------------------------------------------------------------------------
+slot_run_id() {
+  printf 'e11-%s-d%s-ram%s-c%s-slot%s' "$1" "$2" "$3" "$4" "$5"
+}
+
+# The microvm arm REFUSES an empty workspace_key (proto/sandbox/v1/sandbox.proto's own doc
+# comment on Exec.workspace_key); the container arm may omit it, which means today's single
+# shared workspace. The driver-control arm follows the container path.
+slot_workspace_key() {
+  local arm="$1" run_id="$2"
+  case "$arm" in
+  microvm) printf '%s' "$run_id" ;;
+  *) : ;;
+  esac
+}
+
+# A DISJOINT req_id space per slot, base 1000000 apart. Every slot in a rung talks to ONE
+# shared sandbox_id and the relay demultiplexes responses BY req_id, so uniqueness is the
+# caller's job: two concurrent Execs sharing a req_id collide, and on the validation rig one
+# of the pair got the other's chunks and hung for 33 minutes. Converge uses the base itself
+# and the Exec mix counts up from it, and phase 1 drains fully before phase 2 issues
+# anything, so the collision cannot recur across the barrier either.
+slot_req_base() {
+  echo $(($1 * 1000000))
+}
+
 converge_slot() {
   local relay_port="$1" sandbox_id="$2" workspace_key="$3" run_id="$4" req_id="$5"
   local script t0 t1 rc=0
@@ -1148,63 +1179,68 @@ run_density_rung() {
   converge_file="$E11_TMPDIR/converge-$rung_tag"
   : >"$converge_file"
 
-  # Payload construction happens HERE, before timing starts -- spec section 1: "pre-escape
-  # the 7 mix commands and the slot's workspace_key once per slot, before timing starts".
-  # The mix is identical for every slot, so it is escaped once per RUNG; the workspace keys
-  # differ, so there is one per slot. Both are plain shell variables, which the slot
-  # subshells below inherit.
+  # ---------------------------------------------------------------------------
+  # PHASE 1: converge, OUTSIDE the timed window (issue #291 item 3).
   #
-  # json_escape (python3) is still what does the escaping, so the bytes are identical BY
-  # CONSTRUCTION rather than by a reimplementation of JSON escaping in bash -- which is where
-  # this change's real risk was. It just runs 7 + c times per rung instead of twice per Exec.
-  local -a mix_json=() ws_json_by_slot=()
-  mapfile -t mix_json < <(escaped_mix)
-  [ "${#mix_json[@]}" -gt 0 ] ||
-    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c: escaped_mix produced no commands, so every slot would loop forever issuing no Execs"
-  local i run_id_i wskey_i
-  for i in $(seq 1 "$c"); do
-    run_id_i="e11-${arm}-d${d}-ram${ram_mb}-c${c}-slot${i}"
-    wskey_i=""
-    if [ "$arm" = "microvm" ]; then
-      wskey_i="$run_id_i" # microvm arm REFUSES an empty workspace_key (proto doc comment)
-    fi                    # container arm may omit/empty it (today's single shared workspace)
-    ws_json_by_slot[i]="$(json_escape "$wskey_i")"
-  done
-
-  local wall_t0 wall_t1 pids=()
-  wall_t0="$(date +%s%N)"
+  # Every slot converges and exits; all are waited on. A non-zero exit still refuses the
+  # rung, preserving the guarantee that a rung whose slots were not all measuring the same
+  # thing is never recorded. Nothing here is inside wall_t0..wall_t1, so a slow git fetch can
+  # no longer sit in the throughput denominator -- which is what made converge a throughput
+  # ceiling on BOTH arms by construction.
+  # ---------------------------------------------------------------------------
+  local i pids=() pid
   for i in $(seq 1 "$c"); do
     (
-      local wskey="" run_id="e11-${arm}-d${d}-ram${ram_mb}-c${c}-slot${i}"
-      if [ "$arm" = "microvm" ]; then
-        wskey="$run_id" # microvm arm REFUSES an empty workspace_key (proto doc comment)
-      fi               # container arm may omit/empty it (today's single shared workspace)
-
-      # A DISJOINT req_id space per slot. Every slot in this rung talks to ONE shared
-      # sandbox_id, and the relay demultiplexes responses BY req_id (spec 3.1: req_id is
-      # "only probabilistically unique across replicas", so uniqueness is the caller's
-      # job). Two concurrent Execs sharing a req_id therefore collide: on the validation
-      # rig one of the pair got the other's chunks -- with no reqId field on them -- and
-      # the loser's stream was never terminated, hanging for 33 minutes until killed. That
-      # is why the ladder could only ever complete its c=1 rung.
-      #
-      # Isolated with a three-arm probe before this fix was written: one Exec alone
-      # succeeded (30ms); two concurrent with the SAME req_id wedged one of them; two
-      # concurrent with DIFFERENT req_ids both succeeded (27ms, 28ms). So the collision is
-      # the cause, and disjoint spaces are the fix.
-      #
-      # Base 1000000 per slot, converge at the base and the Exec mix above it: disjoint for
-      # any ITERS_PER_SLOT below a million, which it always is.
-      local req_base=$((i * 1000000))
-      local cms cms_rc=0
-      cms="$(converge_slot "$relay_port" "$sandbox_id" "$wskey" "$run_id" "$req_base")" || cms_rc=$?
+      local run_id wskey cms cms_rc=0
+      run_id="$(slot_run_id "$arm" "$d" "$ram_mb" "$c" "$i")"
+      wskey="$(slot_workspace_key "$arm" "$run_id")"
+      cms="$(converge_slot "$relay_port" "$sandbox_id" "$wskey" "$run_id" "$(slot_req_base "$i")")" || cms_rc=$?
       echo "$cms" >>"$converge_file"
       if [ "$cms_rc" -ne 0 ]; then
         echo "e11: slot $i: converge FAILED after ${cms}ms (see $RESULTS/e11-converge.log) - its workspace was never prepared, so its Exec timings would measure something else" >&2
         exit 1
       fi
+    ) &
+    pids+=("$!")
+  done
+  local converge_failures=0
+  for pid in "${pids[@]}"; do
+    wait "$pid" || converge_failures=$((converge_failures + 1))
+  done
+  [ "$converge_failures" -eq 0 ] ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c had $converge_failures of $c slot(s) fail before their timed loop (the reason is above, and in $RESULTS/e11-converge.log) - refusing to record a rung whose slots were not all measuring the same thing"
 
-      local times_file="$slot_dir/slot-$i.times" err_log="$slot_dir/slot-$i.err" req="$req_base"
+  # ---------------------------------------------------------------------------
+  # Payload construction, still BEFORE timing starts (issue #291 item 2). This block MOVES
+  # here from just above wall_t0, where Task 1 put it -- spec section 1: "pre-escape the 7 mix
+  # commands and the slot's workspace_key once per slot, before timing starts". The
+  # derivations now go through the same helpers phase 1 uses, so the two cannot drift.
+  # ---------------------------------------------------------------------------
+  local -a mix_json=() ws_json_by_slot=()
+  mapfile -t mix_json < <(escaped_mix)
+  [ "${#mix_json[@]}" -gt 0 ] ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c: escaped_mix produced no commands, so every slot would loop forever issuing no Execs"
+  local run_id_i
+  for i in $(seq 1 "$c"); do
+    run_id_i="$(slot_run_id "$arm" "$d" "$ram_mb" "$c" "$i")"
+    ws_json_by_slot[i]="$(json_escape "$(slot_workspace_key "$arm" "$run_id_i")")"
+  done
+
+  # ---------------------------------------------------------------------------
+  # PHASE 2: the timed Exec loop, and nothing else.
+  # ---------------------------------------------------------------------------
+  local wall_t0 wall_t1
+  wall_t0="$(date +%s%N)"
+  pids=()
+  for i in $(seq 1 "$c"); do
+    (
+      # No run_id or workspace_key derivation in here: phase 2 needs only the pre-escaped key
+      # and the req_id base, so nothing that forks happens inside the timed window.
+      local req_base req
+      req_base="$(slot_req_base "$i")"
+      req="$req_base"
+
+      local times_file="$slot_dir/slot-$i.times" err_log="$slot_dir/slot-$i.err"
       # Pre-escaped above, before wall_t0. Parameter expansion, not a command substitution:
       # `local x="$(...)"` would trip SC2155, which is a WARNING and so a lint failure here.
       local ws_json="${ws_json_by_slot[$i]}"
@@ -1226,17 +1262,13 @@ run_density_rung() {
     ) &
     pids+=("$!")
   done
-  # Each slot's exit status is CHECKED, not discarded: a slot exits non-zero only when its
-  # converge failed, which means its Exec timings measured a workspace that was never
-  # prepared. Recording that rung would put a fast-looking p95 and a small convergeMsP50
-  # into the ladder.
-  local pid slot_failures=0
+  local exec_failures=0
   for pid in "${pids[@]}"; do
-    wait "$pid" || slot_failures=$((slot_failures + 1))
+    wait "$pid" || exec_failures=$((exec_failures + 1))
   done
-  [ "$slot_failures" -eq 0 ] ||
-    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c had $slot_failures of $c slot(s) fail before their timed loop (the reason is above, and in $RESULTS/e11-converge.log) - refusing to record a rung whose slots were not all measuring the same thing"
   wall_t1="$(date +%s%N)"
+  [ "$exec_failures" -eq 0 ] ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c had $exec_failures of $c slot(s) fail inside the timed loop - refusing to record a rung whose slots were not all measuring the same thing"
   local wall_s
   wall_s="$(require_numeric wallSeconds "$(awk -v ns=$((wall_t1 - wall_t0)) 'BEGIN{printf "%.4f", ns/1000000000.0}')")" ||
     die "rung arm=$arm c=$c could not measure its own wall time (see the refusal above) - throughput is derived from it, so there is nothing to record"
