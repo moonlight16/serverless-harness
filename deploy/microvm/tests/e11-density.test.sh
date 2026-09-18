@@ -1865,6 +1865,116 @@ check "every temp path lives under the trap-owned root, not a bare mktemp local"
 check "the temp root itself is created once, at script scope" \
   "$(grep -c '^E11_TMPDIR="\$(mktemp -d' "$SCRIPT")" "1"
 
+# ---------------------------------------------------------------------------
+# A read that fails AFTER `-r` passed: race vs refusal (issue #291 shakedown).
+#
+# /proc/<pid>/smaps_rollup passes a mode-bits `-r` test but its open is gated by ptrace
+# permissions, and the pid can also exit in the window between the test and the read. Both were
+# observed on real hardware, and unhandled BOTH silently contributed 0 kB to Sigma PSS -- awk's
+# failure left pid_kb empty and bash arithmetic reads an empty string as 0. That is the
+# RSS-fallback failure mode in disguise: the one number spec section 7.3 boxes as
+# non-negotiable, under-reported in the optimistic direction, record still looking complete.
+#
+# awk is stubbed to fail rather than simulated into failing, so the branch is exercised
+# deterministically on any platform.
+# ---------------------------------------------------------------------------
+echo "== a smaps read that fails after -r passed: alive REFUSES, exited is a silent race"
+
+race_body="$(extract_fns die pss_bytes_for_pids || true)"
+check "pss_bytes_for_pids is extractable for the race test" \
+  "$([ -n "$race_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$race_body" ]; then
+  race_tmpdir="$(mktemp -d)"
+  race_snippet="$race_tmpdir/race.sh"
+  printf '%s\n' "$race_body" >"$race_snippet"
+  race_proc="$race_tmpdir/proc"
+
+  # --- ALIVE and unreadable: must refuse. A real live pid, so kill -0 succeeds.
+  race_marker="$(marker_token race)"
+  spawn_marker_process "$race_marker"
+  race_live="$MARKER_PID"
+  mkdir -p "$race_proc/$race_live"
+  printf 'Pss:                 512 kB\n' >"$race_proc/$race_live/smaps_rollup"
+  # NON-VACUOUSNESS: with awk working, this pid reads fine and contributes its 512 kB.
+  race_ok=$(
+    PROC_ROOT="$race_proc"
+    # shellcheck disable=SC1090
+    . "$race_snippet"
+    pss_bytes_for_pids "$race_live"
+  )
+  check "non-vacuousness: with a working awk the live pid contributes its PSS" "$race_ok" "524288"
+  race_rc=0
+  race_out=$(
+    (
+      PROC_ROOT="$race_proc"
+      # shellcheck disable=SC1090
+      . "$race_snippet"
+      # Stub AFTER sourcing so it shadows the real awk inside pss_bytes_for_pids.
+      awk() { return 1; }
+      pss_bytes_for_pids "$race_live"
+    ) 2>&1
+  ) || race_rc=$?
+  check "a failed read on a LIVE pid refuses (nonzero), rather than contributing 0" \
+    "$([ "$race_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  case "$race_out" in *"$race_live"*) race_named=yes ;; *) race_named=no ;; esac
+  check "  ...and the refusal names the pid" "$race_named" "yes"
+  case "$race_out" in *SH_E11_VMM_PROC_PATTERN*) race_hint=yes ;; *) race_hint=no ;; esac
+  check "  ...and points at the unscoped pattern, the likeliest cause" "$race_hint" "yes"
+  stop_marker_process "$race_live"
+
+  # --- EXITED: a race. Contributes 0, exits clean, and prints NOTHING -- the noise that made a
+  # benign race look like a defect (14 awk fatal lines in one three-arm smoke).
+  race_dead=999999
+  mkdir -p "$race_proc/$race_dead"
+  printf 'Pss:                 512 kB\n' >"$race_proc/$race_dead/smaps_rollup"
+  race_dead_rc=0
+  race_dead_err=$(
+    (
+      PROC_ROOT="$race_proc"
+      # shellcheck disable=SC1090
+      . "$race_snippet"
+      awk() { return 1; }
+      pss_bytes_for_pids "$race_dead" >/dev/null
+    ) 2>&1
+  ) || race_dead_rc=$?
+  check "a failed read on an EXITED pid is a race: exit 0, not a refusal" "$race_dead_rc" "0"
+  check "  ...and it prints nothing at all (no awk fatal noise)" "$race_dead_err" ""
+  race_dead_val=$(
+    (
+      PROC_ROOT="$race_proc"
+      # shellcheck disable=SC1090
+      . "$race_snippet"
+      awk() { return 1; }
+      pss_bytes_for_pids "$race_dead"
+    ) 2>/dev/null
+  )
+  check "  ...and the exited pid contributes 0 bytes" "$race_dead_val" "0"
+
+  rm -rf "$race_tmpdir"
+fi
+
+echo "== a thin rung warns at run time instead of passing unremarked"
+# hostCpuSamples is recorded, but it is one field in a 30-field record and a 1-2 sample mean
+# cannot support a saturation verdict. Both arms measured at 75-256 Exec/sec on the nested rig
+# produced exactly one sample at the shipped ITERS_PER_SLOT, so this is the common case, not the
+# corner case. It must WARN, not refuse -- a thin rung is legitimate.
+thin_rdr="$(extract_fn run_density_rung || true)"
+if [ -n "$thin_rdr" ]; then
+  check "run_density_rung warns when a rung is built from very few host samples" \
+    "$([ "$(printf '%s\n' "$thin_rdr" | grep -c 'produced only \$cpu_samples host sample')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "  ...as a log, NOT a die (a thin rung is legitimate)" \
+    "$(printf '%s\n' "$thin_rdr" | grep 'produced only \$cpu_samples host sample' | grep -c '^ *log ')" "1"
+  check "  ...and it names both knobs an operator would reach for" \
+    "$([ "$(printf '%s\n' "$thin_rdr" | grep 'produced only' | grep -c 'SH_E11_ITERS_PER_SLOT.*SH_E11_SAMPLE_INTERVAL_MS')" -ge 1 ] && echo yes || echo no)" "yes"
+  thin_warn_line="$(printf '%s\n' "$thin_rdr" | grep -n 'cpu_samples" -lt 5' | head -n1 | cut -d: -f1)"
+  thin_mean_line="$(printf '%s\n' "$thin_rdr" | grep -n 'require_numeric hostCpuFraction' | head -n1 | cut -d: -f1)"
+  check "the warning is evaluated after the sample count is known" \
+    "$([ -n "$thin_warn_line" ] && [ -n "$thin_mean_line" ] && [ "$thin_warn_line" -lt "$thin_mean_line" ] && echo yes || echo no)" "yes"
+fi
+check "the ITERS_PER_SLOT default carries the >=10-ticks sizing rule" \
+  "$([ "$(grep -c 'AT LEAST ~10 SAMPLER TICKS' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
 echo "== RSS is never read as a fallback anywhere pss_bytes_for_pids or its callers run"
 # Comment lines (the header's own disclosure that RSS/VmRSS is deliberately
 # avoided) are stripped first, so this targets actual code, not prose that

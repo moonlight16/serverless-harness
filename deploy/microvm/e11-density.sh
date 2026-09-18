@@ -190,6 +190,14 @@ read -r -a E11_ARMS <<<"${SH_E11_ARMS-container microvm driver-control}"
 # arm must never measure.
 NULL_RESPONDER_PORT="${SH_E11_NULL_RESPONDER_PORT:-8445}"
 
+# SIZE THIS SO EVERY WINDOW SPANS AT LEAST ~10 SAMPLER TICKS. The default of 20 is a floor for
+# the SLOW arms, not a recommendation for the fast ones: measured on the nested-m8i rig during
+# issue #291's shakedown, the container and driver-control arms sustain 75-256 Exec/sec, so a
+# 23-Exec slot closes its window in well under one 1 Hz tick and the rung records hostCpuSamples=1
+# with hostCpuFractionPeak == hostCpuFraction. A one-sample mean is not a number to score
+# crosses('cpu')'s >= 0.9 against. The microvm arm needs no adjustment (it ran 25 samples at this
+# default, being ~15x slower per Exec). Raise this, or lower SH_E11_SAMPLE_INTERVAL_MS, and check
+# hostCpuSamples in the records before quoting any CPU figure.
 ITERS_PER_SLOT="${SH_E11_ITERS_PER_SLOT:-20}"
 WARMUP_PER_SLOT="${SH_E11_WARMUP_PER_SLOT:-3}"
 
@@ -505,8 +513,28 @@ pss_bytes_for_pids() {
       fi
       continue # pid exited between discovery and sampling; not an unreadable file
     fi
-    local pid_kb
-    pid_kb="$(awk '/^Pss:/{sum+=$2} END{print sum+0}' "$smaps")"
+    # The read can still fail AFTER `-r` said it would succeed, and the two causes need
+    # OPPOSITE handling. Observed on both rigs during issue #291's shakedown:
+    #   - the pid exited in the window between the test and the read. A race; it contributes 0,
+    #     which is correct. Unhandled, awk printed `fatal: cannot open file` to stderr on every
+    #     occurrence -- 14 lines in one three-arm smoke -- which reads like a defect and is not.
+    #   - the open was REFUSED while the process is still alive: /proc/<pid>/smaps_rollup passes
+    #     a mode-bits `-r` test but is gated by ptrace permissions, so another user's process
+    #     yields EPERM. Seen on the metal box, where an unscoped `pgrep -f firecracker` matched a
+    #     colleague's `more firecracker-jailer-snapshot.sh`.
+    # Unhandled, BOTH silently contributed 0: awk's failure left pid_kb empty and bash arithmetic
+    # treats an empty string as 0. That is the RSS-fallback failure mode wearing different
+    # clothes -- Sigma PSS quietly under-reported, in the optimistic direction, with the record
+    # still looking complete. So a live-but-unreadable pid now takes the spec section 7.3 refusal
+    # it was always supposed to take.
+    local pid_kb pid_rc=0
+    pid_kb="$(awk '/^Pss:/{sum+=$2} END{print sum+0}' "$smaps" 2>/dev/null)" || pid_rc=$?
+    if [ "$pid_rc" -ne 0 ] || [ -z "$pid_kb" ]; then
+      if kill -0 "$pid" 2>/dev/null; then
+        die "smaps_rollup for pid $pid ($smaps) passed a readability test and then FAILED to read while the process is still alive - refusing to let it contribute 0 bytes to Sigma PSS (spec section 7.3's boxed warning). Most likely the pid is not ours: check SH_E11_VMM_PROC_PATTERN, which is matched with an unscoped pgrep -f and will pick up any process whose command line contains the pattern, including another user's."
+      fi
+      continue # exited between the readability test and the read; a race, not a bad file
+    fi
     total_kb=$((total_kb + pid_kb))
   done
   echo $((total_kb * 1024))
@@ -1645,6 +1673,12 @@ run_density_rung() {
     die "rung arm=$arm c=$c could not count its own host samples (see the refusal above)"
   [ "$cpu_samples" -gt 0 ] ||
     die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c produced ZERO host samples over its timed window ($sampler_file is empty), so it has no under-load hostCpuFraction, memAvailableBytes, pssBytes or processCount at all. Refusing to backfill from the post-load snapshot: that idle reading IS the defect issue #291 item 1 is about, and crosses('cpu') can never fire on one. The window was shorter than ${SAMPLE_MIN_TICK_MS}ms - raise SH_E11_ITERS_PER_SLOT, or lower SH_E11_SAMPLE_INTERVAL_MS and SH_E11_SAMPLE_MIN_TICK_MS."
+  # A thin rung is legitimate (a fast arm at low c) and is NOT refused -- but it must not pass
+  # unremarked, because hostCpuSamples is easy to miss in a 30-field record and a 1-2 sample mean
+  # cannot support a saturation verdict. Warn at run time, where the operator is actually looking.
+  if [ "$cpu_samples" -lt 5 ]; then
+    log "WARNING: rung arm=$arm c=$c produced only $cpu_samples host sample(s) over its timed window - its hostCpuFraction is a mean of $cpu_samples tick(s) and must NOT be used to score a CPU saturation verdict. Raise SH_E11_ITERS_PER_SLOT (currently $ITERS_PER_SLOT) or lower SH_E11_SAMPLE_INTERVAL_MS (currently ${SAMPLE_INTERVAL_MS}ms) so the window spans >=10 ticks."
+  fi
   cpu_mean="$(require_numeric hostCpuFraction "$(sampler_field "$sampler_file" 1 mean '%.4f')")" ||
     die "rung arm=$arm c=$c: the sampled hostCpuFraction mean failed validation (see above)"
   cpu_peak="$(require_numeric hostCpuFractionPeak "$(sampler_field "$sampler_file" 1 peak '%.4f')")" ||
