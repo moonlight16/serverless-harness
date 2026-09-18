@@ -849,6 +849,7 @@ if [ -n "$ep_body" ]; then
   (
     # shellcheck disable=SC1090
     . "$ep_snippet"
+    unset EPOCHREALTIME
     EPOCHREALTIME='1789672470.123935'
     require_epochrealtime
   ) >/dev/null 2>&1 || ep_ok_rc=$?
@@ -884,6 +885,262 @@ if [ -n "$pe_rdr" ]; then
   fi
   check "the mix is escaped exactly once per rung, not once per slot" \
     "$(printf '%s\n' "$pe_rdr" | grep -c 'mapfile -t mix_json')" "1"
+fi
+
+# ---------------------------------------------------------------------------
+# Issue #291 item 1: host resource signals are sampled DURING the timed window.
+#
+# host_signals_snapshot was called after every slot subshell had exited and after the
+# throughput window closed, and host_cpu_fraction then SLEPT ONE SECOND and diffed
+# /proc/stat across that window -- so hostCpuFraction, memAvailableBytes and pssBytes all
+# described a quiesced machine. The recorded values contain their own falsification: 0.0006
+# on a 72-cpu host is 0.043 cores busy, while the same rung sustained ~41 Exec/sec at ~9
+# spawns each, on the order of 370 process creations per second.
+#
+# Worse than weak: crosses('cpu') in experiments/src/microvm-density.ts reads
+# hostCpuFraction >= 0.9, so a post-load 0.0006 makes the `cpu` bound STRUCTURALLY unable to
+# fire at any rung. EXPERIMENTS.md's "no CPU ceiling was reached" is a restatement of the
+# sampling bug, not a finding.
+#
+# The sampler that replaces it must not become the next artifact: reading 128 smaps_rollup
+# files per second while measuring a density ceiling perturbs the thing under test. So the
+# every-tick path uses only builtins, and the pgrep + N-file walk runs every Nth tick.
+# ---------------------------------------------------------------------------
+echo "== the sampler's every-tick path uses only builtins (#291 item 1)"
+
+samp_body="$(extract_fns die set_epoch_ms discover_pids pss_bytes_for_pids proc_stat_totals proc_meminfo_available host_sampler_tick host_sampler_loop || true)"
+check "the sampler functions are extractable" "$([ -n "$samp_body" ] && echo yes || echo no)" "yes"
+
+# The every-tick path must contain no external command. awk, sleep, date, pgrep, python3 and
+# wc are all forks; `sleep` is legitimate in host_sampler_loop's slice wait but must not
+# appear in the tick itself, and pgrep/awk reach the tick only through the low-cadence
+# branch, which is guarded.
+tick_only="$(extract_fn host_sampler_tick | grep -v '^[[:space:]]*#' || true)"
+check "host_sampler_tick body is extractable" "$([ -n "$tick_only" ] && echo yes || echo no)" "yes"
+tick_forks() { printf '%s\n' "$1" | grep -cE '\bawk\b|\bsleep\b|date \+|\bpython3\b|\bwc\b|\bcat\b'; }
+check "non-vacuousness: the fork detector flags an awk in a tick" \
+  "$(tick_forks '  frac="$(awk -v x=1 "BEGIN{print x}")"')" "1"
+if [ -n "$tick_only" ]; then
+  check "host_sampler_tick calls no awk, sleep, date, python3, wc or cat" \
+    "$(tick_forks "$tick_only")" "0"
+  check "  ...and formats the CPU fraction with printf -v (a builtin, not a subshell)" \
+    "$([ "$(printf '%s\n' "$tick_only" | grep -c 'printf -v')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "  ...and the pgrep walk is behind the low-cadence guard, not on every tick" \
+    "$([ "$(printf '%s\n' "$tick_only" | grep -c 'SAMPLE_LOW_EVERY')" -ge 1 ] && echo yes || echo no)" "yes"
+fi
+
+if [ -n "$samp_body" ]; then
+  sp_tmpdir="$(mktemp -d)"
+  sp_snippet="$sp_tmpdir/samp.sh"
+  printf '%s\n' "$samp_body" >"$sp_snippet"
+  sp_proc="$sp_tmpdir/proc"
+  mkdir -p "$sp_proc"
+
+  # --- CPU diff correctness, against two hand-written /proc/stat snapshots.
+  # Snapshot A: user=100 nice=0 system=100 idle=800 iowait=0, total 1000, idle+iowait 800.
+  # Snapshot B: user=600 nice=0 system=100 idle=1300 iowait=0, total 2000, idle+iowait 1300.
+  # dt=1000, di=500 -> busy fraction 1 - 500/1000 = 0.5000.
+  printf 'cpu  100 0 100 800 0 0 0 0 0 0\ncpu0 100 0 100 800 0 0 0 0 0 0\n' >"$sp_proc/stat"
+  printf 'MemTotal:       16384000 kB\nMemFree:            1000 kB\nMemAvailable:    8192000 kB\n' >"$sp_proc/meminfo"
+
+  sp_line=$(
+    PROC_ROOT="$sp_proc"
+    SAMPLE_LOW_EVERY=1000 # so tick 1 takes the LOW-cadence branch only if tick==1 forces it
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    proc_stat_totals
+    # shellcheck disable=SC2154 # assigned by proc_stat_totals, sourced above
+    SAMPLE_PREV_IDLE="$SAMPLE_IDLE"
+    # shellcheck disable=SC2154
+    SAMPLE_PREV_TOTAL="$SAMPLE_TOTAL"
+    SAMPLE_TICK=0 # the script-scope declaration is not in the extracted snippet
+    printf 'cpu  600 0 100 1300 0 0 0 0 0 0\ncpu0 600 0 100 1300 0 0 0 0 0 0\n' >"$PROC_ROOT/stat"
+    host_sampler_tick "$sp_tmpdir/out"
+    cat "$sp_tmpdir/out"
+  )
+  check "the CPU diff over two hand-written /proc/stat snapshots is 0.5000" \
+    "$(printf '%s\n' "$sp_line" | awk '{print $1}')" "0.5000"
+  check "MemAvailable is parsed from a fake /proc/meminfo and converted to bytes" \
+    "$(printf '%s\n' "$sp_line" | awk '{print $2}')" "8388608000"
+  check "the tick emits exactly one line" "$(printf '%s\n' "$sp_line" | wc -l | tr -d ' ')" "1"
+  rm -f "$sp_tmpdir/out"
+
+  # --- A zero-delta snapshot pair is 0.0000, not a division by zero.
+  printf 'cpu  100 0 100 800 0 0 0 0 0 0\n' >"$sp_proc/stat"
+  sp_zero=$(
+    PROC_ROOT="$sp_proc"
+    SAMPLE_LOW_EVERY=1000
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    proc_stat_totals
+    SAMPLE_PREV_IDLE="$SAMPLE_IDLE"
+    SAMPLE_PREV_TOTAL="$SAMPLE_TOTAL"
+    SAMPLE_TICK=0 # the script-scope declaration is not in the extracted snippet
+    host_sampler_tick "$sp_tmpdir/out"
+    awk '{print $1}' "$sp_tmpdir/out"
+  )
+  check "an identical snapshot pair yields 0.0000, not a divide-by-zero" "$sp_zero" "0.0000"
+  rm -f "$sp_tmpdir/out"
+
+  # --- A fully busy window is 1.0000 and never exceeds it.
+  printf 'cpu  100 0 100 800 0 0 0 0 0 0\n' >"$sp_proc/stat"
+  sp_busy=$(
+    PROC_ROOT="$sp_proc"
+    SAMPLE_LOW_EVERY=1000
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    proc_stat_totals
+    SAMPLE_PREV_IDLE="$SAMPLE_IDLE"
+    SAMPLE_PREV_TOTAL="$SAMPLE_TOTAL"
+    SAMPLE_TICK=0 # the script-scope declaration is not in the extracted snippet
+    printf 'cpu  1100 0 100 800 0 0 0 0 0 0\n' >"$PROC_ROOT/stat"
+    host_sampler_tick "$sp_tmpdir/out"
+    awk '{print $1}' "$sp_tmpdir/out"
+  )
+  check "a window with zero idle jiffies is 1.0000 (the value crosses('cpu') tests at 0.9)" \
+    "$sp_busy" "1.0000"
+  rm -f "$sp_tmpdir/out"
+
+  # --- No MemAvailable line: 0, and still one clean line (the H2 class, in the sampler).
+  printf 'MemTotal:       16384000 kB\n' >"$sp_proc/meminfo"
+  printf 'cpu  100 0 100 800 0 0 0 0 0 0\n' >"$sp_proc/stat"
+  sp_nomem=$(
+    PROC_ROOT="$sp_proc"
+    SAMPLE_LOW_EVERY=1000
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    proc_stat_totals
+    SAMPLE_PREV_IDLE="$SAMPLE_IDLE"
+    SAMPLE_PREV_TOTAL="$SAMPLE_TOTAL"
+    SAMPLE_TICK=0 # the script-scope declaration is not in the extracted snippet
+    host_sampler_tick "$sp_tmpdir/out"
+    cat "$sp_tmpdir/out"
+  )
+  check "no MemAvailable line -> 0 bytes, on one line" \
+    "$(printf '%s\n' "$sp_nomem" | awk '{print $2}')" "0"
+  check "  ...and still exactly one line (no two-line value, the H2 shape)" \
+    "$(printf '%s\n' "$sp_nomem" | wc -l | tr -d ' ')" "1"
+  printf 'MemTotal:       16384000 kB\nMemFree:            1000 kB\nMemAvailable:    8192000 kB\n' >"$sp_proc/meminfo"
+  rm -f "$sp_tmpdir/out"
+
+  # --- The low cadence: tick 1 always carries pss/processCount (so a rung can never end
+  # with zero of them while having CPU samples), then every SAMPLE_LOW_EVERY'th tick.
+  sp_marker="$(marker_token sampler)"
+  spawn_marker_process "$sp_marker"
+  sp_live="$MARKER_PID"
+  mkdir -p "$sp_proc/$sp_live"
+  printf 'Pss:                 512 kB\n' >"$sp_proc/$sp_live/smaps_rollup"
+  sp_cad=$(
+    PROC_ROOT="$sp_proc"
+    SAMPLE_LOW_EVERY=3
+    VMM_PROC_PATTERN="$sp_marker"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    proc_stat_totals
+    # shellcheck disable=SC2034
+    SAMPLE_PREV_IDLE="$SAMPLE_IDLE"
+    # shellcheck disable=SC2034
+    SAMPLE_PREV_TOTAL="$SAMPLE_TOTAL"
+    # shellcheck disable=SC2034 # the script-scope declaration is not in the extracted snippet
+    SAMPLE_TICK=0 # the script-scope declaration is not in the extracted snippet
+    for _ in 1 2 3 4 5 6; do host_sampler_tick "$sp_tmpdir/out"; done
+    awk '{print $3}' "$sp_tmpdir/out" | tr '\n' ' '
+  )
+  check "tick 1 carries pssBytes, then every 3rd tick does (ticks 1,3,6 of 6)" \
+    "$sp_cad" "524288 - 524288 - - 524288 "
+  sp_cad_proc=$(awk '{print $4}' "$sp_tmpdir/out" | tr '\n' ' ')
+  check "  ...and processCount follows the same cadence" "$sp_cad_proc" "1 - 1 - - 1 "
+  stop_marker_process "$sp_live"
+  rm -f "$sp_tmpdir/out"
+
+  # --- host_sampler_loop: ticks while running, stops on the stop file, and emits a final
+  # tick so a short rung is not left with zero samples.
+  printf 'cpu  100 0 100 800 0 0 0 0 0 0\n' >"$sp_proc/stat"
+  sp_stop="$sp_tmpdir/stop"
+  sp_out="$sp_tmpdir/loop-out"
+  : >"$sp_out"
+  (
+    PROC_ROOT="$sp_proc"
+    SAMPLE_INTERVAL_MS=200
+    SAMPLE_SLICE_MS=100
+    SAMPLE_MIN_TICK_MS=1
+    SAMPLE_LOW_EVERY=1000
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    host_sampler_loop "$sp_out" "$sp_stop"
+  ) &
+  sp_loop_pid=$!
+  sleep 1
+  : >"$sp_stop"
+  wait "$sp_loop_pid"
+  sp_n="$(wc -l <"$sp_out" | tr -d ' ')"
+  check "host_sampler_loop produced at least 3 ticks in ~1s at a 200ms interval" \
+    "$([ "$sp_n" -ge 3 ] && echo yes || echo no)" "yes"
+  check "  ...and exited on the stop file rather than running forever" \
+    "$([ -e "/proc/$sp_loop_pid" ] && echo running || echo exited)" "exited"
+  check "  ...and every line has exactly 4 fields" \
+    "$(awk 'NF != 4 {bad++} END{print bad+0}' "$sp_out")" "0"
+
+  # A rung shorter than one interval still gets one sample, from the stop tick.
+  : >"$sp_out"
+  rm -f "$sp_stop"
+  (
+    PROC_ROOT="$sp_proc"
+    SAMPLE_INTERVAL_MS=60000
+    SAMPLE_SLICE_MS=100
+    SAMPLE_MIN_TICK_MS=1
+    SAMPLE_LOW_EVERY=1000
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    host_sampler_loop "$sp_out" "$sp_stop"
+  ) &
+  sp_short_pid=$!
+  sleep 0.5
+  : >"$sp_stop"
+  wait "$sp_short_pid"
+  check "a window shorter than one interval still yields one sample (the stop tick)" \
+    "$(wc -l <"$sp_out" | tr -d ' ')" "1"
+
+  # ...but the stop tick REFUSES to fabricate a sample over an interval too short to diff.
+  : >"$sp_out"
+  rm -f "$sp_stop"
+  (
+    PROC_ROOT="$sp_proc"
+    # shellcheck disable=SC2034
+    SAMPLE_INTERVAL_MS=60000
+    # shellcheck disable=SC2034
+    SAMPLE_SLICE_MS=100
+    # shellcheck disable=SC2034
+    SAMPLE_MIN_TICK_MS=60000
+    # shellcheck disable=SC2034 # read by host_sampler_loop once sourced
+    SAMPLE_LOW_EVERY=1000
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    host_sampler_loop "$sp_out" "$sp_stop"
+  ) &
+  sp_tiny_pid=$!
+  sleep 0.4
+  : >"$sp_stop"
+  wait "$sp_tiny_pid"
+  check "a window below SAMPLE_MIN_TICK_MS records NO sample rather than a noise diff" \
+    "$(wc -l <"$sp_out" | tr -d ' ')" "0"
+
+  rm -rf "$sp_tmpdir"
 fi
 
 echo "== a FAILED converge is not recorded as a fast converge"

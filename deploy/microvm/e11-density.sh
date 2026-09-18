@@ -191,6 +191,38 @@ COLD_LATENCY_MS="${SH_E11_COLD_LATENCY_MS:-50}"
 VMM_PROC_PATTERN="${SH_E11_VMM_PROC_PATTERN:-firecracker}"
 VIRTIOFSD_PROC_PATTERN="${SH_E11_VIRTIOFSD_PROC_PATTERN:-virtiofsd}"
 
+# In-rung host sampling (issue #291 item 1). The sampler brackets exactly the timed Exec
+# window; see host_sampler_loop for why there are two cadences and what each costs.
+#
+# 1 Hz by default: the every-tick path is builtins only, so its cost is a `sleep` fork per
+# slice and nothing else. SAMPLE_SLICE_MS is how often the loop checks the stop file, which
+# bounds how much post-window time the final tick can include -- 100ms, against a window of
+# seconds.
+SAMPLE_INTERVAL_MS="${SH_E11_SAMPLE_INTERVAL_MS:-1000}"
+SAMPLE_SLICE_MS="${SH_E11_SAMPLE_SLICE_MS:-100}"
+# The floor under the final tick at stop. A /proc/stat diff over a few milliseconds is jiffy
+# noise, not a measurement, so below this the stop tick records NOTHING and the rung's
+# hostCpuSamples is 0 -- which run_density_rung refuses, naming the fix.
+SAMPLE_MIN_TICK_MS="${SH_E11_SAMPLE_MIN_TICK_MS:-200}"
+# pssBytes and processCount need pgrep plus an N-file smaps_rollup walk, so they run every
+# Nth tick (and always on tick 1, so a rung with CPU samples can never have zero of them).
+# Defensible because crosses('memory') in experiments/src/microvm-density.ts reads
+# memAvailableBytes -- which IS every tick -- not pssBytes: PSS feeds the narrative, not the
+# bound classification. The cadence is recorded in every rung's proxyLimitations, and each
+# signal's own sample count is written to the record.
+SAMPLE_LOW_EVERY="${SH_E11_SAMPLE_LOW_EVERY:-5}"
+
+# Sampler state. At script scope, above first use, because `shellcheck -o
+# check-unassigned-uppercase` is a gate here (a variable referenced but never assigned
+# passes plain shellcheck AND `bash -n`, and is a hard failure under this driver's `set -u`
+# on the first line that reads it -- exactly how $PROTO_IMPORT_PATH shipped undefined).
+SAMPLE_IDLE=0
+SAMPLE_TOTAL=0
+SAMPLE_MEM_AVAILABLE_BYTES=0
+SAMPLE_PREV_IDLE=0
+SAMPLE_PREV_TOTAL=0
+SAMPLE_TICK=0
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 REMOTE_WORKER_DIR="$REPO_ROOT/remote-worker"
 EXPERIMENTS_DIR="$REPO_ROOT/experiments"
@@ -485,6 +517,153 @@ host_cpu_fraction() {
     'BEGIN{ dt=tb-ta; di=ib-ia; if (dt>0) printf "%.4f", 1-(di/dt); else print 0 }'
 }
 
+# ---------------------------------------------------------------------------
+# The in-rung sampler (issue #291 item 1).
+#
+# host_signals_snapshot below is KEPT, and its values are recorded under postLoad* names, so
+# an idle reading can never again pass as an under-load one. What it cannot do is sample
+# during the window: host_cpu_fraction SLEEPS for its diff, so calling it from inside a
+# concurrency rung would either stall the driver or measure one second of a window that may
+# be shorter than that.
+#
+# The every-tick path here therefore forks NOTHING. proc_stat_totals and
+# proc_meminfo_available read /proc with the `read` builtin and a file redirection (not a
+# pipe, so no subshell), the CPU fraction is formatted with `printf -v`, and the previous
+# /proc/stat reading is kept in globals rather than re-derived -- which is what removes the
+# `sleep` from inside a sample. Globals rather than printed values throughout, because
+# `x="$(f)"` is a fork and this runs beside the thing being measured.
+# ---------------------------------------------------------------------------
+
+# proc_stat_totals sets SAMPLE_IDLE and SAMPLE_TOTAL from the aggregate "cpu " line.
+# Returns non-zero when there is no such line, so a caller on a non-Linux host samples
+# nothing rather than recording a fabricated 0.
+#
+# Missing trailing fields (guest / guest_nice are absent on older kernels) are ASSIGNED
+# EMPTY by `read`, not left unset, and bash arithmetic treats an empty string as 0 -- so
+# `set -u` is satisfied and the sum is still correct.
+proc_stat_totals() {
+  local label user nice system idle iowait irq softirq steal guest guest_nice
+  SAMPLE_IDLE=0
+  SAMPLE_TOTAL=0
+  while read -r label user nice system idle iowait irq softirq steal guest guest_nice; do
+    [ "$label" = "cpu" ] || continue
+    SAMPLE_IDLE=$((idle + iowait))
+    SAMPLE_TOTAL=$((user + nice + system + idle + iowait + irq + softirq + steal + guest + guest_nice))
+    return 0
+  done <"$PROC_ROOT/stat"
+  return 1
+}
+
+# proc_meminfo_available sets SAMPLE_MEM_AVAILABLE_BYTES from MemAvailable, in bytes.
+# Returns non-zero when there is no MemAvailable line. mem_available_bytes' awk form stays
+# in place for the post-load snapshot, where one fork per rung costs nothing.
+#
+# The third `read` variable is needed (two would put "8192000 kB" in $value) and named
+# _rest because SC2034 -- "appears unused" -- is a WARNING, and shellcheck at -S warning is
+# a gate here, so `unit` would fail `make lint`.
+proc_meminfo_available() {
+  local key value _rest
+  SAMPLE_MEM_AVAILABLE_BYTES=0
+  while read -r key value _rest; do
+    if [ "$key" = "MemAvailable:" ]; then
+      SAMPLE_MEM_AVAILABLE_BYTES=$((value * 1024))
+      return 0
+    fi
+  done <"$PROC_ROOT/meminfo"
+  return 1
+}
+
+# host_sampler_tick appends ONE line to $1:
+#
+#     <cpuFraction> <memAvailableBytes> <pssBytes|-> <processCount|->
+#
+# "-" marks a tick that did not carry the low-cadence signals; sampler_field skips those,
+# which is how pssSamples can legitimately differ from hostCpuSamples in the record.
+#
+# The CPU fraction is computed in scaled integer arithmetic and the decimal point spliced in
+# by `printf -v`, because awk or bc would be a fork per tick. It is clamped to [0, 1]: a
+# CPU hotplug or a counter wrap can make the idle delta exceed the total delta, and a
+# negative "fraction" would be interpolated straight into the rung's JSON.
+host_sampler_tick() {
+  local out_file="$1"
+  local di dt scaled frac pss proc_count p vmm_pids virtiofsd_pids
+  proc_stat_totals || return 1
+  di=$((SAMPLE_IDLE - SAMPLE_PREV_IDLE))
+  dt=$((SAMPLE_TOTAL - SAMPLE_PREV_TOTAL))
+  SAMPLE_PREV_IDLE="$SAMPLE_IDLE"
+  SAMPLE_PREV_TOTAL="$SAMPLE_TOTAL"
+  scaled=0
+  if [ "$dt" -gt 0 ]; then
+    scaled=$(((dt - di) * 10000 / dt))
+  fi
+  [ "$scaled" -ge 0 ] || scaled=0
+  [ "$scaled" -le 10000 ] || scaled=10000
+  printf -v frac '%d.%04d' "$((scaled / 10000))" "$((scaled % 10000))"
+  proc_meminfo_available || SAMPLE_MEM_AVAILABLE_BYTES=0
+  SAMPLE_TICK=$((SAMPLE_TICK + 1))
+  pss="-"
+  proc_count="-"
+  # Tick 1 is ALWAYS a low-cadence tick. Otherwise a rung whose window fits in fewer than
+  # SAMPLE_LOW_EVERY ticks would record pssSamples=0 and processCountSamples=0 while having
+  # CPU samples -- and standbysResident is derived from processCount, so it would have had to
+  # fall back to the post-load count, reintroducing exactly the idle reading this fixes.
+  if [ "$SAMPLE_TICK" -eq 1 ] || [ $((SAMPLE_TICK % SAMPLE_LOW_EVERY)) -eq 0 ]; then
+    vmm_pids="$(discover_pids "$VMM_PROC_PATTERN")"
+    virtiofsd_pids="$(discover_pids "$VIRTIOFSD_PROC_PATTERN")"
+    # A `die` inside pss_bytes_for_pids exits only this command substitution's subshell, so
+    # the assignment lands empty with a non-zero status. Recording "-" for that tick is
+    # right: the refusal that matters (spec section 7.3's boxed warning) is enforced by
+    # host_signals_snapshot on the post-load path, which run_density_rung checks and dies on.
+    # shellcheck disable=SC2086 # word-splitting into pss_bytes_for_pids' "$@" is intended
+    pss="$(pss_bytes_for_pids $vmm_pids $virtiofsd_pids)" || pss="-"
+    [ -n "$pss" ] || pss="-"
+    proc_count=0
+    # shellcheck disable=SC2086
+    for p in $vmm_pids $virtiofsd_pids; do
+      [ -z "$p" ] || proc_count=$((proc_count + 1))
+    done
+  fi
+  printf '%s %s %s %s\n' "$frac" "$SAMPLE_MEM_AVAILABLE_BYTES" "$pss" "$proc_count" >>"$out_file"
+}
+
+# host_sampler_loop ticks into $1 until $2 exists, then takes ONE final tick if at least
+# SAMPLE_MIN_TICK_MS has elapsed since the last one, and returns. Meant to be backgrounded
+# by run_density_rung immediately after wall_t0 and reaped immediately after wall_t1.
+#
+# It waits in SAMPLE_SLICE_MS slices rather than one SAMPLE_INTERVAL_MS sleep so that the
+# stop file is noticed promptly: the final tick then covers at most one slice of post-window
+# time, against a window of seconds. That costs one `sleep` fork per slice -- ten a second
+# against the ~370 process creations a second issue #291 item 2 removed.
+host_sampler_loop() {
+  local out_file="$1" stop_file="$2"
+  local slices_per_tick slice=0 last_ms slice_s
+  slices_per_tick=$((SAMPLE_INTERVAL_MS / SAMPLE_SLICE_MS))
+  [ "$slices_per_tick" -ge 1 ] || slices_per_tick=1
+  printf -v slice_s '%d.%03d' "$((SAMPLE_SLICE_MS / 1000))" "$((SAMPLE_SLICE_MS % 1000))"
+  proc_stat_totals || return 0 # no /proc/stat here: sample nothing rather than lie
+  SAMPLE_PREV_IDLE="$SAMPLE_IDLE"
+  SAMPLE_PREV_TOTAL="$SAMPLE_TOTAL"
+  SAMPLE_TICK=0
+  set_epoch_ms
+  last_ms="$EPOCH_MS"
+  while :; do
+    if [ -e "$stop_file" ]; then
+      set_epoch_ms
+      if [ $((EPOCH_MS - last_ms)) -ge "$SAMPLE_MIN_TICK_MS" ]; then
+        host_sampler_tick "$out_file" || true
+      fi
+      return 0
+    fi
+    sleep "$slice_s"
+    slice=$((slice + 1))
+    [ "$slice" -ge "$slices_per_tick" ] || continue
+    slice=0
+    host_sampler_tick "$out_file" || return 0
+    set_epoch_ms
+    last_ms="$EPOCH_MS"
+  done
+}
+
 # host_signals_snapshot prints one JSON object: pssBytes (VMM + virtiofsd, PSS
 # only), memAvailableBytes, hostCpuFraction, processCount.
 #
@@ -568,7 +747,6 @@ epoch_delta_ms() {
 # set_epoch_ms sets EPOCH_MS to now, in whole milliseconds, with no subprocess.
 set_epoch_ms() {
   local e="${EPOCHREALTIME/./}"
-  # shellcheck disable=SC2034 # EPOCH_MS's reader is the sampler tick loop, issue #291 item 3/4 (not yet added)
   EPOCH_MS=$((10#$e / 1000))
 }
 
@@ -633,7 +811,7 @@ e11_tool_call_mix() {
 
 # escaped_mix prints one PRE-ESCAPED JSON string literal (surrounding double quotes
 # included) per command of e11_tool_call_mix, in the mix's own order. It is called ONCE PER
-# SLOT, before the slot's timed loop starts -- this is where the two python3 interpreter
+# RUNG, before the rung's slots start -- this is where the two python3 interpreter
 # startups per Exec went (issue #291 item 2). It uses the same json_escape the timed loop
 # used to call, so the bytes it produces are identical by construction rather than by a
 # reimplementation of JSON escaping in bash, which is where this change's real risk was.
