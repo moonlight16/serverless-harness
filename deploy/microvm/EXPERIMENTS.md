@@ -1040,3 +1040,739 @@ discarded for this reason and the run repeated after the fix. Fixed with
 cleanup recipe, never by a captured PID or a process name), wired into both
 `stop_container_stack` and `stop_microvm_stack`, with five new regression checks in
 `deploy/microvm/tests/e11-density.test.sh` pinning the fix.
+
+### E12 — guest-initiated vsock on a second port survives snapshot restore
+
+> **2026-09-18 — this section's C@128 attribution is superseded by E13 below.** The failure
+> rate recorded here was not host contention. E13 ran a no-second-port control at the same
+> N=128 over the existing Exec path only, and it came back clean (0/128); ruled out memory
+> and the OOM killer directly (sealed prediction 7 falsified, MemAvailable never below
+> ~12.3 GiB of 15); and then found the cause in this probe's own scaffolding. Its
+> `start_host_listener` returned as soon as the listener process was backgrounded rather
+> than when that process had reached `listen()`, so a guest CONNECT could land before
+> anything was listening and be answered with RST — correctly. Fixed in `b203e38` and
+> confirmed on both substrates; see E13.
+>
+> What stands: rungs A, B, D and C@8, both witnesses, the pristine-snapshot check, and
+> T1's support. What must not be cited from this section: "consistent with resource or
+> scheduling contention under heavy concurrent boot load" as the explanation for C@128, and
+> the 76/128 and 127/128 rates as a property of the restore mechanism or of the rig rather
+> than of this probe's own startup ordering. The numbers stay as the record of what the
+> pre-fix probe produced.
+
+**Two distinct findings, not one boolean.** The core mechanism question issue
+#271 asked — does a guest-initiated vsock connection on a second port (1025)
+survive a Firecracker snapshot restore — has a clear, reliable **yes**: rungs
+A, B and D (fresh boot, single restore, and the host-initiated regression
+fence) pass unanimously, and C at N=8 concurrent restores holds the same
+result at modest concurrency. Separately, at N=128 concurrent restores from
+one snapshot, there is a real, non-zero, non-deterministic failure rate on
+this 4-vCPU rig — a distinct scale/capacity finding, not evidence against the
+restore mechanism itself. `main()` ANDs every rung together, so C@128's
+failure alone flips the run's top-level `ok` to `false`
+(`e12-answer.json` from the run: `{"substrate":"nested-m8i","rungs_run":"A B
+C D","ok":false}`) even though three of the four rungs, and C's own N=8
+point, are unanimous passes.
+
+#### What was actually tested, on `nested-m8i`, in two passes
+
+Rungs A, B, C(N=8), C(N=128) and D were first run standalone (Steps 3-7 of
+this task), then again together in one script invocation as the
+authoritative combined run (Step 8). Every connection required TWO
+INDEPENDENT witnesses: the nonce captured host-side on
+`<jail>/vsock.sock_1025`, AND the ACK read back in guest stdout via the
+existing agent Exec path on vsock:1024. Neither witness alone was treated as
+evidence.
+
+| Rung                                                        | Standalone                                                          | Combined (authoritative)                                                                                                                                               |
+| ----------------------------------------------------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A (fresh boot, control)                                     | ok=true, both witnesses yes                                         | ok=true, both witnesses yes                                                                                                                                            |
+| B (single restore — the core question)                      | ok=true, both witnesses yes                                         | ok=true, both witnesses yes                                                                                                                                            |
+| C, N=8 concurrent restores                                  | ok=true, 8/8                                                        | ok=true, 8/8                                                                                                                                                           |
+| C, N=128 concurrent restores                                | ok=false, 127/128 (1 failure: `guest_client_exit=1`, `"read: EOF"`) | ok=false, 76/128 (52 failures: 45× `"read: EOF"`, 2× `"connection refused"`, 1× `"connection reset by peer"`, all `guest_client_exit=1` relay-level connection errors) |
+| D (regression fence: host-initiated 1024 with 1025 present) | ok=true                                                             | ok=true                                                                                                                                                                |
+
+The per-rung and per-VM JSON records and the run log are rig artifacts, not
+committed to this repo (`deploy/microvm/e12-results/` is gitignored) — the
+numbers above are the complete record of what they showed.
+
+All observed C@128 failures are `guest_client`-relay-level connection errors
+(EOF, connection refused, connection reset) — none show the signature of the
+bug fixed in `1ac8371` (that bug produced `guest_client_exit=0` with a
+correctly-echoed-but-mis-compared ACK; these are `guest_client_exit=1` with
+real connection-level errors). The failure rate is markedly worse when C@128
+runs immediately after the other rungs in the same invocation (52/128) than
+when it runs alone (1/128) — consistent with resource or scheduling
+contention under heavy concurrent boot load on this 4-vCPU rig, not with a
+fundamental defect in the vsock-across-restore mechanism itself.
+
+Snapshot integrity was verified pristine (matching `manifest.json`'s
+`rootfs_sha256`) before and after every run, both passes — the golden
+snapshot was never mutated by this probe.
+
+#### The 4-VM bookkeeping gap in the combined run's C@128
+
+The combined run's per-VM records account for only 48 of the 52 counted
+failures: `grep -l '"ok":false' rung-C-128-*.json` finds 48 files, but
+`rung-C-128.json` reports `fail_count=52`. Four VM indices (112, 113, 120, 123) have neither a log line nor a per-VM JSON record, yet are still counted
+in the aggregate.
+
+This is explained precisely by `run_rung_c_n`'s own control flow
+(`deploy/microvm/e12-vsock-egress-probe.sh`). Each per-VM subshell runs:
+
+```
+restore_vm "$jail" 2>"$jail.boot.log" || {
+  write_json_record "$RESULTS/rung-C-${n}-${i}.json" \
+    "{\"rung\":\"rung-C-${n}-${i}\",\"ok\":false,\"error\":\"restore_vm failed\"}"
+  exit 1
+}
+```
+
+That `||` fallback only runs if `restore_vm` _returns_ nonzero. But `die()`
+(the script's error primitive) is `die() { echo "e12: $*" >&2; exit 1; }` — a
+raw `exit`, not a `return`. Called from anywhere inside `restore_vm`'s call
+chain (e.g. `wait_for_socket`'s timeout `die`, or `wait_for_agent`'s, or any
+`api_put`/curl failure `die`), it terminates the per-VM subshell immediately,
+from wherever it is, bypassing the `|| { write_json_record ...; exit 1; }`
+fallback entirely — `exit` never returns control for `||` to catch, it just
+ends the process. The aggregation loop's `wait "$pid"` still correctly
+observes the nonzero exit and counts it in `fail_count` — the aggregate
+**count** is correct — but no per-VM diagnostic JSON gets written for a
+`die()`-triggered failure path. This is a real, minor visibility gap in the
+driver (not a counting bug, and not a defect in the answer itself): the four
+missing indices are failures whose specific cause (which `die` fired, and
+where) was captured at run time in each VM's own `.boot.log` file (the
+redirect target of `restore_vm`'s stderr above), named
+`$JAIL_BASE/rung-c-128-<i>.boot.log` for the failing index `<i>` — a rig
+artifact this repo does not archive. It is not being fixed as part of this
+plan — hardening the per-VM diagnostic path and archiving these logs is
+beyond this throwaway probe's scope, and does not cast doubt on the
+`ok_count`/`fail_count` numbers themselves, which are correct.
+
+#### What a nested run establishes here, and what it does not
+
+This ran on `nested-m8i`, never `metal`. Per this driver's design, no
+substrate name check gates that choice — the snapshot-integrity guard
+(`assert_snapshot_pristine`) is unconditional and mechanical rather than a
+check on the substrate's name, so it holds identically on whichever run this
+probe is next pointed at.
+
+What this DOES establish: the guest-initiated vsock mechanism — a
+pre-created host listener on `<uds>_<PORT>`, no handshake, `vsock_override`
+rewriting `uds_path` per restore — works as documented, on real KVM hardware
+virtualized one level down, across a real snapshot restore, including under
+modest concurrency (N=8).
+
+What this does NOT establish on its own: Firecracker's snapshot/restore
+contract assumes matching hardware between snapshot and restore. A nested
+pass makes the metal case very likely but does not prove it. Per issue #271,
+metal confirmation should ride along with whichever later run builds a metal
+snapshot anyway — not worth booking metal time for on its own — and because
+the driver's snapshot-integrity guard is unconditional rather than a
+substrate name check, running it again on that later metal snapshot needs no
+code change.
+
+#### Prediction (spec-style, pinned in `predictions.json` id 6)
+
+> Guest-initiated vsock on a second port (1025) works on a fresh boot and
+> survives snapshot restore, for all N concurrent restores of one snapshot,
+> because the guest-to-host direction needs no handshake and no host-side
+> state beyond the socket file - strictly less state to reset than the
+> host-initiated direction already known to survive.
+
+Falsifier: "any rung B, C or D reporting ok=false while rung A reported
+ok=true."
+
+**By the letter of the falsifier, this technically fires.** Rung C reported
+`ok=false` at N=128 while rung A reported `ok=true` — that is exactly the
+condition the falsifier names, and it should be said plainly rather than
+argued around. But in the same breath: the prediction's own claim is
+specifically about the guest-initiated mechanism surviving restore, and
+rungs A, B and D — the rungs that test the mechanism directly, without
+concurrency-scale load — support it strongly and unanimously across both
+runs, as does C at N=8. The falsifier's wording ("any rung ... reporting
+ok=false") was sealed before rung A ran and did not anticipate a
+concurrency-scale failure mode distinct from a restore-mechanism failure; it
+cannot distinguish "the mechanism doesn't survive restore" from "128
+simultaneous restores exceed what a 4-vCPU rig can schedule reliably." This
+is a genuine tension between a coarse-grained sealed falsifier and a
+nuanced real result. It is recorded here as exactly that tension, not
+resolved by picking whichever framing is more convenient: the falsifier
+fires on its literal text, and the mechanism it was meant to test is
+nonetheless well-supported.
+
+**2026-09-18 — re-scored after E13's fix.** The falsifier still fires, but not for the
+reason argued above. With the listener race fixed, C@128 is clean in 37 of 40 bare-metal
+iterations, and the 3 remaining failures across 5,120 VM-attempts are all the other,
+unrelated family (a `read: EOF`, a handshake-ack EOF, one `dial` failure); the guest-side
+reset signature that dominated the pre-fix failures (999 of 1,007 on metal) occurs zero
+times post-fix, and zero times across a separately sized 7,296-attempt nested run. So the
+verdict is unchanged and its substance is not: the mechanism is better supported than this
+section could show, and what remains is a distinct, still-open failure family — not the
+concurrency ceiling invoked above. The specific reading that C@128's failures were what
+128 simultaneous restores cost a 4-vCPU rig was wrong, and the tension recorded above was
+partly a tension with this probe's own defect rather than with the mechanism.
+
+#### Effect on PR #268
+
+P4.1's decision T1 (route all sandbox egress over vsock) is supported by the
+core finding (rungs A, B, D and C@8) and should stand. The N=128 finding
+should be carried into P4.1's implementation as an open scale/capacity
+question — how many concurrent egress connections a single host is expected
+to serve, and whether restores should be staggered or rate-limited under
+heavy concurrent load — not as grounds to revert to the NIC option (spec
+§2). Nothing observed here resembles the restore-mechanism failure that
+would force that reversion.
+
+**Superseded in part:** E13 re-scoped that open scale question after ruling out restore
+count as the lever, and its own closing section carries the current recommendations for
+P4.1 — including one persistent, pre-bound multiplexed listener, which E13 promoted from an
+efficiency nicety to the load-bearing fix. Read E13's version, not this paragraph's.
+
+### E13 — rung C@128's failures are its own probe's added workload, not memory and not restore count
+
+**Prediction 7 is falsified, both disjuncts of its own falsifier fired, and
+the control rules out the other obvious explanation as well.** E12 left an
+open scale question with two candidate causes on the table: host memory
+exhaustion under 128 concurrent 256 MiB guests against this rig's ~15 GiB
+(prediction 7's claim), or a bare concurrent-restore capacity limit on a
+4-vCPU rig (PR #272's own framing). Both were tested on `nested-m8i` and
+neither survives. A no-second-port control at the same N=128 is a **clean
+128/128 pass**, so 128 concurrent restores of the already-shipped mechanism
+are not by themselves the problem. A telemetry-wrapped rerun of E12's own
+rung C@128 fails **38/128** with **zero OOM events** and `MemAvailable`
+never falling below 12.3 GiB, so memory is not the problem either. What
+remains — and what the elimination points at — is contention from the
+workload rung C@128's own probe apparatus adds on top of the restores, and
+the channel it degrades is the pre-existing Exec path on port 1024, not the
+1025 path E12 introduced.
+
+#### The two runs, on `nested-m8i`
+
+Both ran back to back on the same host, under the same 1 Hz memory/OOM
+sampler (`e13-mem-telemetry.sh`), within the same 40-second window.
+
+| Run                                                                                               | What each VM does after restore                                                                                                                                                                                           | Result                                                        | Wall time | `MemAvailable` floor                       | OOM events |
+| ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- | --------- | ------------------------------------------ | ---------- |
+| Control, N=128 (`e13-restore-capacity-control.sh`)                                                | existing host-initiated Exec on vsock:1024 only, `-command true`; no listener on 1025, no guest-side script, no second port at all                                                                                        | `ok=true`, **128/128**, `fail_count=0`                        | 5.442s    | 15,098,597,376 B (14.06 GiB), ~0.26 GB dip | 0          |
+| E12 rung C@128, rerun standalone (`SH_E12_RUNGS=C SH_E12_C_LADDER=128 e12-vsock-egress-probe.sh`) | one host-side `python3` listener process per VM on `<jail>/vsock.sock_1025`, plus an Exec on 1024 that base64-decodes and runs a `python3` script **inside** the guest to do a real AF_VSOCK connect/send/recv round trip | `ok=false`, 90/128, **`fail_count=38`**, `nonce_collisions=0` | 17.204s   | 13,231,726,592 B (12.32 GiB), ~2.13 GB dip | 0          |
+
+Per-VM and per-rung JSON, the telemetry timelines and the correlation output
+are rig artifacts, not committed (`deploy/microvm/e13-results/`,
+`e13-control-results/` and `e13-telemetry/` are gitignored, per PR #272's own
+precedent) — the numbers here are the complete record of what they showed.
+`e12-answer.json` from the rerun is `{"substrate":"nested-m8i","rungs_run":"C","ok":false}`.
+
+Every one of the 38 failures carries the identical signature PR #272
+reported: `"guest_client_exit":1` with
+`"guest_output":"e12-guest-client: read: EOF"`, and `"guest_witness":"no"`.
+The host witness is **not** uniform, and the exception matters: 36 of the 38
+show `"host_witness":"no"`, but **two — VM indices 12 and 52 — show
+`"host_witness":"yes"`**. `host_ok` is set only by
+`[ "$host_nonce" = "$nonce" ]`, so in those two the host listener captured
+that VM's own unique nonce, byte-for-byte, on `<jail>/vsock.sock_1025`: the
+guest ran its `python3` payload, opened an AF_VSOCK connection to the host on
+1025 and sent its nonce, and only afterwards did the read of the 1024 response
+fail. (Precisely: this witnesses the guest→host leg. The guest's own
+subsequent `recv()` of the host's `ACK` cannot be checked, because the only
+channel that would have carried that evidence — its stdout, relayed over 1024
+— is the one that broke, which is also why `"guest_witness":"no"` is forced
+for all 38 regardless of what the guests actually did.) All 90 passing VMs are
+`"host_witness":"yes"` too, so 92 of 128 nonces arrived host-side in a run
+scored 90/128. Unlike E12's
+combined run, this rerun has **no bookkeeping gap** — 38 counted failures, 38
+per-VM records, all 128 per-VM records present — so no `die()`-path failures
+are hiding here (see E12's 4-VM gap above).
+
+#### Memory is ruled out directly, and prediction 7's premise never materialized
+
+`e13-correlate.py` matched all 128 per-VM records against the memory
+timeline: `oom_events_total=0`, `failed_near_oom_event=0`,
+`failed_below_low_water=0` (of 38), `ok_near_oom_event=0`,
+`ok_below_low_water=0`. `oom-events.log` is zero bytes for both runs. The
+floor across the failing run was 13,231,726,592 bytes — **12.32 GiB still
+available**, i.e. roughly 80% of the rig's memory free at the worst moment of
+a run in which 30% of connections failed. There is no exhaustion here to
+correlate against.
+
+The control's timeline undercuts prediction 7's arithmetic premise
+independently, before the OOM correlation is even consulted: restoring 128
+VMs each configured with 256 MiB moved `MemAvailable` by only ~0.26 GB, not
+the ~32 GiB that the "128 × 256 MiB against 15 GiB" admission math implies.
+Firecracker faults guest RAM in lazily, so a configured guest size is an
+upper bound that trivial post-restore work never approaches. The
+concurrent-restore admission budget prediction 7 borrowed from issue #266 is
+simply not the binding constraint at this N for this workload. (Caveat: the
+control's sampler took only 7 samples across its 5.4s run, so its floor is
+coarse; the rung C run has 19.)
+
+#### The failures are not positional, and the rate is not reproducible
+
+The 38 failing indices are 8, 12, 24, 31, 32, 37, 40, 41, 43, 45, 49, 52,
+53, 65, 67, 69, 71, 73, 81, 82, 87, 88, 89, 92, 94, 95, 97, 99, 100, 101,
+102, 105, 110, 114, 122, 124, 125, 128 — spread from index 8 to 128, with
+5 / 8 / 13 / 12 falling in successive quarters of launch order. They are not
+clustered at the head or the tail. That mild upward tilt is what a
+whole-run contention effect looks like as the burst saturates, not a
+threshold being crossed at a particular VM count and everything after it
+failing.
+
+The rate itself is highly run-to-run variable and should not be quoted as a
+property of the system. Three measurements of the same rung at the same N on
+the same rig now exist: **1/128** (PR #272 standalone), **52/128** (PR #272
+combined with the other rungs), **38/128** (this rerun, standalone with
+telemetry). This rerun's standalone number is nowhere near PR #272's own
+standalone number, which is the sharpest available evidence that what is
+being measured is a scheduling race, not a capacity threshold. Any future
+gate on this must be a repeated-trials distribution, not a single run's rate.
+
+Both runs also finished in seconds — 5.4s and 17.2s — not the minutes that
+PR #272's "heavy concurrent boot load" phrasing suggests, and not the slow
+grinding degradation a genuine resource-exhaustion failure usually produces.
+The 3.2× wall-time difference for an identical restore count is itself a
+measure of what the probe apparatus costs.
+
+#### What actually explains it, stated at the confidence the evidence supports
+
+Three differences separate the clean control from the 30%-failing rung C at
+the same N and the same restore path: rung C starts **128 additional
+host-side `python3` processes** (one listener per VM), it asks each guest to
+**spawn a `python3` interpreter and perform a real vsock round trip** instead
+of `true`, and it therefore holds each VM alive substantially longer. The
+restore count, the restore code path, the rig and the host-initiated Exec
+call are common to both. By elimination — memory measured and excluded,
+restore count excluded by the control — the cause lies in that added
+workload, and the plausible mechanism on a 4-vCPU rig is CPU/scheduling
+contention: ~256 extra userspace processes competing with 128 Firecracker
+VMMs and the guest agents whose Exec responses are precisely what fails to
+be read.
+
+Two honesty caveats on that, in the same spirit as E12's:
+
+- **CPU was never measured.** `e13-mem-telemetry.sh` samples `MemAvailable`
+  and the OOM killer, nothing else. "CPU/scheduling contention" is therefore
+  an inference from elimination plus the ~1.87 GB (2.13 GB − 0.26 GB, the
+  incremental memory cost over the control's own dip) and 3.2× wall-time deltas,
+  not an observation. Confirming it needs host CPU-utilization and
+  run-queue-depth sampling across the burst, plus the cheap discriminating
+  experiment this run did not do: rerun the control at N=128 with `-command`
+  changed from `true` to the same guest-side `python3` payload but **no**
+  1025 listener, which separates the guest-side cost from the host-side
+  process cost.
+- **The degraded channel is the 1024 Exec relay, and in two cases that is
+  directly observed rather than inferred.** `read: EOF` is the
+  `guest_client`'s own transport error reading the framed response from
+  **vsock:1024**; the guest-side script that would connect to 1025 is
+  _delivered by_ that same Exec call. So for the 36 failures with
+  `"host_witness":"no"`, that absent nonce is an expected downstream
+  consequence of the 1024 relay dying and is not independent evidence about
+  1025 — those cases cannot distinguish "the guest never ran" from "the guest
+  ran and the 1025 connect failed." But indices 12 and 52 settle it in the
+  affirmative for themselves: their nonces **were** captured on
+  `vsock.sock_1025`, so in those two the guest-side `python3` payload was
+  delivered, started, and got as far as connecting to the host on 1025 and
+  sending its nonce — and the read of the 1024 response failed afterwards. In
+  at least those two cases the 1025 hop was demonstrably reached and worked.
+  That is direct evidence for the added-workload reading — the expensive
+  guest-side work does get done — and it localizes the fault in the 1024 Exec
+  relay rather than in the mechanism E12 added. Two of 38 is a narrow base,
+  and it witnesses the guest→host leg only, so it is offered as an existence
+  proof, not as a rate and not as a clean bill of health for the whole
+  exchange.
+
+#### Prediction (spec-style, pinned in `predictions.json` id 7)
+
+> PR #272's rung C@128 connection failures are caused by host memory
+> exhaustion under 128x256MiB guest RAM demand against nested-m8i's 15 GiB
+> total (per issue #266's own admission-budget finding on this rig class),
+> not by a defect in the guest-initiated vsock-across-restore mechanism E12
+> added.
+
+Falsifier: "the control script's fail_count at N=128 is close to zero while
+PR #272's own rung C@128 fail_count stayed high, OR the telemetry rerun
+shows no OOM-killer activity and MemAvailable never drops near the control
+script's failures' timestamps."
+
+**Prediction 7 is falsified, and both disjuncts of its falsifier fired
+independently.** The first: control `fail_count=0` while rung C@128 stayed
+non-trivial at 38/128. The second: `oom_events_total=0` and a memory floor
+12.32 GiB clear of exhaustion. There is no tension to record here and no
+reading on which the prediction survives — unlike prediction id 6 above,
+whose falsifier fired on the letter of its text while the mechanism it
+existed to test was well-supported, this falsifier fired on both its letter
+and its substance. The claim's causal content was wrong.
+
+Its second clause — "not by a defect in the guest-initiated
+vsock-across-restore mechanism E12 added" — is not thereby shown false; it
+is simply not what the falsifier tested, and per the caveat above these
+artifacts locate the failure in the 1024 relay rather than in the 1025
+mechanism. But that clause was carried along by a claim whose stated cause
+is refuted, so it earns no credit from this run.
+
+Worth stating plainly, because it is the part neither this prediction nor PR
+#272 anticipated: the control result also falsifies PR #272's own
+alternative framing. Its write-up read C@128 as evidence that "128
+simultaneous restores exceed what a 4-vCPU rig can schedule reliably."
+128 simultaneous restores on this rig are fine — 128/128, in 5.4 seconds.
+It is 128 simultaneous restores _plus 256 extra userspace processes doing
+real work_ that are not.
+
+#### Overnight follow-up: 293 iterations, and iowait as the best lead so far
+
+The section above named the missing measurement plainly: "CPU was never
+measured." Getting a real measurement turned out to need a detour first —
+`teardown_jail`'s own `rm -rf` deletes a VM's `console.log` before the
+`/dev/kvm`-busy partial-unmount failure that leaves the jail directory
+behind, so every one of the run's 38 failing VMs had already lost its guest
+console by the time anyone could read it. A throwaway patch to
+`e12-vsock-egress-probe.sh` (`CONSOLE_ARCHIVE`, writing each VM's console
+_outside_ the jail so teardown can't touch it — not committed to this
+driver; kept as a local diagnostic copy) made the logs readable at all. That
+in turn surfaced a genuinely different failure signature on the first
+attempt — a guest-side `ConnectionResetError` on the actual 1025 `connect()`
+— which was reason enough to run this for real rather than by hand: an
+overnight loop (`e13-overnight-loop.sh` + two small Python helpers, same
+throwaway status) re-ran rung C@128 every ~20-160s for most of a night on
+`nested-m8i`, sampling host `MemAvailable`, CPU steal%, and — added mid-run,
+after the first ~74 iterations showed a pattern steal and memory couldn't
+explain — disk iowait%, via `/proc/stat`.
+
+**293 iterations, 37,504 VM-attempts, 8.61% overall failure rate.** Rig
+verified clean afterward every time: no live `firecracker`/`guest_client`
+processes, no leftover bind mounts or jail directories, golden snapshot
+`rootfs` digest unchanged (`sha256:833401a1...`) on every single check across
+the whole night.
+
+##### The bimodal pattern has a real (if partial) explanation now
+
+Iterations split cleanly into two regimes by wall-clock duration — not a
+smooth distribution, two clusters — and the split is not simple alternation:
+fast iterations run in streaks up to 7 long, slow ones are mostly isolated
+singletons (mean streak length ≈ 2).
+
+| Regime (243-iteration run) | n   | mean iowait% | mean steal% | mean `MemAvailable` | per-VM failure rate       |
+| -------------------------- | --- | ------------ | ----------- | ------------------- | ------------------------- |
+| Fast (< 30s)               | 136 | 0.108%       | 0.117%      | 12.42 GiB           | **2.37%** (413/17,408)    |
+| Slow (≥ 30s, ~125-160s)    | 107 | 0.922%       | 0.161%      | 12.72 GiB           | **15.81%** (2,165/13,696) |
+
+Steal and memory are the same story the single-run telemetry already told —
+flat, low, and if anything _higher_ available memory in the slow group, not
+lower. iowait is the first metric all night that actually moves between the
+two regimes, and by a wide margin (8.5x). Correlating per-iteration values
+directly (Pearson, n=243): duration↔iowait **r=0.788** (strong), duration↔
+fail_count **r=0.582** (moderate-strong), iowait↔fail_count **r=0.41**
+(moderate). That last number is the honest one to hold onto: real and
+stable across nearly 300 iterations, but a 0.41 correlation is a
+contributor, not a single sufficient cause — plenty of variance in
+fail_count isn't explained by iowait alone.
+
+**What this most plausibly is, stated at the confidence the evidence
+supports:** disk I/O contention — plausibly EBS burst-balance throttling,
+since sustained iowait with flat CPU/memory is exactly that signature — is a
+real contributor to the slow/high-failure regime, on a rig this is a _shared_
+EC2 instance type. This is inferred from the iowait correlation and the
+absence of any better-fitting alternative among the three metrics collected,
+not confirmed against an AWS-level burst-balance or `CreditBalance`
+CloudWatch metric, which nothing in this run captured. The mechanism from
+E12/E13's core section (extra host processes + heavier guest Exec payload
+holding VMs open longer) is still very plausibly what makes fast iterations
+occasionally slip into the slow regime in the first place — iowait explains
+which iterations get _worse_ once something is already straining the box,
+not why straining happens on this workload at all.
+
+##### What actually failed, categorized across all of part 2 (243 iterations)
+
+| Signature                                                            | Count  | Where in the lifecycle                                                                                |
+| -------------------------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------- |
+| `read: EOF`                                                          | 1,769  | Mid-protocol — CONNECT handshake already succeeded, response never arrives (E12's original signature) |
+| dial failed, connection refused                                      | 132    | Earliest possible failure — `guest_client` couldn't reach Firecracker's own local vsock socket at all |
+| handshake ack read, connection reset                                 | 101    | Early — the `CONNECT <port>` handshake itself fails, before any real data flows                       |
+| handshake ack read, EOF                                              | 62     | Same stage, different failure mode                                                                    |
+| **guest-side `ConnectionResetError` on the 1025 `connect()` itself** | **37** | **Inside the guest, on the actual second-port mechanism — not the 1024 relay**                        |
+| short-payload framing error                                          | 6      | Protocol-level, mid-response                                                                          |
+| handshake ack read, i/o timeout                                      | 4      | Same stage as above, an explicit timeout rather than a reset/EOF — itself an I/O-flavored symptom     |
+
+2,113 per-VM records recovered against a `fail_count` sum of 2,578 — the
+~18% gap is the same `die()`-bypass bookkeeping gap E12's own combined run
+hit, not a new one; it costs per-VM detail, not aggregate accuracy.
+
+Two things worth being precise about, in both directions:
+
+- **The failure signature is not one bug.** It spans the entire connection
+  lifecycle, from the earliest possible failure (can't even reach
+  Firecracker's own socket) through the handshake to the mid-protocol
+  `read: EOF` that dominated the single-run analysis above. That spread — not
+  one narrow defect recurring — is consistent with something degrading the
+  whole host-side connection-serving path under load, which fits the iowait
+  finding better than it would fit a single specific code bug.
+- **The second port is now directly implicated, 37 times, not once.** E12's
+  original run and this section's single-run analysis both located every
+  observed failure in the 1024 relay and treated the 1025 mechanism as
+  unimplicated-but-uncleared. Running it 243 more times found 37 cases of a
+  guest-side traceback on the second port's own `connect()` call — direct
+  evidence, not inference, that the 1025 mechanism itself fails under this
+  same load, at a low but real rate (37 of ~2,113 recovered failures, ≈1.75%
+  of all recovered failures across the whole run).
+
+##### What this run did not do
+
+In the interest of not overstating coverage: the loop's own disk hygiene
+(matching the earlier single-run diagnostic) keeps a VM's console log only
+for iterations with `fail_count > 0` — 107 of them in part 2 alone, still
+sitting under the rig's `/tmp/e13-overnight-part2/iter-*/console/`
+directories (gitignored, not pulled into this repo, per the same precedent
+as every other rig artifact this section cites). Beyond the single example
+that motivated this whole follow-up (one passing VM's console showing a
+genuine `sched: DL replenish lagged too much` kernel warning during the very
+first exploratory run), those logs were never systematically mined for
+kernel-level anomalies across the full night. That is a real, still-available
+next step, not something this section's numbers already cover.
+
+##### Bare-metal follow-up: the failure is substrate-independent, and the signature inverts
+
+The overnight run's own leading hypothesis (disk I/O contention, plausibly
+EBS burst-balance throttling — a mechanism specific to `nested-m8i` being a
+_shared_ EC2 instance type) is directly testable by running the identical
+diagnostic on dedicated hardware with none of the candidate confounds: no
+hypervisor above the guest, no shared tenancy, no EBS. `metal` in this
+project's own SH_SUBSTRATE convention (72 vCPU / 754 GiB, the same host
+E10/E11's bare-metal rungs used, golden snapshot digest
+`sha256:668af589...` confirmed unchanged before, during, and after) is
+exactly that host, already reserved. One hour, `SH_SUBSTRATE=metal`, same
+console-preserving throwaway patch, same telemetry.
+
+**80 iterations, 10,240 VM-attempts, 9.83% overall failure rate — essentially
+the same magnitude as `nested-m8i`'s 8.61%, on hardware with none of that
+rig's candidate causes.** `max_steal_pct` is `0.0` on every single iteration
+(correctly — there is no hypervisor above bare metal to steal from).
+`max_iowait_pct` stays in a narrow 0.40-1.35% band (mean 0.755%), nothing
+like `nested-m8i`'s 8x fast/slow split. `min_mem_available_bytes` never
+drops below 800 GB of ~810 GB total. Duration is tight and unimodal —
+14.19-16.40s, mean 15.05s — the bimodal ~19s/~125s pattern that dominated
+`nested-m8i` **does not appear at all**. And critically: **every single one
+of the 80 iterations had at least 2 failures** (range 2-21, mean 12.59) —
+this is not an occasional bad run, it is a persistent baseline. Correlating
+per-iteration values directly (Pearson, n=80): duration↔iowait **r=-0.136**,
+duration↔fail_count **r=0.198**, iowait↔fail_count **r=-0.132** — all three
+essentially null. Nothing this project measured on either substrate explains
+metal's failure rate.
+
+**The failure signature composition inverts completely.** `nested-m8i`
+recovered 2,113 failing records, 84% `read: EOF` (the 1024 relay dying, not
+the 1025 mechanism) and only 37 (1.75%) a guest-side `ConnectionResetError`
+on the 1025 `connect()` itself. Metal recovered 1,007 failing records, and
+**999 of them (99.2%)** are that same guest-side `ConnectionResetError` —
+`read: EOF` drops to 4 occurrences (0.4%).
+
+That inversion, together with the null correlations above, points at a
+specific, previously undiagnosed mechanism rather than resource contention
+of any kind: per this project's own documented Firecracker behavior ("if
+nobody listens, the guest gets `VIRTIO_VSOCK_OP_RST`" — `vsock.md`, quoted in
+`e12-vsock-egress-probe.sh`'s own header), a `ConnectionResetError` on the
+guest's `connect()` is the _expected_ response when the guest's connection
+attempt reaches Firecracker before the host-side listener on
+`<uds>_<PROBE_PORT>` is actually bound. `start_host_listener` starts a fresh
+`python3` process per VM and returns as soon as it is backgrounded — **not**
+once that process has reached `srv.listen()` — so at N=128, forking and
+execing 128 Python interpreters in close succession creates real variance in
+exactly when each one starts listening, independent of how much host
+compute is available to absorb that fork/exec burst. A guest whose `connect()`
+lands in that window gets RST, correctly, because nothing was listening yet.
+This is a race in the **probe's own per-VM-listener design**, not a defect
+in Firecracker's vsock backend or in the guest-initiated direction as such —
+and it is exactly why P4.1's existing recommendation to use one persistent,
+pre-bound multiplexed listener rather than one process per connection is not
+just an efficiency improvement: a listener that is already bound and
+`listen()`-ing long before any restore happens cannot lose this race at all.
+
+##### Rulings from this comparison
+
+- **The disk-I/O correlation found on `nested-m8i` is now best read as a
+  real but secondary or confounding signal, not the primary mechanism.**
+  It explained real variance on that specific, shared substrate and should
+  not be discarded — but it explains none of metal's failure rate, and
+  metal's failure rate is the same order of magnitude. The listener-startup
+  race is the more defensible primary explanation on the evidence collected
+  so far, precisely because it reproduces, unchanged in magnitude, on a
+  substrate where every host-resource-contention candidate this project has
+  measured (steal, iowait, memory) is flat, low, and abundant.
+- **This was never a test of whether the golden snapshot or the restore
+  mechanism itself is sound on metal** — rungs A, B, D and C@8 are not what
+  this follow-up re-ran, and nothing here should be read as reopening those.
+  It is specifically about rung C@128's own concurrent-probe apparatus,
+  which is throwaway diagnostic code, not the mechanism PR #268 would ship.
+
+##### The fix, applied and confirmed: 167.8x on the same substrate that showed the race clearest
+
+The listener-startup race described above is fixed directly in
+`start_host_listener()`: the host-side `python3` script now writes a marker
+file the instant its own `listen()` call returns — before `accept()` — and
+the bash function blocks on that marker (polling every 0.1s, `die`-ing loudly
+past 5s rather than hanging) before returning control to its caller. No
+caller can trigger the guest's `connect()` until the host side is genuinely
+bound and listening; a fixed sleep was deliberately not used, since under
+the exact N=128 contention this exists to survive a fixed delay is either too
+short (races again) or adds latency to every one of 128 concurrent probes for
+no reason on the common path.
+
+Confirmed on the same bare-metal host, same golden snapshot, same
+`SH_SUBSTRATE=metal`, same rung C@128, back to back with the pre-fix run
+above for the cleanest possible comparison:
+
+| Run                          | Iterations | VM-attempts | Failure rate | Iterations with zero failures | Mean fails/iteration |
+| ---------------------------- | ---------- | ----------- | ------------ | ----------------------------- | -------------------- |
+| Before (this section, above) | 80         | 10,240      | 9.83%        | 0 / 80                        | 12.59                |
+| **After the fix**            | 40         | 5,120       | **0.059%**   | **37 / 40**                   | **0.075**            |
+
+**167.8x reduction in failure rate.** Of the 3 residual failures across
+5,120 VM-attempts, every one is a member of the _other_ failure family this
+section already knew about and never attributed to the listener race —
+`read CONNECT ack: EOF`, `read: EOF`, and a `dial` failure — and **zero** are
+the guest-side `ConnectionResetError` on the 1025 `connect()` that made up
+99.2% of failures before the fix. The mechanism this section proposed is not
+just plausible in hindsight; fixing exactly that mechanism, and nothing
+else, removed exactly that failure signature, and nothing else moved it.
+
+Also confirmed, so this reads as a fix and not a regression: the existing
+`e12-vsock-egress-probe.test.sh` contract test (including its behavioral
+"host listener behaves like a real accept-once-and-reply server" check)
+passes unchanged, `shellcheck` is clean, and `make lint` passes end to end.
+The single-VM control path (rung A/B/D) is untouched by this change —
+`start_host_listener` is called identically from all of them, and the fix
+only changes when the function _returns_, not what it does.
+
+Rig left clean afterward: no live `firecracker`/`guest_client` processes, no
+leftover mounts or jail directories, golden snapshot digest unchanged
+throughout both the pre-fix and post-fix runs.
+
+##### The fix also confirmed on `nested-m8i`, sized to actually detect it there
+
+The listener race was never the _dominant_ failure on `nested-m8i` the way
+it was on metal — only 37 of 31,104 pre-fix VM-attempts (≈0.119%) were that
+signature there, next to the much larger iowait-correlated `read: EOF`
+family. That asymmetry matters for how big a confirmation run needs to be:
+detecting a rare signature's disappearance with confidence needs enough
+trials that seeing zero would be surprising if the true rate _hadn't_
+dropped. For a Poisson-style one-sided test, that threshold is
+`n > -ln(α)/p`; at `p = 0.119%` and `α = 0.01` (99% confidence), `n >
+3,866` VM-attempts (≈31 iterations at N=128). This run was sized well past
+that floor on purpose.
+
+**57 iterations, 7,296 VM-attempts, run to its own 90-minute budget on the
+fixed driver, `SH_SUBSTRATE=nested-m8i`.** The bimodal fast/slow pattern and
+its iowait correlation are unchanged, exactly as expected — this fix does
+not touch that mechanism at all: 33 fast / 24 slow iterations, fast mean
+iowait 0.269% vs. slow mean 1.545%, fast per-VM failure rate 0.92% vs. slow
+15.53%, duration↔iowait **r=0.622**, duration↔fail_count **r=0.689**,
+iowait↔fail_count **r=0.504** — all consistent in direction and magnitude
+with the pre-fix overnight run's own r=0.788/0.582/0.41 (sampling variance
+across a 57- vs. 243-iteration window, not a change in the underlying
+relationship). Overall failure rate is 7.07% (516/7,296), close to the
+pre-fix baseline's own wide swings — exactly the outcome predicted: the
+fix's true contribution to the _overall_ rate is a fraction of a point
+against a noise floor of dozens of points, not something a run this size
+could resolve either way, and it was not the metric this run was sized to
+resolve.
+
+**The signature it _was_ sized to resolve: zero.** Of 423 recovered failing
+records (516 counted, the same ~18% `die()`-bypass gap as every other run
+in this section), the breakdown is `read: EOF` 344, `dial-fail` 57,
+handshake-ack `connection reset` 13, handshake-ack `EOF` 6, handshake-ack
+`i/o timeout` 2, `short-payload` 1 — **and zero guest-side
+`ConnectionResetError` on the 1025 `connect()`.** Against the 0.119%
+baseline rate, observing zero in 7,296 attempts has a probability of
+`e^(-7296 × 0.00119) ≈ 0.00017` (0.017%) under the hypothesis that the rate
+had not actually changed — this is not an ambiguous null result stretched
+to look positive; it is a specific, rare signature disappearing at a
+confidence level the run was deliberately sized to reach. Rig left clean
+afterward: no live processes, no leftover mounts or jails, golden snapshot
+digest (`sha256:833401a1...`, `nested-m8i`'s own, distinct from metal's)
+unchanged throughout.
+
+Read together with the bare-metal confirmation above, the fix's effect is
+now established on two substrates with very different baseline exposure to
+it (metal: 99.2% of failures; `nested-m8i`: 1.75%) and it disappears
+completely on both, while each substrate's own _other_, unrelated failure
+mechanism (disk I/O contention on `nested-m8i`; the smaller residual family
+on metal) is left exactly where it was — which is the correct outcome for a
+fix that targets one specific mechanism among several, not evidence that
+either follow-up's other findings were wrong.
+
+#### Effect on PR #268 and P4.1
+
+**T1 (route all sandbox egress over vsock) stands, and the bare-metal
+follow-up's diagnosis is now a confirmed fix on both substrates tested, not
+just a hypothesis.** E12 established the mechanism across rungs A, B, D and
+C@8. The overnight follow-up found the 1025 mechanism itself failing
+directly (37 times, small next to the 1024-relay signatures). The metal
+follow-up found _why_: on a substrate where every host-resource candidate is
+flat and abundant, 99.2% of failures were that same guest-side reset,
+matching this project's own documented Firecracker behavior for "nobody was
+listening yet" — a race in the throwaway _probe's_ one-process-per-VM
+listener design, not a defect in the vsock mechanism PR #268 actually ships.
+Fixing exactly that race (see below) cut the failure rate **167.8x** (9.83%
+→ 0.059%) on metal, with the guest-side reset signature going to zero across
+5,120 VM-attempts. Re-run on `nested-m8i` — where the same signature was
+only ≈0.119% of pre-fix attempts, not 99.2% — it disappeared there too,
+to zero across 7,296 post-fix VM-attempts (p ≈ 0.017% under "the rate didn't
+actually change"), while that substrate's own unrelated, iowait-correlated
+failure mechanism stayed exactly where it was. Nothing on any substrate
+resembles the restore-mechanism failure that would force the NIC option
+(spec §2).
+
+**P4.1's open scale/capacity question should be re-scoped, not just carried
+forward.** E12 framed it as "how many concurrent egress connections a single
+host is expected to serve, and whether restores should be staggered or
+rate-limited." The restore-count half of that is answered in the negative at
+N=128 on every substrate tried, so staggering restores is not the lever. The
+question that survives is narrower than either follow-up first suggested:
+**does P4.1's own listener implementation avoid the specific startup-ordering
+race this probe's throwaway version did not.** Concretely, for P4.1:
+
+1. **Do not carry E12's one-host-process-per-connection shape into the
+   implementation — confirmed as the load-bearing recommendation, not a
+   nice-to-have.** `start_host_listener`'s fix (block until the listener's
+   own `listen()` call has actually succeeded, not just until its process is
+   backgrounded) cut this probe's own failure rate 167.8x on bare metal.
+   Production's listener will be a single persistent, pre-bound one started
+   well before any restore begins, which cannot lose an equivalent race at
+   all — but the _shape_ of the bug (trusting "the process is running" as a
+   proxy for "the socket is ready to accept") is exactly the class of defect
+   a multiplexed design must not reintroduce in its own startup path.
+2. **Treat the Exec relay on 1024 as fallible under concurrent load, on the
+   substrate where it is the dominant signature.** On `nested-m8i` specifically,
+   an unrelated channel's transport dying while the host is busy was 84% of
+   recovered failures. Whatever P4.1 builds on top of Exec still needs a
+   retry with backoff; a single `read: EOF` must not be terminal — but see
+   item 4 below for why this should not be read as the general explanation.
+3. **Gate on a distribution, not a run.** 1/128, 52/128, 38/128 on
+   `nested-m8i`, a 243-iteration spread from 0 to 61 failures there, and now
+   80/80 metal iterations all failing (2-21 each, never zero) — three
+   different substrates, none of them giving a single trustworthy rate for
+   the same rung at the same N. Any acceptance threshold needs repeated
+   trials regardless of substrate.
+4. **The disk-I/O correlation found on `nested-m8i` (r=0.788 against
+   duration) is real but substrate-specific, not the general mechanism.**
+   It explained real variance there and should still inform staggering
+   decisions on shared EC2 instance types specifically — but the metal run's
+   near-identical ~10% failure rate, with steal at a flat `0.0%`, iowait in a
+   narrow 0.4-1.35% band, and near-null correlations throughout (all three
+   |r| < 0.2), shows disk I/O contention cannot be the general explanation.
+   Confirming the `nested-m8i` finding as EBS-specific still needs an
+   AWS-level burst-balance metric neither run collected.
+5. **The second-port failures on this probe were the listener race, almost
+   entirely — but "almost" is doing real work in that sentence.** 999 of
+   1,007 pre-fix metal failures were the guest-side reset; the fix drove
+   that signature to zero across 5,120 post-fix VM-attempts. That is strong
+   evidence the race was the dominant cause on this probe, not proof the
+   guest-initiated direction has no other failure mode under load — P4.1's
+   own implementation should still not assume the direction is failure-free
+   just because this specific, now-fixed defect accounted for nearly all of
+   what was observed here.
+6. **CPU utilization itself is still unmeasured, on either substrate.** Both
+   follow-ups added steal% and iowait%; steal was flat and uninformative on
+   both (uninterpretable-but-present on `nested-m8i`, `0.0%` by construction
+   on metal). Neither run measured this host's own CPU utilization or
+   run-queue depth during the burst. Lower priority now that the listener
+   race is fixed and confirmed as the dominant cause, but still an open gap
+   in what either follow-up actually collected.

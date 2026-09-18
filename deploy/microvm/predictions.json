@@ -36,6 +36,22 @@
       "metric": "idle standby residency and workspace count, sampled after each rung's last Exec",
       "falsifiedBy": "standbys outliving StandbyIdle + ReclaimScanInterval on an idle host, workspaces vanishing before WorkspaceIdle, or residency reading zero rather than (runs finishing) x D",
       "note": "Predicts the reclamation path's SHAPE — convergence with no arrival to trigger it, and RAM released long before state is."
+    },
+    {
+      "id": 6,
+      "experiment": "E12",
+      "claim": "Guest-initiated vsock on a second port (1025) works on a fresh boot and survives snapshot restore, for all N concurrent restores of one snapshot, because the guest-to-host direction needs no handshake and no host-side state beyond the socket file - strictly less state to reset than the host-initiated direction already known to survive.",
+      "metric": "per-rung boolean: the VM's unique nonce captured host-side on <jail>/vsock.sock_1025 AND 'ACK <nonce>' returned in that VM's guest stdout, for rungs A, B, C(N=8), C(N=128), D",
+      "falsifiedBy": "any rung B, C or D reporting ok=false while rung A reported ok=true",
+      "note": "Rung A failing falsifies nothing about Firecracker - it indicts our own plumbing or socket naming, and the probe is retried. Recorded before rung A ran, per issue #271."
+    },
+    {
+      "id": 7,
+      "experiment": "E13",
+      "claim": "PR #272's rung C@128 connection failures are caused by host memory exhaustion under 128x256MiB guest RAM demand against nested-m8i's 15 GiB total (per issue #266's own admission-budget finding on this rig class), not by a defect in the guest-initiated vsock-across-restore mechanism E12 added.",
+      "metric": "e13-restore-capacity-control.sh's control-128.json fail_count (existing 1024 Exec only, no second port) compared against PR #272's rung-C-128.json fail_count; and e13-correlate.py's failed_near_oom_event / failed_below_low_water counts from a telemetry-wrapped rerun of rung C@128",
+      "falsifiedBy": "the control script's fail_count at N=128 is close to zero while PR #272's own rung C@128 fail_count stayed high, OR the telemetry rerun shows no OOM-killer activity and MemAvailable never drops near the control script's failures' timestamps",
+      "note": "If the control script (no second port at all) reproduces a similar failure rate to PR #272's rung C@128, that alone falsifies any claim that E12's mechanism is implicated - the fix belongs to concurrent-restore capacity, not to vsock-across-restore."
     }
   ]
 }
