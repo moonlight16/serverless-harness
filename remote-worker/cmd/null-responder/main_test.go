@@ -107,12 +107,12 @@ func TestAbortReturnsAnEmptyResponse(t *testing.T) {
 // and no execution, so anything that reached it over a network and believed it would be told
 // its commands ran when nothing did.
 func TestRequireLoopback(t *testing.T) {
-	for _, ok := range []string{"127.0.0.1:8445", "localhost:8445", "[::1]:8445", "127.0.0.2:0"} {
+	for _, ok := range []string{"127.0.0.1:8445", "localhost:8445", "[::1]:8445", "127.0.0.2:0", "[::ffff:127.0.0.1]:8445"} {
 		if err := requireLoopback(ok); err != nil {
 			t.Errorf("requireLoopback(%q) = %v, want nil", ok, err)
 		}
 	}
-	for _, bad := range []string{":8445", "0.0.0.0:8445", "10.0.0.5:8445", "example.com:8445", "8445"} {
+	for _, bad := range []string{":8445", "0.0.0.0:8445", "10.0.0.5:8445", "example.com:8445", "8445", "[::]:8445", "[2001:db8::1]:8445"} {
 		err := requireLoopback(bad)
 		if err == nil {
 			t.Errorf("requireLoopback(%q) = nil, want a refusal", bad)

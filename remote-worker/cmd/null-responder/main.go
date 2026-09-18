@@ -89,6 +89,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("null-responder: listen %s: %v", *addr, err)
 	}
+	// requireLoopback checked the requested string, which does not resolve "localhost" and
+	// so could pass despite the actual bind landing on a non-loopback interface. Check the
+	// socket lis actually bound, not the flag string, before serving a single request.
+	if tcpAddr, ok := lis.Addr().(*net.TCPAddr); !ok || !tcpAddr.IP.IsLoopback() {
+		log.Fatalf("null-responder: bound address %s is not loopback - the null-responder answers every Exec with success and no execution, so it must never be reachable off this host (issue #291 section 4)", lis.Addr())
+	}
 	log.Printf("null-responder: serving sandbox.v1.SandboxExec on %s (E11 driver-control arm, issue #291)", lis.Addr())
 	if err := newServer().Serve(lis); err != nil {
 		log.Fatalf("null-responder: serve: %v", err)
