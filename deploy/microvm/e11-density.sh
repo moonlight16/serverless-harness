@@ -298,6 +298,17 @@ E11_START_STACK="${SH_E11_START_STACK:-1}"
 # because a digest this script has never pulled would be a guess, not a pin.
 E11_REDIS_IMAGE="${SH_E11_REDIS_IMAGE:-redis:7}"
 
+# A per-invocation identity, stamped into every rung record and enforced by assemble_ladder.
+# WHY: $RESULTS accumulates across runs and nothing clears it -- not this script, not the metal
+# runbook. assemble_ladder used to glob `e11-rung-<arm>-c*.json`, so a rung left over from an
+# EARLIER run with different settings was silently assembled into the current ladder. Observed
+# during issue #291's shakedown: a c=2 rung from a 20-iter smoke reappeared inside a 600-iter
+# ladder, carrying that run's one-sample hostCpuFraction. detectKnee anchors on the c=1 baseline,
+# so a stale c=1 does not merely add a bad point -- it re-scales every health decision after it.
+# That is this issue's own failure mode one level up: a ladder that looks complete while mixing
+# measurements that were never comparable.
+E11_RUN_ID="${SH_E11_RUN_ID:-$(date +%Y%m%dT%H%M%S)-$$}"
+
 die() { echo "e11: $*" >&2; exit 1; }
 log() { echo "e11: $*" >&2; }
 
@@ -1833,6 +1844,7 @@ rec = {
   'arm': '$arm',
   'standbyDepth': $d_json,
   'guestRamMb': $ram_json,
+  'runId': '$E11_RUN_ID',
   'substrate': '$SUBSTRATE',
   'repoCacheShape': '$REPO_CACHE_SHAPE',
   'convergeMsP50': $converge_p50,
@@ -1871,14 +1883,33 @@ open('$out_json_path', 'w').write(json.dumps(rec, indent=2))
 # assemble_ladder collects every per-rung JSON file for one (arm, D, guest RAM)
 # slice into a single JSON array, ascending by c, ready for analyzeLadder.
 assemble_ladder() {
-  local pattern="$1" out_path="$2"
+  local pattern="$1" out_path="$2" rc=0
+  # Only THIS invocation's rungs. A record with no runId predates the stamp and is treated as
+  # stale, which is the safe direction: it cannot be shown to belong to this run.
   python3 -c "
-import glob, json
-files = sorted(glob.glob('$pattern'))
-recs = [json.load(open(f)) for f in files]
+import glob, json, sys
+run_id = '$E11_RUN_ID'
+kept, skipped = [], []
+for f in sorted(glob.glob('$pattern')):
+    r = json.load(open(f))
+    (kept if r.get('runId') == run_id else skipped).append((f, r))
+if skipped:
+    sys.stderr.write('e11: assemble_ladder SKIPPED %d stale rung record(s) not from this run (%s): %s\n'
+                     % (len(skipped), run_id, ', '.join(f.split('/')[-1] for f, _ in skipped)))
+if not kept:
+    sys.stderr.write('e11: assemble_ladder found no rung records from this run matching $pattern - '
+                     'refusing to write an empty or all-stale ladder to $out_path\n')
+    sys.exit(1)
+recs = [r for _, r in kept]
 recs.sort(key=lambda r: r['c'])
 open('$out_path', 'w').write(json.dumps(recs, indent=2))
 "
+  # The closing quote above MUST stay on its own line: extract_fn skips the span between
+  # `  python3 -c "` and a bare `"` (Task 3 taught it to, because this file's record writer has a
+  # column-0 `}` inside its python dict). Appending `|| die ...` to that line leaves the skip open,
+  # so extraction swallows the rest of the function and the tests source a snippet without it.
+  rc=$?
+  [ "$rc" -eq 0 ] || die "assemble_ladder could not build $out_path from this run's rungs (see the refusal above) - a ladder mixing runs is worse than no ladder, because detectKnee re-scales every health decision off its c=1 baseline"
 }
 
 # analyze_slice invokes experiments/src/microvm-density.ts's analyzeLadder against

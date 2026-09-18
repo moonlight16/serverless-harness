@@ -568,6 +568,7 @@ if [ -n "$writer_body" ] && [ -n "$dim_body" ]; then
       standbys_resident=0 idle_residency=0 reclaim_converge_s=0 converge_p50=7
       errors_json='{}'
       SUBSTRATE=nested-m8i REPO_CACHE_SHAPE=accept-cold-fetch COLD_LATENCY_MS=50
+      E11_RUN_ID=RUN-FIXTURE
       eval "$writer_body"
     )
   }
@@ -1974,6 +1975,92 @@ if [ -n "$thin_rdr" ]; then
 fi
 check "the ITERS_PER_SLOT default carries the >=10-ticks sizing rule" \
   "$([ "$(grep -c 'AT LEAST ~10 SAMPLER TICKS' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
+# ---------------------------------------------------------------------------
+# A ladder may only contain rungs from THIS run (issue #291 shakedown).
+#
+# $RESULTS accumulates across runs and nothing clears it. assemble_ladder globbed
+# e11-rung-<arm>-c*.json, so a rung from an earlier run with different settings joined the current
+# ladder silently -- observed for real: a c=2 rung from a 20-iter smoke reappeared inside a
+# 600-iter ladder carrying its one-sample hostCpuFraction. detectKnee anchors on the c=1 baseline,
+# so a stale c=1 re-scales every health decision after it.
+# ---------------------------------------------------------------------------
+echo "== assemble_ladder takes only this run's rungs, and says what it dropped"
+
+al_body="$(extract_fns die assemble_ladder || true)"
+# Guarded on assemble_ladder ALONE, not on the concatenation: extract_fns prints each body as it
+# iterates and only fails at the first MISSING name, so `die` alone would make the concatenation
+# non-empty and this guard would pass while the snippet lacked the function under test. That
+# happened while writing this very block -- the sourced snippet had only `die` and every call
+# below exited 127.
+check "assemble_ladder alone is extractable (a guard extract_fns cannot fake)" \
+  "$([ -n "$(extract_fn assemble_ladder || true)" ] && echo yes || echo no)" "yes"
+
+if [ -n "$al_body" ]; then
+  al_tmpdir="$(mktemp -d)"
+  al_snippet="$al_tmpdir/al.sh"
+  printf '%s\n' "$al_body" >"$al_snippet"
+  mk_rung() { printf '{"c": %s, "runId": %s, "throughput": 1.0}\n' "$1" "$2" >"$al_tmpdir/e11-rung-x-c$1.json"; }
+  # Two rungs from this run, one left over from an earlier one.
+  mk_rung 1 '"RUN-CURRENT"'
+  mk_rung 4 '"RUN-CURRENT"'
+  mk_rung 2 '"RUN-STALE"'
+  al_out="$al_tmpdir/ladder.json"
+  al_rc=0
+  al_err=$(
+    (
+      E11_RUN_ID="RUN-CURRENT"
+      # shellcheck disable=SC1090
+      . "$al_snippet"
+      assemble_ladder "$al_tmpdir/e11-rung-x-c*.json" "$al_out"
+    ) 2>&1
+  ) || al_rc=$?
+  check "it succeeds when at least one rung is from this run" "$al_rc" "0"
+  check "  ...and the ladder contains ONLY this run's rungs" \
+    "$(python3 -c 'import json,sys; print(",".join(str(r["c"]) for r in json.load(open(sys.argv[1]))))' "$al_out")" "1,4"
+  case "$al_err" in *SKIPPED*e11-rung-x-c2.json*) al_said=yes ;; *) al_said=no ;; esac
+  check "  ...and it NAMES the stale record it dropped, rather than dropping it silently" "$al_said" "yes"
+
+  # NON-VACUOUSNESS: without the runId filter a glob would have taken all three.
+  check "non-vacuousness: the glob really does match all three files" \
+    "$(ls "$al_tmpdir"/e11-rung-x-c*.json | wc -l | tr -d ' ')" "3"
+
+  # An all-stale directory is a refusal, not an empty ladder.
+  al_stale_rc=0
+  al_stale_err=$(
+    (
+      E11_RUN_ID="RUN-DIFFERENT"
+      # shellcheck disable=SC1090
+      . "$al_snippet"
+      assemble_ladder "$al_tmpdir/e11-rung-x-c*.json" "$al_tmpdir/ladder2.json"
+    ) 2>&1
+  ) || al_stale_rc=$?
+  check "an all-stale directory REFUSES rather than writing an empty ladder" \
+    "$([ "$al_stale_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "  ...and writes no ladder file at all" \
+    "$([ -e "$al_tmpdir/ladder2.json" ] && echo wrote || echo nothing)" "nothing"
+  case "$al_stale_err" in *"mixing runs is worse than no ladder"*) al_why=yes ;; *) al_why=no ;; esac
+  check "  ...and the refusal explains why a mixed ladder is worse than none" "$al_why" "yes"
+
+  # A record predating the stamp has no runId and must count as stale (the safe direction).
+  printf '{"c": 8, "throughput": 1.0}\n' >"$al_tmpdir/e11-rung-x-c8.json"
+  al_nostamp=$(
+    (
+      E11_RUN_ID="RUN-CURRENT"
+      # shellcheck disable=SC1090
+      . "$al_snippet"
+      assemble_ladder "$al_tmpdir/e11-rung-x-c*.json" "$al_tmpdir/ladder3.json"
+    ) 2>&1 >/dev/null
+  )
+  check "a record with NO runId is treated as stale (it cannot be shown to be ours)" \
+    "$(python3 -c 'import json,sys; print(",".join(str(r["c"]) for r in json.load(open(sys.argv[1]))))' "$al_tmpdir/ladder3.json")" "1,4"
+  case "$al_nostamp" in *e11-rung-x-c8.json*) al_named8=yes ;; *) al_named8=no ;; esac
+  check "  ...and it is named among the skipped" "$al_named8" "yes"
+
+  rm -rf "$al_tmpdir"
+fi
+check "every rung record carries the run id" \
+  "$(grep -c "'runId': '\$E11_RUN_ID'," "$SCRIPT")" "1"
 
 echo "== RSS is never read as a fallback anywhere pss_bytes_for_pids or its callers run"
 # Comment lines (the header's own disclosure that RSS/VmRSS is deliberately
