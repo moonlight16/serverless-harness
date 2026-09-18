@@ -124,9 +124,9 @@ function sharedLease(url: string | undefined): LeaseStore {
   };
   return {
     load: (pod) => call((s) => s.load(pod)),
-    acquire: (pod, cap, runId, ttlMs) => call((s) => s.acquire(pod, cap, runId, ttlMs)),
-    heartbeat: (pod, runId, ttlMs) => call((s) => s.heartbeat(pod, runId, ttlMs)),
-    release: (pod, runId) => call((s) => s.release(pod, runId)),
+    acquire: (pod, cap, holderId, ttlMs) => call((s) => s.acquire(pod, cap, holderId, ttlMs)),
+    heartbeat: (pod, holderId, ttlMs) => call((s) => s.heartbeat(pod, holderId, ttlMs)),
+    release: (pod, holderId) => call((s) => s.release(pod, holderId)),
   };
 }
 
@@ -324,14 +324,23 @@ function defaultExecClient(_sandboxId: string, env: NodeJS.ProcessEnv): ExecClie
  *    is true), pick least-loaded under the soft cap, acquire a lease. Throws
  *    SandboxPoolSaturatedError if every candidate is full.
  *  - `SH_SANDBOX_DISCOVERY` narrows which inventories are consulted (see resolveDiscoverySource).
+ *
+ * TWO identities arrive here and they are not interchangeable. `sessionId` keys the microVM WORKSPACE
+ * and must be stable across the turns of a session; `opts.holderId` is the lease's ZSET member and
+ * must be unique per concurrent holder. They are equal for a leaf (one session executing once) and
+ * differ for `/turn` (many concurrent turns of one session), which is why the holder is a separate,
+ * optional argument that defaults to the session id rather than something derived here.
  */
 export async function selectPoolSandbox(
   env: NodeJS.ProcessEnv,
   headCwd: string,
   sessionId: string,
-  opts: { cap: number; ttlMs: number; remoteSandbox?: boolean },
+  opts: { cap: number; ttlMs: number; remoteSandbox?: boolean; holderId?: string },
   deps: SelectDeps = {},
 ): Promise<SelectedSandbox | null> {
+  // Defaults to the session id, which is exactly what every leaf path wants and what this function
+  // did before /turn began leasing here — so a caller that passes no holder keeps today's behaviour.
+  const holderId = opts.holderId ?? sessionId;
   const selector = env.KAGENTI_SANDBOX_POOL_SELECTOR;
   if (!selector) {
     const config = await resolveSandboxConfig(env, headCwd, deps.run);
@@ -366,7 +375,7 @@ export async function selectPoolSandbox(
     candidates.map(async (name) => ({ pod: name, active: await lease.load(name) })),
   );
   for (const name of orderByLoad(loads)) {
-    if (await lease.acquire(name, opts.cap, sessionId, opts.ttlMs)) {
+    if (await lease.acquire(name, opts.cap, holderId, opts.ttlMs)) {
       const config: K8sSandboxConfig = { pod: name, namespace, context, podCwd, headCwd };
       const rec = grpcById.get(name);
       const make = deps.makeTransport ?? GrpcRelayTransport;
@@ -374,11 +383,16 @@ export async function selectPoolSandbox(
         ? make(
             name,
             (deps.makeExecClient ?? ((id: string) => defaultExecClient(id, env)))(name),
-            // The lease's session id becomes the Exec's workspace_key. This is the ONLY
-            // harness change the microVM tier needs, and it is required for
-            // correctness rather than convenience: without it, consecutive
-            // leaseholders of one sandbox_id inherit the previous session's workspace
-            // (spec §3.4).
+            // The SESSION id becomes the Exec's workspace_key -- never the lease holder id. This is
+            // the ONLY harness change the microVM tier needs, and it is required for correctness
+            // rather than convenience: without it, consecutive leaseholders of one sandbox_id inherit
+            // the previous session's workspace (spec §3.4).
+            //
+            // It has to be the session id specifically, because the key is also what makes a session
+            // CONTINUOUS: `WorkspaceRoot/<workspace_key>` is created on the first Exec for an unseen
+            // key and lives until an idle Reclaim (§4.4), so keying it per turn would open turn 2 of a
+            // session in an empty workspace and give it its own standby VM pool (§4.3) -- continuity
+            // lost and standbys multiplied per turn rather than per session.
             { workspaceKey: sessionId },
           )
         : undefined;
@@ -386,8 +400,8 @@ export async function selectPoolSandbox(
         config,
         transport,
         leased: true,
-        heartbeat: () => lease.heartbeat(name, sessionId, opts.ttlMs),
-        release: () => lease.release(name, sessionId),
+        heartbeat: () => lease.heartbeat(name, holderId, opts.ttlMs),
+        release: () => lease.release(name, holderId),
       };
     }
   }

@@ -48,21 +48,24 @@ describe('orderByLoad', () => {
 function fakeLease(
   loads: Record<string, number>,
   cap: number,
-): LeaseStore & { acquired: string[]; acquiredTtl: number[] } {
+): LeaseStore & { acquired: string[]; acquiredTtl: number[]; acquiredHolders: string[] } {
   const counts = { ...loads };
   const acquired: string[] = [];
   const acquiredTtl: number[] = [];
+  const acquiredHolders: string[] = [];
   return {
     acquired,
     acquiredTtl,
+    acquiredHolders,
     async load(pod) {
       return counts[pod] ?? 0;
     },
-    async acquire(pod, c, _sessionId, ttlMs) {
+    async acquire(pod, c, holderId, ttlMs) {
       if ((counts[pod] ?? 0) < c) {
         counts[pod] = (counts[pod] ?? 0) + 1;
         acquired.push(pod);
         acquiredTtl.push(ttlMs);
+        acquiredHolders.push(holderId);
         return true;
       }
       return false;
@@ -184,7 +187,7 @@ describe('selectPoolSandbox remote dispatch', () => {
     expect(sel?.config.pod).toBe('sbx-remote-1');
   });
 
-  it('gives the leased transport the run id as its workspace key', async () => {
+  it('gives the leased transport the SESSION id as its workspace key', async () => {
     const lease = fakeLease({ 'sbx-remote-1': 0 }, opts.cap);
     let seen: { id: string; opts?: { workspaceKey?: string } } | undefined;
     const fakeTransport = {
@@ -203,10 +206,44 @@ describe('selectPoolSandbox remote dispatch', () => {
       },
     });
     expect(sel?.transport).toBeDefined();
-    // The run id IS the workspace key: leases are keyed by leaf run id
-    // (sandbox-lease.ts:3), so anything else here would key a workspace on
-    // something the lease does not own (spec §3.4).
+    // The SESSION id is the workspace key. A leaf passes no separate holder, so the two ids coincide
+    // here — the case that distinguishes them is below.
     expect(seen?.opts?.workspaceKey).toBe('leaf-abc123');
+  });
+
+  it('keys the workspace by the session id even when the LEASE holder differs', async () => {
+    // The `/turn` shape: many concurrent turns of one session, so each takes its lease under its own
+    // per-turn holder while all of them must share the session's workspace. Keying the workspace by
+    // the holder instead gave turn 2 an empty `WorkspaceRoot/<key>` and its own standby VM pool
+    // (spec §3.4, §4.3, §4.4) — cross-turn continuity lost, standbys multiplied per turn.
+    const lease = fakeLease({ 'sbx-remote-1': 0 }, opts.cap);
+    let seen: { id: string; opts?: { workspaceKey?: string } } | undefined;
+    const fakeTransport = {
+      exec: async () => ({ stdout: Buffer.alloc(0), exitCode: 0, truncated: false }),
+      close: async () => {},
+    };
+    const sel = await selectPoolSandbox(
+      env(),
+      '/head',
+      'sess-1',
+      { ...opts, holderId: 'sess-1:11111111-2222-3333-4444-555555555555' },
+      {
+        listPods: async () => [],
+        lease,
+        records: fakeRecords([grpcRec]),
+        makeExecClient: () => fakeExecClient,
+        makeTransport: (id, _client, transportOpts) => {
+          seen = { id, opts: transportOpts };
+          return fakeTransport;
+        },
+      },
+    );
+
+    expect(sel?.transport).toBeDefined();
+    expect(seen?.opts?.workspaceKey).toBe('sess-1');
+    // ...and the lease itself is taken under the holder, not the session id.
+    expect(lease.acquired).toEqual(['sbx-remote-1']);
+    expect(lease.acquiredHolders).toEqual(['sess-1:11111111-2222-3333-4444-555555555555']);
   });
 });
 

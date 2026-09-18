@@ -123,13 +123,18 @@ describe('acquireTurnSandbox', () => {
       undefined,
       { KAGENTI_SANDBOX_POOL_SELECTOR: 'app=sandbox' },
       '/head',
-      'run-42',
+      'sess-42',
       { lease, listPods: async () => ['sandbox-a'] },
     );
 
     expect(got.sandbox.config?.pod).toBe('sandbox-a');
     expect(got.leased).toBe(true);
-    expect(lease.calls).toContain('acquire:sandbox-a:run-42');
+    // The member is the per-turn HOLDER, derived here from the session id -- not the session id
+    // itself, which would make N concurrent turns of one session share one lease slot
+    // (turn-lease-holder.test.ts covers why). Prefixed by it for greppability.
+    const acquire = lease.calls.find((c) => c.startsWith('acquire:'));
+    expect(acquire).toMatch(/^acquire:sandbox-a:sess-42:[0-9a-f-]{36}$/);
+    expect(lease.calls).not.toContain('acquire:sandbox-a:sess-42');
   });
 
   it('drives the real lease store on heartbeat and release', async () => {
@@ -139,16 +144,22 @@ describe('acquireTurnSandbox', () => {
       undefined,
       { KAGENTI_SANDBOX_POOL_SELECTOR: 'app=sandbox' },
       '/head',
-      'run-42',
+      'sess-42',
       { lease, listPods: async () => ['sandbox-a'] },
     );
     await got.heartbeat();
     await got.release();
 
     // Asserted against the store's own recorded calls: a fake that merely agreed with a spy count
-    // would pass even if heartbeat/release were wired to the wrong pod or runId.
-    expect(lease.calls).toContain('heartbeat:sandbox-a:run-42');
-    expect(lease.calls).toContain('release:sandbox-a:run-42');
+    // would pass even if heartbeat/release were wired to the wrong pod or holder. Renewal and release
+    // must name the SAME member acquire took, or a turn renews nothing and releases someone else's
+    // lease -- so this reads the holder off the acquire rather than hard-coding it.
+    const holder = lease.calls
+      .find((c) => c.startsWith('acquire:sandbox-a:'))!
+      .slice('acquire:sandbox-a:'.length);
+    expect(holder).toMatch(/^sess-42:[0-9a-f-]{36}$/);
+    expect(lease.calls).toContain(`heartbeat:sandbox-a:${holder}`);
+    expect(lease.calls).toContain(`release:sandbox-a:${holder}`);
   });
 
   it('treats an empty-string selector as no pool, matching selectPoolSandbox exactly', async () => {

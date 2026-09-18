@@ -122,12 +122,17 @@ export interface AcquiredTurnSandbox {
 }
 
 /**
- * The runId a turn holds its sandbox lease under. Unique per TURN — never the session id.
+ * The id a turn holds its sandbox lease under. Unique per TURN — never the session id.
  *
- * The runId is the ZSET *member* in `ACQUIRE_LUA` (sandbox-lease.ts), not a payload, so a repeated
+ * Named for what it identifies (the lease's HOLDER) rather than a "run": #279 established that `run`
+ * is not a harness concept and that the old lease `runId` was `session_id` under another name. This
+ * value is the counter-example that makes the identity real — it MUST differ from the session id, for
+ * the two reasons below — so it gets its own descriptive name, as docs/glossary.md prescribes.
+ *
+ * The holder id is the ZSET *member* in `ACQUIRE_LUA` (sandbox-lease.ts), not a payload, so a repeated
  * value is one lease rather than two: `ZADD` on an existing member updates its score and leaves
  * `ZCARD` unchanged. A session id is stable across every turn of a session by design (that is what
- * lets `:openFromCheckpoint` reopen one), so deriving the runId from it would have made the RESUME
+ * lets `:openFromCheckpoint` reopen one), so deriving the holder from it would have made the RESUME
  * path — the one the supervisor exists to serve — the path that shares leases, and broken the pool
  * two ways:
  *
@@ -141,10 +146,11 @@ export interface AcquiredTurnSandbox {
  *    later, so `load()` returns a different answer depending on where in the heartbeat interval it is
  *    sampled.
  *
- * The session id is prefixed for greppability only — nothing reads the runId back, and the UUID is
- * what carries the uniqueness.
+ * The session id is prefixed for greppability only — nothing reads the holder back, and the UUID is
+ * what carries the uniqueness. The session id itself still reaches `selectPoolSandbox` separately,
+ * because it is what keys the microVM workspace and must stay stable across a session's turns.
  */
-export function turnRunId(sessionId?: string): string {
+export function turnLeaseHolder(sessionId?: string): string {
   return `${sessionId ?? 'anon'}:${randomUUID()}`;
 }
 
@@ -178,7 +184,7 @@ export async function acquireTurnSandbox(
   injected: TurnSandbox | undefined,
   env: NodeJS.ProcessEnv,
   headCwd: string,
-  runId: string,
+  sessionId: string | undefined,
   deps: SelectDeps = {},
 ): Promise<AcquiredTurnSandbox> {
   const noop = async () => {};
@@ -190,11 +196,18 @@ export async function acquireTurnSandbox(
   // so hardening it (an empty or unparseable value no longer becoming 0/NaN) could not harden this
   // path and leave a leaf behind.
   const { cap, ttlMs } = leaseTimings(env);
+  // The holder is derived HERE rather than taken from the caller, so a per-turn id cannot be forgotten
+  // at one of several call sites — the M1 defect was exactly one such expression.
+  const holderId = turnLeaseHolder(sessionId);
   const selected = await selectPoolSandbox(
     env,
     headCwd,
-    runId,
-    { cap, ttlMs, remoteSandbox: env.SH_REMOTE_SANDBOX === '1' },
+    // An anonymous turn has no session, so there is no continuity to preserve and no shared workspace
+    // it should join: keying it by its unique holder gives it its own, which is the correct answer for
+    // a one-off. Sharing a literal 'anon' workspace across unrelated turns would be the cross-turn
+    // bleed spec §2.3 is about, and an EMPTY key is refused outright by microvm-worker (§3.4).
+    sessionId ?? holderId,
+    { cap, ttlMs, holderId, remoteSandbox: env.SH_REMOTE_SANDBOX === '1' },
     deps,
   );
   if (!selected)
@@ -612,12 +625,7 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<TurnResult> 
   // a normal return, a throw, and an abort (input.signal → session.abort(), which resolves the prompt
   // and unwinds through this finally). A leaked lease would hold a pool slot for its full TTL and, at
   // E8's concurrency, starve the pool it is meant to measure.
-  const acquired = await acquireTurnSandbox(
-    input.sandbox,
-    process.env,
-    cwd,
-    turnRunId(input.sessionId),
-  );
+  const acquired = await acquireTurnSandbox(input.sandbox, process.env, cwd, input.sessionId);
 
   let leaseRenewal: ReturnType<typeof setInterval> | undefined;
   if (acquired.leased) {

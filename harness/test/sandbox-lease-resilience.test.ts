@@ -16,19 +16,26 @@ import { RedisLeaseStore } from '../src/sandbox-lease.js';
  * caller happens to swallow (`void store.close().catch(() => {})`) and the next one need not: a
  * teardown helper that awaits would fail on the failure path, which is the path teardown exists for.
  *
- * Runs against a port nothing listens on, so it needs no Redis. A REFUSED port returns `ECONNREFUSED`
- * at once, so the cost is the strategy's own delays and nothing else: ~5.5 s at the default bound,
- * which is why the timeout below is generous. (`RedisLeaseStore` takes no `maxReconnectAttempts` seam,
- * so this pays the real backoff.)
+ * Runs against a port nothing listens on, so it needs no Redis, and passes `maxReconnectAttempts = 0`
+ * — the seam `resilientClientOptions` and `RedisRecordStore` already expose — so it gives up on the
+ * first failed attempt. At the default bound the same assertion costs ~5.5 s of real backoff
+ * (redis-errors.ts) for a property that is about two lines of `close()` and nothing about timing; it
+ * would also move whenever that ladder is retuned.
  */
 describe('RedisLeaseStore.close() on a store that never connected', () => {
   it('resolves rather than re-throwing the connect rejection', async () => {
-    const store = new RedisLeaseStore('redis://127.0.0.1:6399');
+    const store = new RedisLeaseStore('redis://127.0.0.1:6399', Date.now, 0);
+    const started = Date.now();
 
     // The command rejects loudly — that half is `resilientClientOptions`' bound doing its job.
     await expect(store.load('sandbox-0-0')).rejects.toThrow();
 
     // ...and tearing the store down afterwards is the normal path, not an error.
     await expect(store.close()).resolves.toBeUndefined();
-  }, 20_000);
+
+    // The seam is load-bearing for this file, not decoration: without it the two assertions above
+    // wait out the real ladder. Generous enough not to flake on a loaded CI box, tight enough to fail
+    // if the seam stops being honoured.
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
 });
