@@ -13,7 +13,8 @@ Builds on (reuse, no redesign): [Z1](2026-06-26-identity-spine-design.md) trust 
 `CredentialInjector` shape; [Z2](2026-06-26-harness-lockdown-design.md) secret-free container;
 [Z3](2026-06-26-inference-injector-design.md) "the harness holds no provider key";
 [Z5](2026-06-19-m13-generalized-credentialed-egress-design.md) per-user egress;
-[RC1](2026-07-10-authbridge-egress-control-plane-poc-design.md) placeholder swap.
+[RC1](2026-07-10-authbridge-egress-control-plane-poc-design.md) placeholder swap;
+[Glossary](../glossary.md) canonical `session`/`turn` vocabulary.
 Composes with: **P5** multi-session isolation ([`2026-09-06-p5-session-isolation-design.md`](2026-09-06-p5-session-isolation-design.md),
 [ADR-0032](../adrs/0032-per-request-subject-no-ambient-credential.md)) — **design merged** in
 [#228](https://github.com/rossoctl/serverless-harness/pull/228), implementation on a separate

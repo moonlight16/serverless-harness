@@ -8,11 +8,11 @@ function sq(s: string): string {
 export function envDirFromKey(envKey: string): string {
   return envKey.endsWith(':latest') ? envKey.slice(0, -':latest'.length) : envKey;
 }
-export function swebenchCheckoutDir(runId: string): string {
-  return `/workspace/co-${runId}`;
+export function swebenchCheckoutDir(sessionId: string): string {
+  return `/workspace/co-${sessionId}`;
 }
-export function swebenchVenvDir(runId: string): string {
-  return `/workspace/venv-${runId}`;
+export function swebenchVenvDir(sessionId: string): string {
+  return `/workspace/venv-${sessionId}`;
 }
 
 /**
@@ -26,10 +26,10 @@ export function buildSwebenchSetupScript(a: {
   repoUrl: string;
   baseCommit: string;
   envKey: string;
-  runId: string;
+  sessionId: string;
 }): string {
-  const CO = swebenchCheckoutDir(a.runId);
-  const VENV = swebenchVenvDir(a.runId);
+  const CO = swebenchCheckoutDir(a.sessionId);
+  const VENV = swebenchVenvDir(a.sessionId);
   const ENV_PY = `/opt/miniconda3/envs/${envDirFromKey(a.envKey)}/bin/python`;
   return [
     `set -eu`,
@@ -45,14 +45,15 @@ export function buildSwebenchSetupScript(a: {
   ].join('\n');
 }
 
-export function buildSwebenchDiffScript(runId: string): string {
-  const CO = swebenchCheckoutDir(runId);
+export function buildSwebenchDiffScript(sessionId: string): string {
+  const CO = swebenchCheckoutDir(sessionId);
   return [`set -eu`, `git -C ${sq(CO)} add -A`, `git -C ${sq(CO)} diff --cached`].join('\n');
 }
-export function buildSwebenchCleanupScript(runId: string): string {
-  return [`set -u`, `rm -rf ${sq(swebenchCheckoutDir(runId))} ${sq(swebenchVenvDir(runId))}`].join(
-    '\n',
-  );
+export function buildSwebenchCleanupScript(sessionId: string): string {
+  return [
+    `set -u`,
+    `rm -rf ${sq(swebenchCheckoutDir(sessionId))} ${sq(swebenchVenvDir(sessionId))}`,
+  ].join('\n');
 }
 
 export function buildSwebenchSolvePrompt(
@@ -80,34 +81,34 @@ export function buildSwebenchSolvePrompt(
 
 export async function setupSwebenchWorkspace(
   t: SandboxTransport,
-  a: { repoUrl: string; baseCommit: string; envKey: string; runId: string },
+  a: { repoUrl: string; baseCommit: string; envKey: string; sessionId: string },
 ): Promise<string> {
   const { stdout, exitCode, truncated } = await t.exec(buildSwebenchSetupScript(a), {
     timeout: 900,
   });
   if (truncated) {
     throw new Error(
-      `swebench setup exceeded the sandbox output cap (setup output too large): ${a.runId}`,
+      `swebench setup exceeded the sandbox output cap (setup output too large): ${a.sessionId}`,
     );
   }
   if (exitCode !== 0) throw new Error(`swebench setup failed (exit ${exitCode})`);
-  return stdout.toString().trim() || swebenchCheckoutDir(a.runId);
+  return stdout.toString().trim() || swebenchCheckoutDir(a.sessionId);
 }
-export async function captureSwebenchDiff(t: SandboxTransport, runId: string): Promise<string> {
-  const { stdout, exitCode, truncated } = await t.exec(buildSwebenchDiffScript(runId), {
+export async function captureSwebenchDiff(t: SandboxTransport, sessionId: string): Promise<string> {
+  const { stdout, exitCode, truncated } = await t.exec(buildSwebenchDiffScript(sessionId), {
     timeout: 120,
   });
   if (truncated) {
     throw new Error(
-      `swebench diff capture exceeded the sandbox output cap (diff too large): ${runId}`,
+      `swebench diff capture exceeded the sandbox output cap (diff too large): ${sessionId}`,
     );
   }
   if (exitCode !== 0) throw new Error(`swebench diff capture failed (exit ${exitCode})`);
   return stdout.toString();
 }
-export async function cleanupSwebench(t: SandboxTransport, runId: string): Promise<void> {
+export async function cleanupSwebench(t: SandboxTransport, sessionId: string): Promise<void> {
   try {
-    await t.exec(buildSwebenchCleanupScript(runId), { timeout: 60 });
+    await t.exec(buildSwebenchCleanupScript(sessionId), { timeout: 60 });
   } catch {
     /* ignore */
   }

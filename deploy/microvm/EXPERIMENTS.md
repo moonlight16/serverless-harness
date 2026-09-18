@@ -892,7 +892,173 @@ No blank above is filled. Filling it is the metal run's job, not this task's.
   (pre-run hardware correction F8; a build-time note, not committed); no placeholder resembling a live run
   was added.
 
+### Issue #266 — the metal/nested ratio
+
+**RUN ON `nested-m8i` (EC2 `m8i.xlarge`, 4 vCPU, 15 GiB, kernel 6.18.44), a fresh golden
+snapshot built on that box.** Not a re-decision: per the design, a nested result fires no
+stop rule by itself (§7.2/E9). The point is the _ratio_ to the metal numbers above — it
+survives a change of machine where an absolute time does not — plus a first-ever
+execution of E11 at real scale (`ITERS_PER_SLOT=20`, `SH_E11_ACTIVE_RUNS` up to 32; see
+below for why 64 is absent), and a shakedown of E10 rung 1 for the first time on any rig
+(docker/grpcurl/pnpm were absent from this box as of 2026-09-14 and are present now).
+
+`SH_E11_COLD_LATENCY_MS` was recomputed for this host per METAL-RUNBOOK.md §5: E10 rung 2's
+warm p50 (209.72 ms) plus half of rung 3's restore p50 (114.45 ms) gives **267** here,
+against metal's 145 — expected, since the formula is host-specific by design.
+
+#### E10 — full field coverage where a metal baseline exists, nested-only otherwise
+
+Only the fields EXPERIMENTS.md actually recorded for the metal run (above) have a metal
+side to ratio against; the metal run's raw per-rung JSON was never committed and the box
+itself was later wiped (see the branch's own note on that). Everything else below is
+nested-only, clearly marked.
+
+| metric (E10, `ITERS=200 WARMUP=20`)               | metal               | nested-m8i          | ratio (nested/metal)              |
+| ------------------------------------------------- | ------------------- | ------------------- | --------------------------------- |
+| warm hot path p50                                 | 52.74 ms            | 200.91 ms           | **3.81x**                         |
+| container baseline p50 (rung 1)                   | 41 ms               | 25 ms               | 0.61x                             |
+| warm/baseline ratio (the design's own §7.2 ratio) | 1.29x               | 8.04x               | 6.23x (the ratio itself, ratioed) |
+| replenishment CPU, mean/restore                   | 10.98 ms            | 5.76 ms             | 0.52x                             |
+| rung 2 acquire mix (warm/cold, of 200)            | 143/57 (71.5% warm) | 166/34 (83.0% warm) | — (fractions, not a ratio)        |
+
+**The container baseline moved in the OPPOSITE direction from the microVM path**, and by
+enough to explain most of the §7.2 ratio's own blow-up: nested's container p50 is 61% of
+metal's, while nested's warm-microVM p50 is 381% of metal's. Neither number is doing
+anything mysterious on its own — a 4-vCPU box with no other tenants plausibly runs a single
+container faster and less variably than a 72-core NUMA host under its own scheduler noise,
+and that has nothing to do with virtualization. But it means the §7.2 ratio (warm/baseline)
+is not purely a nested-tax signal: **6.23x of the 8.04x nested ratio is inherited from a
+baseline that moved for reasons unrelated to nesting**, and only the numerator side (the
+microVM path itself, ratioed directly below) isolates the tax the issue asked about.
+
+**Rung 2 decomposition (parked variant), nested vs metal — this is the answer to the
+issue's question 1 ("which sub-cost inflates most"):**
+
+| sub-cost (rung 2, parked)                   | metal p50 | nested-m8i p50 | ratio                                                         |
+| ------------------------------------------- | --------- | -------------- | ------------------------------------------------------------- |
+| acquire                                     | 0.00 ms   | 0.00 ms        | — (both ≈0, standby pop)                                      |
+| resume                                      | 28.58 ms  | 78.34 ms       | **2.74x**                                                     |
+| run                                         | 2.85 ms   | 4.12 ms        | 1.45x                                                         |
+| destroy                                     | 21.31 ms  | 118.45 ms      | **5.56x**                                                     |
+| total (separately measured; p50s don't sum) | 55.32 ms  | 209.72 ms      | 3.79x (matches the warm-hot-path ratio above within rounding) |
+
+`total` is the rung's own measured warm-hot-path p50 (same 55.32 / 209.72 as the E10 table
+above), not the sum of the four sub-costs — percentiles don't add, and the two columns are
+each off by a different amount (metal: 52.74 vs a stated 55.32, a ~2.6 ms gap; nested:
+200.91 vs a stated 209.72, a ~8.8 ms gap). Both sums still land on the ratio the row
+claims (209.72/55.32 = 3.79x ≈ the 3.81x warm-hot-path ratio), so the gap is presentation,
+not a measurement error.
+
+**Destroy is taxed harder than resume on this rig** (5.56x vs 2.74x), not evenly — a
+finding one level more specific than the design's own hypothesis that nested
+virtualization "taxes exactly the VM-exit-heavy work restore consists of." Both resume and
+destroy are VM-exit-heavy, and destroy is nonetheless the more expensive one to nest,
+consistently with `run` (barely VM-exit-heavy, since it is guest-userspace time) moving the
+least of the three (1.45x).
+
+**Nested-only, no metal baseline recorded to ratio against** (rung 3 replenishment and
+rung 4 teardown; EXPERIMENTS.md's metal write-up never itemized these past the aggregate
+"replenishment CPU" row above):
+
+| metric (nested-m8i only)                         | value     |
+| ------------------------------------------------ | --------- |
+| rung 3 replenishment, cold memfile p50           | 104.43 ms |
+| rung 3 replenishment, pinned memfile p50         | 114.45 ms |
+| rung 4 teardown-inflight p50 (destroy)           | 117.13 ms |
+| rung 4 teardown-standby p50 (destroy)            | 125.48 ms |
+| rung 4 teardown-bulk p50 (destroy, 8-VM batches) | 925.02 ms |
+
+#### E11 — full ladder, both arms, c=1 through 32
+
+`SH_E11_ACTIVE_RUNS="1 2 4 8 16 32"` — **64 is absent, deliberately.** At `guestRamMb=256`
+the admission budget charges 288 MiB per resident VM (`PerVMBytes` = guest RAM +
+`DefaultVMOverheadBytes`), so 64 concurrently active VMs alone need ~18 GiB against this
+box's 15 GiB total. `SH_MAX_COMMITTED_MB=11264` was sized to comfortably clear 32 with
+standby headroom; 64 would have to either shrink guest RAM (contaminating exactly the
+resume/destroy cost this ratio is about) or die on admission refusal mid-rung. This is a
+genuine, reportable finding for a `nested-m8i`-sized instance, not a gap in the run: **the
+sweep is memory-bound here, on a rig where the metal run was replenishment-bound all the
+way to c=64.**
+
+| c   | metal microVM tput | metal microVM p95 | nested microVM tput | nested microVM p95 | tput ratio | p95 ratio |
+| --- | ------------------ | ----------------- | ------------------- | ------------------ | ---------- | --------- |
+| 1   | 6.73               | 124 ms            | 3.06                | 268 ms             | 0.46x      | **2.16x** |
+| 2   | 13.01              | 121 ms            | 6.31                | 276 ms             | 0.49x      | **2.28x** |
+| 4   | 23.37              | 142 ms            | 12.60               | 266 ms             | 0.54x      | 1.87x     |
+| 8   | 39.04              | 175 ms            | 19.80               | 324 ms             | 0.51x      | 1.85x     |
+| 16  | 43.31              | 353 ms            | 20.73               | 687 ms             | 0.48x      | 1.95x     |
+| 32  | 35.00              | 788 ms            | 13.88               | 2045 ms            | 0.40x      | **2.60x** |
+
+| c   | metal container tput | metal container p95 | nested container tput | nested container p95 | tput ratio | p95 ratio |
+| --- | -------------------- | ------------------- | --------------------- | -------------------- | ---------- | --------- |
+| 1   | 9.68                 | 78 ms               | 18.43                 | 40 ms                | 1.90x      | 0.51x     |
+| 2   | 20.96                | 73 ms               | 37.49                 | 41 ms                | 1.79x      | 0.56x     |
+| 4   | 38.15                | 83 ms               | 51.48                 | 61 ms                | 1.35x      | 0.73x     |
+| 8   | 55.32                | 124 ms              | 51.33                 | 138 ms               | 0.93x      | 1.11x     |
+| 16  | 57.03                | 333 ms              | 49.67                 | 298 ms               | 0.87x      | 0.89x     |
+| 32  | 49.15                | 840 ms              | 47.20                 | 609 ms               | 0.96x      | 0.72x     |
+
+**The microVM p95 ratio is the clean nested-tax signal, and it says ~2x, consistently.**
+Unlike E10's warm-path ratio, this one does not need correcting for a moved baseline: the
+container arm's p95 ratio hovers near 1x (0.51x–1.11x, no clear trend), exactly what you'd
+expect from ordinary box-to-box variance for a path that never touches KVM. The microVM
+arm's p95 ratio sits at 1.85x–2.60x at _every_ c, including where the container ratio is
+below 1 — nesting adds a roughly constant multiplicative tax to VM-exit-heavy work
+independent of load, not a tax that only shows up under contention.
+
+**Nested's knee also lands at c=8, consistent with metal's** — a validation result, not a
+measurement of the knee's location under real concurrency (see the nested-run caveat
+above): replenishment saturates at the same concurrency here as on metal, it just costs
+~2x more once it does. `bound` is `replenishment` on the microVM arm at every c through 32
+(never memory or process-count on this arm); the sweep's own budget is what stops it from
+reaching 64, not the arm's own dynamics.
+
+**Predictions:** the container-arm mini-analysis scored prediction 3 (`inconclusive` at
+smoke scale, `supported` once real per-arm data existed) the same way metal's did; the
+combined analysis across both arms at the full `1 2 4 8 16 32` ladder came back
+`inconclusive` on every prediction, because `analyzeLadder`'s scorers were sealed against
+a `1 2 4 8 16 32 64` shape and a 6-rung ladder changes which rung is "the last one" for
+several of them — expected from dropping a rung, not a defect. The knee corroboration
+above is read directly off the two ladders rather than through that scorer, which is why
+it stands alongside, not inside, this `inconclusive` verdict: the scorer's ladder-shape
+mismatch leaves it unable to confirm the knee match, not evidence against it.
+
+#### A real defect this run found, fixed, and left a regression test for
+
+**`e11-density.sh`'s relay teardown between its own two arms killed the wrong process.**
+`E11_RELAY_PID` is captured as `pnpm ... start & echo $!` inside a subshell; on this host
+pnpm keeps running as a supervisor over a separate node child rather than exec-ing into it,
+so `kill "$E11_RELAY_PID"` killed pnpm and left the actual relay holding the port. The
+microvm arm's relay then died with `EADDRINUSE` on startup, and — because a worker's
+startup check only confirms _something_ answers on the port, never _which_ relay — the
+microvm worker attached to the **stale container-arm relay** instead. That is the exact
+"silently wrong data" failure METAL-RUNBOOK.md §3a already documents for a leaked relay
+across _separate_ invocations; this run is the first evidence it also happens _within_ one
+invocation, between `e11-density.sh`'s own two arms. First attempt's `c=1` microvm data was
+discarded for this reason and the run repeated after the fix. Fixed with
+`kill_relay_by_port()` (kills by `ss`-observed port, same as the runbook's own manual
+cleanup recipe, never by a captured PID or a process name), wired into both
+`stop_container_stack` and `stop_microvm_stack`, with five new regression checks in
+`deploy/microvm/tests/e11-density.test.sh` pinning the fix.
+
 ### E12 — guest-initiated vsock on a second port survives snapshot restore
+
+> **2026-09-18 — this section's C@128 attribution is superseded by E13 below.** The failure
+> rate recorded here was not host contention. E13 ran a no-second-port control at the same
+> N=128 over the existing Exec path only, and it came back clean (0/128); ruled out memory
+> and the OOM killer directly (sealed prediction 7 falsified, MemAvailable never below
+> ~12.3 GiB of 15); and then found the cause in this probe's own scaffolding. Its
+> `start_host_listener` returned as soon as the listener process was backgrounded rather
+> than when that process had reached `listen()`, so a guest CONNECT could land before
+> anything was listening and be answered with RST — correctly. Fixed in `b203e38` and
+> confirmed on both substrates; see E13.
+>
+> What stands: rungs A, B, D and C@8, both witnesses, the pristine-snapshot check, and
+> T1's support. What must not be cited from this section: "consistent with resource or
+> scheduling contention under heavy concurrent boot load" as the explanation for C@128, and
+> the 76/128 and 127/128 rates as a property of the restore mechanism or of the rig rather
+> than of this probe's own startup ordering. The numbers stay as the record of what the
+> pre-fix probe produced.
 
 **Two distinct findings, not one boolean.** The core mechanism question issue
 #271 asked — does a guest-initiated vsock connection on a second port (1025)
@@ -1035,6 +1201,18 @@ resolved by picking whichever framing is more convenient: the falsifier
 fires on its literal text, and the mechanism it was meant to test is
 nonetheless well-supported.
 
+**2026-09-18 — re-scored after E13's fix.** The falsifier still fires, but not for the
+reason argued above. With the listener race fixed, C@128 is clean in 37 of 40 bare-metal
+iterations, and the 3 remaining failures across 5,120 VM-attempts are all the other,
+unrelated family (a `read: EOF`, a handshake-ack EOF, one `dial` failure); the guest-side
+reset signature that dominated the pre-fix failures (999 of 1,007 on metal) occurs zero
+times post-fix, and zero times across a separately sized 7,296-attempt nested run. So the
+verdict is unchanged and its substance is not: the mechanism is better supported than this
+section could show, and what remains is a distinct, still-open failure family — not the
+concurrency ceiling invoked above. The specific reading that C@128's failures were what
+128 simultaneous restores cost a 4-vCPU rig was wrong, and the tension recorded above was
+partly a tension with this probe's own defect rather than with the mechanism.
+
 #### Effect on PR #268
 
 P4.1's decision T1 (route all sandbox egress over vsock) is supported by the
@@ -1045,6 +1223,11 @@ to serve, and whether restores should be staggered or rate-limited under
 heavy concurrent load — not as grounds to revert to the NIC option (spec
 §2). Nothing observed here resembles the restore-mechanism failure that
 would force that reversion.
+
+**Superseded in part:** E13 re-scoped that open scale question after ruling out restore
+count as the lever, and its own closing section carries the current recommendations for
+P4.1 — including one persistent, pre-bound multiplexed listener, which E13 promoted from an
+efficiency nicety to the load-bearing fix. Read E13's version, not this paragraph's.
 
 ### E13 — rung C@128's failures are its own probe's added workload, not memory and not restore count
 

@@ -28,8 +28,8 @@ export function configRefsDir(digest: string): string {
 }
 
 /** Per-leaf link, under the leaf workspace so `cleanupWorkspace` remains the only teardown path. */
-export function leafConfigDir(runId: string): string {
-  return `/workspace/leaves/${runId}/.sh-config`;
+export function leafConfigDir(sessionId: string): string {
+  return `/workspace/leaves/${sessionId}/.sh-config`;
 }
 
 /**
@@ -44,18 +44,19 @@ export function leafConfigDir(runId: string): string {
 const REF_STALE_MINUTES = 1440;
 
 /**
- * A runId used as a ref FILENAME, validated rather than assumed.
+ * A sessionId used as a ref FILENAME, validated rather than assumed.
  *
- * `toSessionId` (`run-leaf.ts:78`) already reduces every runId to `[A-Za-z0-9._-]` with alphanumeric
- * ends, so in practice this always passes. It is asserted anyway because the consequence of a runId
- * that escaped its directory would be a `rm -rf` aimed by it, and because a second caller could
- * one day reach these builders without going through `toSessionId`. Validating also lets the scripts
- * interpolate the name plainly instead of quoting around it.
+ * `toSessionId` (`run-leaf.ts:78`) already reduces every sessionId to `[A-Za-z0-9._-]` with
+ * alphanumeric ends, so in practice this always passes. It is asserted anyway because the
+ * consequence of a sessionId that escaped its directory would be a `rm -rf` aimed by it, and
+ * because a second caller could one day reach these builders without going through
+ * `toSessionId`. Validating also lets the scripts interpolate the name plainly instead of
+ * quoting around it.
  */
-function assertSafeRunId(runId: string): string {
-  if (!/^[A-Za-z0-9._-]+$/.test(runId) || runId === '.' || runId === '..')
-    throw new Error(`invalid runId for a config ref: ${JSON.stringify(runId)}`);
-  return runId;
+function assertSafeSessionId(sessionId: string): string {
+  if (!/^[A-Za-z0-9._-]+$/.test(sessionId) || sessionId === '.' || sessionId === '..')
+    throw new Error(`invalid sessionId for a config ref: ${JSON.stringify(sessionId)}`);
+  return sessionId;
 }
 
 export interface OverlayPaths {
@@ -80,7 +81,7 @@ export interface OverlayPaths {
  * dangling and its turn running unconfigured — the plausible-but-wrong-work failure the promotion
  * design exists to prevent (spec §4.4).
  */
-export function buildCacheAcquireScript(digest: string, runId: string): string {
+export function buildCacheAcquireScript(digest: string, sessionId: string): string {
   return [
     `set -eu`,
     // Marker so a test's fake transport can tell this call from the others by content rather
@@ -95,7 +96,7 @@ export function buildCacheAcquireScript(digest: string, runId: string): string {
     // failing the ref write below and killing the leaf on a pure teardown race.
     `  mkdir -p "$REFS"`,
     `  find "$REFS" -maxdepth 1 -type f -mmin +${REF_STALE_MINUTES} -delete 2>/dev/null || true`,
-    `  : > "$REFS/${assertSafeRunId(runId)}"`,
+    `  : > "$REFS/${assertSafeSessionId(sessionId)}"`,
     `  if [ -d "$DIR" ]; then printf 'hit'; else printf 'miss'; fi`,
     `) 9>"$LOCK"`,
   ].join('\n');
@@ -152,8 +153,8 @@ export function buildCachePopulateScript(digest: string): string {
 }
 
 /** Link the shared cache into this leaf's workspace and echo the leaf-local root. */
-export function buildLeafBindScript(digest: string, runId: string): string {
-  const LEAF = leafConfigDir(runId);
+export function buildLeafBindScript(digest: string, sessionId: string): string {
+  const LEAF = leafConfigDir(sessionId);
   return [
     `set -eu`,
     `DIR=${sq(configCacheDir(digest))}; LEAF=${sq(LEAF)}`,
@@ -175,17 +176,17 @@ export function buildLeafBindScript(digest: string, runId: string): string {
  * Best-effort throughout (`set -u`, not `set -eu`), matching `cleanupWorkspace` (converge.ts:76): a
  * teardown hiccup must never mask the turn's actual verdict.
  */
-export function buildConfigCleanupScript(runId: string, digest: string): string {
+export function buildConfigCleanupScript(sessionId: string, digest: string): string {
   return [
     `set -u`,
-    `rm -f ${sq(leafConfigDir(runId))} 2>/dev/null || true`,
+    `rm -f ${sq(leafConfigDir(sessionId))} 2>/dev/null || true`,
     `DIR=${sq(configCacheDir(digest))}; REFS=${sq(configRefsDir(digest))}`,
     `LOCK=/workspace/.sh-config.lock`,
     `(`,
     // The same lock the acquire and populate scripts use, so "drop my ref, then count what is left"
     // is atomic against a concurrent leaf claiming one.
     `  flock 9 || exit 0`,
-    `  rm -f "$REFS/${assertSafeRunId(runId)}" 2>/dev/null || true`,
+    `  rm -f "$REFS/${assertSafeSessionId(sessionId)}" 2>/dev/null || true`,
     `  find "$REFS" -maxdepth 1 -type f -mmin +${REF_STALE_MINUTES} -delete 2>/dev/null || true`,
     `  if [ -z "$(ls -A "$REFS" 2>/dev/null)" ]; then`,
     // ADR-0031's `chmod -R a-w` clears the write bit on the cache's DIRECTORIES too, and a directory
@@ -221,14 +222,14 @@ async function run(transport: SandboxTransport, script: string, stdin?: Buffer):
 export async function overlayConfig(
   transport: SandboxTransport,
   digest: string,
-  runId: string,
+  sessionId: string,
   tarGz: Buffer,
 ): Promise<OverlayPaths> {
-  const acquired = await run(transport, buildCacheAcquireScript(digest, runId));
+  const acquired = await run(transport, buildCacheAcquireScript(digest, sessionId));
   if (acquired.trim() !== 'hit') {
     await run(transport, buildCachePopulateScript(digest), Buffer.from(tarGz.toString('base64')));
   }
-  await run(transport, buildLeafBindScript(digest, runId));
-  const root = leafConfigDir(runId);
+  await run(transport, buildLeafBindScript(digest, sessionId));
+  const root = leafConfigDir(sessionId);
   return { skillsDir: `${root}/skills`, memoryDir: `${root}/memory` };
 }

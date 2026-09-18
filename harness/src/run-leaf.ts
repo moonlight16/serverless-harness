@@ -597,7 +597,7 @@ export const realProduceSolve: ProduceSolve = async (env, config, capture) => {
         repoUrl: env.repoUrl!,
         baseCommit: env.ref!,
         envKey: env.env_key!,
-        runId: sid,
+        sessionId: sid,
       });
       // Separate setup-duty from solve-duty (spec §4): the driver reads this line for setup ms,
       // and solve-duty = total exec-timing delta − setupMs.
