@@ -2495,9 +2495,12 @@ for client in grpcurl go; do
   )"
   check "validate_exec_client accepts '$client'" "$out" "ACCEPTED"
 done
+# The invalid value must contain NEITHER accepted name. `grpcurl-go` did, and since die echoes
+# the bad value back, the input itself satisfied a "does the message name both?" grep -- the
+# check could not fail. Use a value that shares no substring with either answer.
 out="$(
-  # shellcheck disable=SC2034 # read by validate_exec_client, sourced via eval above
-  EXEC_CLIENT="grpcurl-go"
+  # shellcheck disable=SC2034 # read by validate_exec_client, sourced via eval below
+  EXEC_CLIENT="xyzzy"
   eval "$vec_body"
   die() {
     echo "DIED: $*"
@@ -2507,8 +2510,16 @@ out="$(
 )"
 check "validate_exec_client refuses an unrecognised value" \
   "$(printf '%s' "$out" | grep -c '^DIED:')" "1"
-check "  ...and its refusal names both accepted values" \
-  "$(printf '%s' "$out" | grep -c "grpcurl.*go\|go.*grpcurl")" "1"
+# Each accepted value named SEPARATELY, matched on its quoted form as the message writes it, so
+# neither assertion can be satisfied by the rejected input being echoed back.
+check "  ...and its refusal names 'grpcurl' as an accepted value" \
+  "$(printf '%s' "$out" | grep -c "'grpcurl'")" "1"
+check "  ...and its refusal names 'go' as an accepted value" \
+  "$(printf '%s' "$out" | grep -c "'go'")" "1"
+# NON-VACUOUSNESS: the rejected value must NOT appear in quotes in a way that could satisfy
+# either check above. Proven by feeding the detector a stripped-down message.
+check "non-vacuousness: a refusal that only quotes the bad value fails the 'grpcurl' check" \
+  "$(printf '%s' "DIED: SH_E11_EXEC_CLIENT is 'xyzzy', which is neither" | grep -c "'grpcurl'")" "0"
 
 # preflight must validate it BEFORE any work: the build below depends on the value.
 pf_body="$(extract_fn preflight || true)"
@@ -2525,8 +2536,20 @@ check "build_exec_driver builds ./cmd/exec-driver" \
   "$(printf '%s\n' "$bed_body" | grep -c 'go build -o "\$E11_EXEC_DRIVER_BIN" ./cmd/exec-driver')" "1"
 check "build_exec_driver dies with a reason when the build fails" \
   "$(printf '%s\n' "$bed_body" | grep -c 'die "go build ./cmd/exec-driver failed')" "1"
-check "main builds the Exec driver after preflight" \
-  "$(printf '%s\n' "$(extract_fn main)" | grep -c 'build_exec_driver')" "1"
+# Position, not presence. `grep -c build_exec_driver` passed with the two calls in either order,
+# which made the check's own name false: what matters is that preflight -- which is what creates
+# $RESULTS -- runs BEFORE the build writes a binary into it.
+main_body="$(extract_fn main)"
+check "main is extractable" "$([ -n "$main_body" ] && echo yes || echo no)" "yes"
+mb_pf_line="$(printf '%s\n' "$main_body" | grep -n '^  preflight$' | head -n1 | cut -d: -f1)"
+mb_bed_line="$(printf '%s\n' "$main_body" | grep -n '^  build_exec_driver$' | head -n1 | cut -d: -f1)"
+check "main calls preflight" "$([ -n "$mb_pf_line" ] && echo yes || echo no)" "yes"
+check "main calls build_exec_driver" "$([ -n "$mb_bed_line" ] && echo yes || echo no)" "yes"
+check "  ...and build_exec_driver comes AFTER preflight, which creates \$RESULTS" \
+  "$([ -n "$mb_pf_line" ] && [ -n "$mb_bed_line" ] && [ "$mb_pf_line" -lt "$mb_bed_line" ] && echo yes || echo no)" "yes"
+# NON-VACUOUSNESS: the comparison must be able to say no. Same arithmetic, reversed operands.
+check "non-vacuousness: the position comparison reports no when the order is reversed" \
+  "$([ -n "$mb_pf_line" ] && [ -n "$mb_bed_line" ] && [ "$mb_bed_line" -lt "$mb_pf_line" ] && echo yes || echo no)" "no"
 
 # The binary lives under $RESULTS, like the null-responder's, so a run leaves its artifacts
 # in one place and preflight's own `mkdir -p "$RESULTS"` has already happened.
