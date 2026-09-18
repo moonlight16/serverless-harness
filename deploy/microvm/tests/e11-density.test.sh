@@ -2781,6 +2781,103 @@ check "converge still drives grpcurl, on every path" \
   "$(printf '%s\n' "$cs_body" | grep -c 'grpcurl -plaintext')" "1"
 check "  ...and converge is not routed through EXEC_CLIENT at all" \
   "$(printf '%s\n' "$cs_body" | grep -c 'EXEC_CLIENT')" "0"
+# ---------------------------------------------------------------------------
+# SEAM CLOSURE (issue #294): the real plan writer -> the real binary -> the real responder.
+#
+# Everything above tests ONE side of the bash/Go boundary. This runs both. e11-density.sh
+# itself cannot run here (it needs /proc, cgroups and Linux), so this is where the seam is
+# actually verified, and it needs none of those things.
+# ---------------------------------------------------------------------------
+echo "== the real write_rung_plan drives the real exec-driver against the real null-responder (#294)"
+
+if ! command -v go >/dev/null 2>&1; then
+  echo "  SKIP: no go on PATH, so the exec-driver and null-responder cannot be built"
+else
+  seam_dir="$(mktemp -d "${TMPDIR:-/tmp}/e11-seam.XXXXXX")"
+  seam_rc=0
+  (
+    cd "$DIR/../../remote-worker" &&
+      go build -o "$seam_dir/exec-driver" ./cmd/exec-driver &&
+      go build -o "$seam_dir/null-responder" ./cmd/null-responder
+  ) >"$seam_dir/build.log" 2>&1 || seam_rc=$?
+  check "both binaries build" "$seam_rc" "0"
+
+  if [ "$seam_rc" -eq 0 ]; then
+    # An ephemeral-ish port well away from the driver's defaults (8444/8445), so a stray relay
+    # or responder from another run cannot answer this test's Execs.
+    seam_port=18447
+    "$seam_dir/null-responder" --listen "127.0.0.1:$seam_port" >"$seam_dir/responder.log" 2>&1 &
+    seam_pid=$!
+    # Wait for the listener rather than sleeping a guessed interval.
+    seam_up=no
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      if grep -q 'serving sandbox.v1.SandboxExec' "$seam_dir/responder.log" 2>/dev/null; then
+        seam_up=yes
+        break
+      fi
+      sleep 0.25
+    done
+    check "the null-responder came up" "$seam_up" "yes"
+
+    # THE REAL write_rung_plan, with slot identity from THE REAL slot_req_base and the mix from
+    # THE REAL e11_tool_call_mix. Nothing here is a rewritten substitute.
+    seam_plan="$seam_dir/plan.json"
+    seam_iters=5
+    seam_warmup=2
+    seam_c=3
+    (
+      eval "$(extract_fns die slot_req_base e11_tool_call_mix write_rung_plan)"
+      seam_argv=()
+      while IFS= read -r seam_cmd; do seam_argv+=("$seam_cmd"); done < <(e11_tool_call_mix)
+      seam_mix_count="${#seam_argv[@]}"
+      for i in 1 2 3; do
+        seam_argv+=("$(slot_req_base "$i")" "" "$seam_dir/slot-$i.times" "$seam_dir/slot-$i.err")
+      done
+      write_rung_plan "$seam_plan" "localhost:$seam_port" "e11-driver-control" \
+        "$seam_iters" "$seam_warmup" 30 45 "$seam_mix_count" "$seam_c" "${seam_argv[@]}"
+    ) >"$seam_dir/plan.log" 2>&1
+    check "write_rung_plan produced a plan" "$([ -s "$seam_plan" ] && echo yes || echo no)" "yes"
+
+    # THE REAL BINARY, reading THAT plan.
+    drv_rc=0
+    "$seam_dir/exec-driver" --plan "$seam_plan" >"$seam_dir/driver.log" 2>&1 || drv_rc=$?
+    check "exec-driver accepted the real plan and exited 0" "$drv_rc" "0"
+    if [ "$drv_rc" -ne 0 ]; then
+      echo "  exec-driver said: $(cat "$seam_dir/driver.log")"
+    fi
+
+    # The times-file contract, end to end. iters+warmup lines per slot, all ok, all three fields.
+    for i in 1 2 3; do
+      check "slot $i wrote iters+warmup lines" \
+        "$(wc -l <"$seam_dir/slot-$i.times" | tr -d ' ')" "$((seam_iters + seam_warmup))"
+      check "  ...every line is '<ms> <status> <cause>' with status ok" \
+        "$(awk 'NF==3 && $2=="ok" && $3=="-" && $1 ~ /^[0-9]+$/ {n++} END{print n+0}' "$seam_dir/slot-$i.times")" \
+        "$((seam_iters + seam_warmup))"
+      check "  ...and its err file is empty, because nothing failed" \
+        "$([ -s "$seam_dir/slot-$i.err" ] && echo nonempty || echo empty)" "empty"
+    done
+
+    # The aggregation run_density_rung performs on these files, reproduced here: the warmup is
+    # trimmed off the FRONT and exactly ITERS lines remain. This is the property that makes
+    # "nothing downstream changed" true rather than asserted.
+    check "warmup trimming leaves exactly ITERS steady-state samples per slot" \
+      "$(tail -n "+$((seam_warmup + 1))" "$seam_dir/slot-1.times" | head -n "$seam_iters" | wc -l | tr -d ' ')" \
+      "$seam_iters"
+
+    # And the req_ids the RESPONDER saw are disjoint and start one past each base. The
+    # null-responder echoes the request's req_id in its End, so its own log is not a record of
+    # them -- but the plan's bases plus the line counts pin the space, and exec-driver's own Go
+    # test asserts the server-side view. What is asserted here is that the plan the REAL writer
+    # produced carries the REAL slot_req_base spacing.
+    check "the plan's slot bases are slot_req_base's, 1000000 apart" \
+      "$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1]))["slots"]; print(",".join(str(x["reqBase"]) for x in s))' "$seam_plan")" \
+      "1000000,2000000,3000000"
+
+    kill "$seam_pid" 2>/dev/null || true
+    wait "$seam_pid" 2>/dev/null || true
+  fi
+  rm -rf "$seam_dir"
+fi
 echo
 echo "Total failures: $fails"
 exit "$fails"
