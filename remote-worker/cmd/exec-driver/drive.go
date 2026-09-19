@@ -128,17 +128,30 @@ func oneExec(ctx context.Context, client pb.SandboxExecClient, p *plan, s slot, 
 // Exec -- is driver cost inside the measured window, which is the thing being removed. A rung
 // killed mid-flight loses its tail, and that is fine: run_density_rung refuses a rung whose
 // child exited non-zero rather than recording a partial one.
-func runSlot(ctx context.Context, client pb.SandboxExecClient, p *plan, s slot) error {
+func runSlot(ctx context.Context, client pb.SandboxExecClient, p *plan, s slot) (err error) {
 	times, err := os.OpenFile(s.TimesFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("opening times file %s: %w", s.TimesFile, err)
 	}
-	defer func() { _ = times.Close() }()
+	// Close is captured, not discarded: Flush below pushes bufio's buffer into the file, but the
+	// write-back can still fail at Close, and a silently truncated times file would be aggregated
+	// as though it were complete. Named return so the deferred check can surface it.
+	defer func() {
+		if cerr := times.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("closing times file %s: %w", s.TimesFile, cerr)
+		}
+	}()
 	errFile, err := os.OpenFile(s.ErrFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("opening err file %s: %w", s.ErrFile, err)
 	}
-	defer func() { _ = errFile.Close() }()
+	// The err file carries diagnostics only, so a close failure must not mask a real rung error --
+	// it is reported only when nothing worse happened.
+	defer func() {
+		if cerr := errFile.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("closing err file %s: %w", s.ErrFile, cerr)
+		}
+	}()
 
 	w := bufio.NewWriter(times)
 	calls := p.callsPerSlot()
@@ -196,10 +209,14 @@ func drive(ctx context.Context, p *plan) error {
 	}
 	wg.Wait()
 
+	// EVERY failing slot, not just the lowest-indexed one. The rung is refused either way, so
+	// this is purely diagnostic -- but an operator debugging why a rung died should not have to
+	// re-run it once per slot to discover that three of them failed for three different reasons.
+	var slotErrs []error
 	for i, e := range errs {
 		if e != nil {
-			return fmt.Errorf("slot %d (reqBase %d): %w", i+1, p.Slots[i].ReqBase, e)
+			slotErrs = append(slotErrs, fmt.Errorf("slot %d (reqBase %d): %w", i+1, p.Slots[i].ReqBase, e))
 		}
 	}
-	return nil
+	return errors.Join(slotErrs...)
 }
