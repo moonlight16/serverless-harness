@@ -44,14 +44,23 @@ func dialReady(ctx context.Context, target string) (*grpc.ClientConn, error) {
 // execOutcome is one line of a times file, before it is formatted. errMsg is kept separately
 // from cause so the operator gets the original text in the slot's err file while the record
 // gets the classified key.
+//
+// us (not ms) so the unit is unambiguous: the field is microseconds, and line() below is the
+// one place that formats it down to three decimal places of a millisecond -- integer-exact,
+// no floating point -- to match grpc_exec_record's fork-free bash arithmetic
+// (deploy/microvm/e11-density.sh) byte for byte. Both paths must move together (review on
+// #294/#296): the Go client's per-Exec latency is sub-millisecond, so int64 whole-millisecond
+// truncation rounded almost every recorded value to 0.
 type execOutcome struct {
-	ms     int64
+	us     int64
 	status string
 	cause  string
 	errMsg string
 }
 
-func (o execOutcome) line() string { return fmt.Sprintf("%d %s %s", o.ms, o.status, o.cause) }
+func (o execOutcome) line() string {
+	return fmt.Sprintf("%d.%03d %s %s", o.us/1000, o.us%1000, o.status, o.cause)
+}
 
 // oneExec issues a single Exec and times it host-side, which is what grpc_exec_record does
 // with $EPOCHREALTIME either side of its grpcurl call.
@@ -71,7 +80,7 @@ func oneExec(ctx context.Context, client pb.SandboxExecClient, p *plan, s slot, 
 
 	t0 := time.Now()
 	fail := func(msg string) execOutcome {
-		return execOutcome{ms: time.Since(t0).Milliseconds(), status: "err", cause: causeFor(msg), errMsg: msg}
+		return execOutcome{us: time.Since(t0).Microseconds(), status: "err", cause: causeFor(msg), errMsg: msg}
 	}
 
 	stream, err := client.Exec(callCtx, &pb.ExecRequest{
@@ -106,11 +115,11 @@ func oneExec(ctx context.Context, client pb.SandboxExecClient, p *plan, s slot, 
 			inStream = e.GetMessage()
 		}
 	}
-	ms := time.Since(t0).Milliseconds()
+	us := time.Since(t0).Microseconds()
 	if sawErr {
-		return execOutcome{ms: ms, status: "err", cause: causeFor(inStream), errMsg: inStream}
+		return execOutcome{us: us, status: "err", cause: causeFor(inStream), errMsg: inStream}
 	}
-	return execOutcome{ms: ms, status: "ok", cause: "-"}
+	return execOutcome{us: us, status: "ok", cause: "-"}
 }
 
 // runSlot is one slot's whole timed loop: the goroutine that replaces one bash subshell.

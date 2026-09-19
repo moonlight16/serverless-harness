@@ -154,6 +154,12 @@ Each call appends one line to its slot's `slot-$i.times` in the existing
 warmup trimming, `percentile`, `execErrorsByCause`, the sampler bracket and the record
 writer are untouched.
 
+**Post-review addendum:** both `grpc_exec_record` and this client now record `ms` to
+three decimal places (integer-exact, from microseconds, no floating point on either
+path) instead of whole milliseconds — required because the Go client's per-Exec latency
+is sub-millisecond, which int64 truncation rounded to `0` almost every time. Records
+written before this change carry integer `ms`.
+
 Per-Exec errors are **recorded, not fatal** — matching `grpc_exec_record`, which never
 returns non-zero. The binary exits non-zero only on a setup failure: an unreadable plan,
 a failed dial, an unwritable times file. `run_density_rung` already turns that into the

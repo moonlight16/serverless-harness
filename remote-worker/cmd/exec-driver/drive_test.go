@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,12 @@ import (
 
 	pb "github.com/kagenti/serverless-harness/gen/go/sandbox/v1"
 )
+
+// msFieldShape pins the times-file ms field to whole.fractional with exactly three decimal
+// digits (review on #294/#296: milliseconds are now recorded to three decimal places on both
+// the Go and bash paths, so the format is a contract, not an incidental ParseDuration-parsable
+// string).
+var msFieldShape = regexp.MustCompile(`^[0-9]+\.[0-9]{3}$`)
 
 // fakeExec is a null responder with a recorder. It answers like
 // remote-worker/cmd/null-responder -- one End carrying the request's own req_id -- and
@@ -155,7 +162,37 @@ func TestDriveWritesTheFrozenTimesFileFormat(t *testing.T) {
 			if _, err := time.ParseDuration(fields[0] + "ms"); err != nil {
 				t.Fatalf("slot %d line %d has a non-numeric ms field %q", i+1, n+1, fields[0])
 			}
+			if !msFieldShape.MatchString(fields[0]) {
+				t.Fatalf("slot %d line %d has ms field %q, want whole.fractional with exactly three decimal digits", i+1, n+1, fields[0])
+			}
 		}
+	}
+}
+
+// The point of this fix (review on #294/#296): against the in-test fake responder every Exec
+// completes in well under a millisecond, so before recording microseconds and formatting three
+// decimal places, int64 whole-millisecond truncation rounded the recorded value to 0 for
+// essentially every call -- collapsing p95/knee/coldAcquireRate on the Go arm to the clock's
+// resolution rather than a real signal. This must fail against the pre-fix code (ms field "0")
+// and pass against the fix (a non-zero fractional value).
+func TestDriveRecordsSubMillisecondLatencyRatherThanZero(t *testing.T) {
+	subMsShape := regexp.MustCompile(`^0\.[0-9]{3}$`)
+	f := &fakeExec{}
+	p := planFor(t, startFake(t, f), 1, 1, 0, []string{"true"})
+	if err := drive(context.Background(), p); err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	lines := readLines(t, p.Slots[0].TimesFile)
+	if len(lines) != 1 {
+		t.Fatalf("wrote %d lines, want 1", len(lines))
+	}
+	fields := strings.Fields(lines[0])
+	msField := fields[0]
+	if !subMsShape.MatchString(msField) {
+		t.Fatalf("ms field %q does not have the sub-millisecond shape 0.XXX", msField)
+	}
+	if msField == "0.000" {
+		t.Fatalf("ms field is %q: a sub-millisecond Exec against an in-process fake responder recorded as exactly zero, which is the truncation bug this test exists to catch", msField)
 	}
 }
 

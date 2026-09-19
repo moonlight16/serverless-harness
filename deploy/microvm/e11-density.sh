@@ -1236,7 +1236,7 @@ with open(out, "w") as fh:
 # ---------------------------------------------------------------------------
 grpc_exec_record() {
   local relay_port="$1" sandbox_id="$2" ws_json="$3" cmd_json="$4" req_id="$5" out_file="$6" err_log="$7"
-  local t0 t1 a b ms cause status
+  local t0 t1 a b us frac ms cause status
   # ws_json and cmd_json arrive ALREADY ESCAPED, quotes included (escaped_mix / the caller's
   # one-shot workspace_key escape). err_log is a fixed per-slot path: `2>` truncates it on
   # every call, so the old mktemp+rm pair bought nothing. req_id is a number and needs no
@@ -1254,8 +1254,9 @@ grpc_exec_record() {
     # Subprocess forks in this function: grpcurl above (always -- it is the thing being
     # measured) and these greps (only after an Exec has already failed, so they cannot
     # contribute to a healthy rung's latency, and a failed Exec's latency is not in the
-    # distribution p95 is taken over anyway). ms below is pure arithmetic expansion, no
-    # command substitution and no extra fork (issue #291 item 1) -- so that count is complete.
+    # distribution p95 is taken over anyway). ms below is pure arithmetic expansion plus
+    # parameter expansion, no command substitution and no extra fork (issue #291 item 1) --
+    # so that count is complete.
     if grep -qi "workspace_key" "$err_log"; then
       cause="empty-workspace-key"
     elif grep -qi "mem" "$err_log"; then
@@ -1271,7 +1272,12 @@ grpc_exec_record() {
     fi
   fi
   a="${t0/./}"; b="${t1/./}"
-  ms=$(( (10#$b - 10#$a) / 1000 ))
+  us=$(( (10#$b - 10#$a) ))
+  # Fractional ms with NO fork: parameter expansion and arithmetic only. `1000 + us % 1000`
+  # lands in 1000..1999 so `${frac#1}` is the remainder zero-padded to three digits -- printf
+  # would be a command substitution, and this function is asserted to contain none (#291 item 2).
+  frac=$((1000 + us % 1000))
+  ms="$((us / 1000)).${frac#1}"
   echo "$ms $status $cause" >>"$out_file"
 }
 

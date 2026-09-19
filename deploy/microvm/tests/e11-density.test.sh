@@ -977,7 +977,7 @@ ger_nosubst() { printf '%s\n' "$1" | grep -cE '\$\([^(]'; }
 check "non-vacuousness: the detector flags a real command substitution" \
   "$(ger_nosubst 't0="$(date +%s%N)"')" "1"
 check "non-vacuousness: the detector does NOT flag arithmetic expansion" \
-  "$(ger_nosubst 'ms=$(( (10#$b - 10#$a) / 1000 ))')" "0"
+  "$(ger_nosubst 'us=$(( (10#$b - 10#$a) )); frac=$((1000 + us % 1000)); ms="$((us / 1000)).${frac#1}"')" "0"
 ger_body="$(extract_fn grpc_exec_record | grep -v '^[[:space:]]*#' || true)"
 check "grpc_exec_record is extractable" "$([ -n "$ger_body" ] && echo yes || echo no)" "yes"
 if [ -n "$ger_body" ]; then
@@ -2870,8 +2870,11 @@ else
     for i in 1 2 3; do
       check "slot $i wrote iters+warmup lines" \
         "$(wc -l <"$seam_dir/slot-$i.times" | tr -d ' ')" "$((seam_iters + seam_warmup))"
+      # $1's shape is pinned to whole.fractional with exactly three decimal digits (review on
+      # #294/#296): microseconds formatted as milliseconds to three decimal places, not the
+      # bare integer the pre-fix truncation produced.
       check "  ...every line is '<ms> <status> <cause>' with status ok" \
-        "$(awk 'NF==3 && $2=="ok" && $3=="-" && $1 ~ /^[0-9]+$/ {n++} END{print n+0}' "$seam_dir/slot-$i.times")" \
+        "$(awk 'NF==3 && $2=="ok" && $3=="-" && $1 ~ /^[0-9]+\.[0-9][0-9][0-9]$/ {n++} END{print n+0}' "$seam_dir/slot-$i.times")" \
         "$((seam_iters + seam_warmup))"
       check "  ...and its err file is empty, because nothing failed" \
         "$([ -s "$seam_dir/slot-$i.err" ] && echo nonempty || echo empty)" "empty"

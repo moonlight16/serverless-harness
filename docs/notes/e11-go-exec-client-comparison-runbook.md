@@ -19,6 +19,12 @@ Bare metal, `srv-r16b14s16`, 72 cpu / 754 GiB, `virt: none`, governor `performan
 | 32  | 204.9  | 340 ms | 0.7564          | 0.8069              | 54.46         | 72             |
 | 64  | 231.6  | 753 ms | 0.8907          | 0.9598              | 64.13         | 103            |
 
+The `p95` column above predates a post-review fix: both Exec clients now record `ms` to
+three decimal places (from microseconds, integer-exact) instead of whole milliseconds,
+because the Go client's per-Exec latency is sub-millisecond and whole-ms truncation
+rounded it to `0` almost every time — so a new run's `p95Ms` will show three decimals
+where this table shows a bare integer.
+
 ## Run both arms
 
 Same host, same session, back to back. `SH_E11_RUN_ID` differs per invocation by default, and
@@ -58,6 +64,21 @@ mv deploy/microvm/.results deploy/microvm/.results-go
   runbook exists to hold fixed (both arms must issue the same Exec count per slot to stay
   comparable), and it papers over a cadence problem with more work instead of a faster
   sampler.
+- **Cranking cadence to reach 10 ticks can make the PSS walk the next artifact.**
+  `SAMPLE_LOW_EVERY` (default 5) throttles the `pgrep` + `smaps_rollup` PSS walk relative
+  to _tick rate_, not to wall-clock time — and tick 1 always samples PSS regardless of
+  `SAMPLE_LOW_EVERY`. Pushing tick rate up to the ~70 Hz that 10 ticks inside a ~140 ms
+  Go-arm window needs also pushes PSS/`pgrep` sampling to an absolute rate well past the
+  ~1 Hz-ish envelope issue #291's fix was sized to avoid perturbing — on the very metric
+  (`pssBytes`/Sigma PSS) spec section 7.3 cares most about getting right. The tradeoff is
+  plain: chase 10 ticks via cadence and risk PSS sampling perturbing that rung, or hold
+  cadence where #291 sized it and let the Go arm's tick count (and `hostCpuSamples`) run
+  lower. **The alternative worth considering** is sizing both arms to a common wall-clock
+  window instead of a common Exec count — matched Exec counts were a cleanliness choice
+  for comparability, not a correctness requirement, since `p95`, throughput and
+  `coresBusy` are each individually valid without them. That trade costs the "both arms
+  issued identical Exec counts" property this runbook otherwise asks for. Which cost is
+  acceptable is an operator call, not a rule this runbook sets.
 - **If cadence alone still can't reach 10 ticks**, do not reach for `ITERS_PER_SLOT` as a
   second attempt. Run **two** Go ladders instead, each labelled by the setting that differs
   from the reference (for example "go, `SAMPLE_INTERVAL_MS=250`" and "go,
