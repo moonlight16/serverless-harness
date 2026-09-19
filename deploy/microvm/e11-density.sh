@@ -13,10 +13,13 @@
 # in deploy/microvm/tests/e11-density.test.sh calls main(). See the scope note in the header
 # for the full disclosure of every proxy/limitation below.
 #
-# Two arms only (hardware-corrections F5): "container" (today's remote-worker, no
-# microVM at all -- the baseline E11 is priced against) and "microvm"
-# (microvm-worker, Firecracker ONLY). Cloud Hypervisor is not a third arm: on this
-# project's rig it dies during device restoration after logging
+# Three arms by default (hardware-corrections F5, extended by issue #291 item 3):
+# "container" (today's remote-worker, no microVM at all -- the baseline E11 is
+# priced against), "microvm" (microvm-worker, Firecracker ONLY), and
+# "driver-control" (a null-responder standing in for a backend, see
+# start_null_stack below -- it measures the driver's own cost, not either real
+# backend). Cloud Hypervisor is not one of the three: on this project's rig it
+# dies during device restoration after logging
 # "Restoring virtio-console __console", with no error propagated through its API,
 # and presents as a 30-second hang -- it does not restore, so there is nothing to
 # sweep. Where a CH column would appear in a write-up, that absence is the reason,
@@ -42,10 +45,15 @@
 #     for a real rate-based driver would only need to change how requests are
 #     scheduled onto the same grpc_exec_record() plumbing.
 #   - page-cache asymmetry between arms: drop_caches (dup of e10-lifecycle.sh's own
-#     function) runs between the container and microvm arms, and shuffle_e11_arms
-#     randomizes which arm goes first, exactly as E10 does for its own arms.
+#     function) runs between every pair of arms in the shuffled order (not just
+#     container/microvm -- driver-control gets the same treatment), and
+#     shuffle_e11_arms randomizes which arm goes first, exactly as E10 does for its
+#     own arms.
 #   - guest-side timing is garbage: every timestamp in this script is taken on the
-#     HOST around a grpcurl call (date +%s%N); no guest clock is ever read.
+#     HOST, never a guest clock. Per-Exec latency (grpc_exec_record) is now
+#     $EPOCHREALTIME read before/after the grpcurl call, with no subprocess fork
+#     in the timed path (issue #291 item 1); each rung's own wall time
+#     (wall_t0/wall_t1) still comes from date +%s%N.
 #   - CPU frequency / thermal drift: check_governor (dup of e10-lifecycle.sh's own
 #     function) still refuses a non-"performance" governor before any rung runs.
 #   - converge hides inside the rungs (section 4.5): converge_slot times ONE
@@ -119,6 +127,15 @@
 #     bash deploy/microvm/e11-density.sh
 set -uo pipefail
 
+# LC_ALL is pinned for the WHOLE driver, and exported so awk, python3 and grpcurl inherit
+# it. $EPOCHREALTIME -- which replaces two `date +%s%N` forks per Exec below -- renders with
+# the LOCALE's decimal separator, so under e.g. LC_NUMERIC=de_DE it yields
+# "1789672470,123935". epoch_delta_ms strips a '.', not a ',', so the comma would survive
+# into `10#`, and every Exec's latency would become an arithmetic error INSIDE the timed
+# loop. require_epochrealtime in preflight proves the pin took.
+LC_ALL=C
+export LC_ALL
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -160,6 +177,27 @@ read -r -a D_VALUES <<<"${SH_E11_D_VALUES:-2}"
 read -r -a RAM_MB_VALUES <<<"${SH_E11_GUEST_RAM_MB_VALUES:-256}"
 read -r -a ACTIVE_RUNS <<<"${SH_E11_ACTIVE_RUNS:-1 2 4 8}"
 
+# The arms driven, in randomized order (shuffle_e11_arms). "driver-control" is ON BY DEFAULT
+# (issue #291 section 4): it drives the identical run_density_rung against
+# remote-worker/cmd/null-responder -- one End per Exec, no relay, no Redis, no worker, no VMM
+# -- so subtracting it at each c gives the DRIVER's own contribution to observed latency. The
+# control whose absence let a driver artifact be published as a density finding should not be
+# opt-in. Set SH_E11_ARMS to opt out.
+read -r -a E11_ARMS <<<"${SH_E11_ARMS-container microvm driver-control}"
+# The null-responder's loopback port. Deliberately NOT E11_RELAY_PORT: the control arm's
+# "stack" is one process and never coexists with a relay, but sharing the port would make a
+# stale relay from a previous arm answer the control arm's Execs, which is the one thing this
+# arm must never measure.
+NULL_RESPONDER_PORT="${SH_E11_NULL_RESPONDER_PORT:-8445}"
+
+# SIZE THIS SO EVERY WINDOW SPANS AT LEAST ~10 SAMPLER TICKS. The default of 20 is a floor for
+# the SLOW arms, not a recommendation for the fast ones: measured on the nested-m8i rig during
+# issue #291's shakedown, the container and driver-control arms sustain 75-256 Exec/sec, so a
+# 23-Exec slot closes its window in well under one 1 Hz tick and the rung records hostCpuSamples=1
+# with hostCpuFractionPeak == hostCpuFraction. A one-sample mean is not a number to score
+# crosses('cpu')'s >= 0.9 against. The microvm arm needs no adjustment (it ran 25 samples at this
+# default, being ~15x slower per Exec). Raise this, or lower SH_E11_SAMPLE_INTERVAL_MS, and check
+# hostCpuSamples in the records before quoting any CPU figure.
 ITERS_PER_SLOT="${SH_E11_ITERS_PER_SLOT:-20}"
 WARMUP_PER_SLOT="${SH_E11_WARMUP_PER_SLOT:-3}"
 
@@ -181,6 +219,46 @@ COLD_LATENCY_MS="${SH_E11_COLD_LATENCY_MS:-50}"
 # marker process rather than a real firecracker/virtiofsd binary.
 VMM_PROC_PATTERN="${SH_E11_VMM_PROC_PATTERN:-firecracker}"
 VIRTIOFSD_PROC_PATTERN="${SH_E11_VIRTIOFSD_PROC_PATTERN:-virtiofsd}"
+
+# In-rung host sampling (issue #291 item 1). The sampler brackets exactly the timed Exec
+# window; see host_sampler_loop for why there are two cadences and what each costs.
+#
+# 1 Hz by default: the every-tick path is builtins only, so its cost is a `sleep` fork per
+# slice and nothing else. SAMPLE_SLICE_MS is how often the loop checks the stop file.
+#
+# The final tick at stop is taken ONLY when no full tick has already landed for this rung
+# (host_sampler_loop gates it on SAMPLE_TICK == 0). A rung that already has one or more real
+# ticks never gets an extra one at stop: that tick's window would be mostly post-window idle
+# time averaged in with equal weight to the real ticks, biasing the mean toward "the driver
+# was idle" -- the same failure mode issue #291 exists to fix, at reduced magnitude. When no
+# full tick has landed (a rung shorter than SAMPLE_INTERVAL_MS), the final tick is still taken
+# once SAMPLE_MIN_TICK_MS has elapsed, so a short rung gets exactly one sample rather than
+# none.
+SAMPLE_INTERVAL_MS="${SH_E11_SAMPLE_INTERVAL_MS:-1000}"
+SAMPLE_SLICE_MS="${SH_E11_SAMPLE_SLICE_MS:-100}"
+# The floor under the final tick at stop (see above -- only reachable when zero full ticks
+# have landed). A /proc/stat diff over a few milliseconds is jiffy noise, not a measurement,
+# so below this the stop tick records NOTHING and the rung's hostCpuSamples is 0 -- which
+# run_density_rung refuses, naming the fix.
+SAMPLE_MIN_TICK_MS="${SH_E11_SAMPLE_MIN_TICK_MS:-200}"
+# pssBytes and processCount need pgrep plus an N-file smaps_rollup walk, so they run every
+# Nth tick (and always on tick 1, so a rung with CPU samples can never have zero of them).
+# Defensible because crosses('memory') in experiments/src/microvm-density.ts reads
+# memAvailableBytes -- which IS every tick -- not pssBytes: PSS feeds the narrative, not the
+# bound classification. The cadence is recorded in every rung's proxyLimitations, and each
+# signal's own sample count is written to the record.
+SAMPLE_LOW_EVERY="${SH_E11_SAMPLE_LOW_EVERY:-5}"
+
+# Sampler state. At script scope, above first use, because `shellcheck -o
+# check-unassigned-uppercase` is a gate here (a variable referenced but never assigned
+# passes plain shellcheck AND `bash -n`, and is a hard failure under this driver's `set -u`
+# on the first line that reads it -- exactly how $PROTO_IMPORT_PATH shipped undefined).
+SAMPLE_IDLE=0
+SAMPLE_TOTAL=0
+SAMPLE_MEM_AVAILABLE_BYTES=0
+SAMPLE_PREV_IDLE=0
+SAMPLE_PREV_TOTAL=0
+SAMPLE_TICK=0
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 REMOTE_WORKER_DIR="$REPO_ROOT/remote-worker"
@@ -220,6 +298,17 @@ E11_START_STACK="${SH_E11_START_STACK:-1}"
 # because a digest this script has never pulled would be a guess, not a pin.
 E11_REDIS_IMAGE="${SH_E11_REDIS_IMAGE:-redis:7}"
 
+# A per-invocation identity, stamped into every rung record and enforced by assemble_ladder.
+# WHY: $RESULTS accumulates across runs and nothing clears it -- not this script, not the metal
+# runbook. assemble_ladder used to glob `e11-rung-<arm>-c*.json`, so a rung left over from an
+# EARLIER run with different settings was silently assembled into the current ladder. Observed
+# during issue #291's shakedown: a c=2 rung from a 20-iter smoke reappeared inside a 600-iter
+# ladder, carrying that run's one-sample hostCpuFraction. detectKnee anchors on the c=1 baseline,
+# so a stale c=1 does not merely add a bad point -- it re-scales every health decision after it.
+# That is this issue's own failure mode one level up: a ladder that looks complete while mixing
+# measurements that were never comparable.
+E11_RUN_ID="${SH_E11_RUN_ID:-$(date +%Y%m%dT%H%M%S)-$$}"
+
 die() { echo "e11: $*" >&2; exit 1; }
 log() { echo "e11: $*" >&2; }
 
@@ -252,6 +341,9 @@ log() { echo "e11: $*" >&2; }
 E11_WORKER_PID=""
 E11_RELAY_PID=""
 E11_WORKER_BIN=""
+E11_SAMPLER_PID=""
+E11_NULL_PID=""
+E11_NULL_BIN=""
 E11_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/e11-density.XXXXXX")"
 
 cleanup_on_exit() {
@@ -261,8 +353,13 @@ cleanup_on_exit() {
   # below cannot catch, so without this flag a stuck relay from stop_container_stack
   # would abort the trap before stop_microvm_stack or the E11_TMPDIR cleanup ever ran.
   E11_IN_CLEANUP=1
+  # The sampler goes before the stacks and, crucially, before the `rm -rf "$E11_TMPDIR"`
+  # below: host_sampler_loop polls for a stop file under that root, so once the root is gone
+  # the file can never appear and the subshell would spin forever appending to a deleted path.
+  stop_host_sampler || true
   stop_container_stack || true
   stop_microvm_stack || true
+  stop_null_stack || true
   [ -z "${E11_TMPDIR:-}" ] || rm -rf "$E11_TMPDIR"
 }
 trap cleanup_on_exit EXIT
@@ -316,6 +413,39 @@ validate_repo_cache_shape() {
   esac
 }
 
+# validate_arms refuses an SH_E11_ARMS value that is not one of the three arms this driver
+# implements, and refuses an empty list. An invented arm would otherwise fall through main()'s
+# case with no branch, so the sweep would "succeed" having driven nothing -- which is the
+# looks-like-success failure mode this file spends most of its refusals on. A Cloud
+# Hypervisor spelling in particular is a plausible typo and is NOT an arm here (see the
+# header for why: on this rig CH does not restore).
+validate_arms() {
+  [ "${#E11_ARMS[@]}" -gt 0 ] ||
+    die "SH_E11_ARMS is empty - a sweep with no arms would complete having measured nothing. The three arms are: container, microvm, driver-control."
+  local arm
+  for arm in "${E11_ARMS[@]}"; do
+    case "$arm" in
+    container | microvm | driver-control) : ;;
+    *)
+      die "SH_E11_ARMS contains '$arm', which is not one of this driver's three arms: container (today's remote-worker, the baseline), microvm (microvm-worker, Firecracker only), driver-control (the null-responder, issue #291 section 4). Cloud Hypervisor is not an arm here - see this file's header."
+      ;;
+    esac
+  done
+}
+
+# arm_in_use reports, via exit status, whether $1 is present in E11_ARMS, so preflight
+# can skip a tool or hardware check that no configured arm actually needs (issue #291
+# item 5): a SH_E11_ARMS=driver-control run should not be refused over a missing docker
+# or /dev/kvm that arm never touches. Called only after validate_arms has already run,
+# so E11_ARMS is known to hold nothing but the three recognized arm names.
+arm_in_use() {
+  local want="$1" arm
+  for arm in "${E11_ARMS[@]}"; do
+    [ "$arm" = "$want" ] && return 0
+  done
+  return 1
+}
+
 # require_tool refuses a MISSING external binary by name, in preflight, rather than
 # letting a rung "run" against a command that is not there -- the same guard, and the same
 # wording, e10-lifecycle.sh already carries. E11 had NO tool preflight at all, and that is
@@ -327,26 +457,45 @@ require_tool() {
 }
 
 preflight() {
-  # Every one of these is a HARD requirement for at least one arm, and each was found the
-  # expensive way on the first execution. pnpm in particular is NOT optional: the container
-  # arm's relay is `pnpm --filter @sh/sandbox-relay start`, so without it that whole arm --
-  # the baseline the microvm arm is priced against -- cannot start.
-  require_tool grpcurl "both arms drive their Exec RPCs through grpcurl; without it every timing would measure a client-side error rather than a sandbox"
-  require_tool docker "both arms start their own scratch redis in a container; without it the relay has nowhere to publish its presence record"
-  require_tool go "both arms build their own worker binary from ./cmd/worker and ./cmd/microvm-worker"
-  require_tool pnpm "the container arm starts the real sandbox-relay via pnpm --filter @sh/sandbox-relay; without it the baseline arm cannot start at all"
-  require_tool ss "between-arm relay teardown identifies the listener by port via ss; without it kill_relay_by_port cannot tell a free port from a missing tool, and the next arm would attach to the previous arm's relay"
+  require_epochrealtime
+  # validate_arms runs FIRST: every check below reads E11_ARMS to decide what it needs, so
+  # an invented arm name must be refused before any of them run, not after (also see
+  # arm_in_use above).
+  validate_arms
+  # grpcurl and go are hard requirements for every arm: grpcurl drives every arm's Exec
+  # RPCs, and go builds whichever binary that arm needs (./cmd/worker, ./cmd/microvm-worker,
+  # or ./cmd/null-responder). Everything else in this function is conditional on which arms
+  # are actually configured (issue #291 item 5): a SH_E11_ARMS=driver-control run touches
+  # none of docker, pnpm, or the microVM hardware checks below, so refusing over a missing
+  # one would block a run that never needed it.
+  require_tool grpcurl "every arm drives its Exec RPCs through grpcurl; without it every timing would measure a client-side error rather than a sandbox"
+  require_tool go "the container arm builds ./cmd/worker, the microvm arm builds ./cmd/microvm-worker, and the driver-control arm builds ./cmd/null-responder"
+  if arm_in_use container || arm_in_use microvm; then
+    require_tool docker "the container and microvm arms both start their own scratch redis in a container; without it the relay has nowhere to publish its presence record"
+    require_tool pnpm "the container and microvm arms both start the real sandbox-relay via pnpm --filter @sh/sandbox-relay; without it neither arm can start at all"
+    # `ss` is in this branch, not above it, because kill_relay_by_port is called from
+    # stop_container_stack and stop_microvm_stack ONLY -- the driver-control arm runs no relay
+    # and tears its responder down by pid. Requiring it unconditionally would re-block exactly
+    # the SH_E11_ARMS=driver-control run that issue #291 item 5 exists to unblock.
+    require_tool ss "between-arm relay teardown identifies the listener by port via ss; without it kill_relay_by_port cannot tell a free port from a missing tool, and the next arm would attach to the previous arm's relay"
+  fi
   # The proto must be PRESENT as a file, separately from how grpcurl is told to find it
   # (PROTO_IMPORT_PATH/PROTO_REL_PATH): a missing proto is otherwise indistinguishable from
   # a malformed grpcurl invocation, and both present as an unencodable Exec. e10 carries the
-  # same check for the same reason.
+  # same check for the same reason. Every arm drives grpcurl, so this stays unconditional.
   [ -f "$PROTO_FILE" ] ||
     die "the sandbox proto is missing at $PROTO_FILE - grpcurl cannot encode an Exec request without it, so every rung would time a client-side error"
-  check_kvm
-  check_cgroups
-  check_swap
-  GOVERNOR_STATE="$(check_governor)"
-  log "governor: $GOVERNOR_STATE"
+  # check_kvm/check_cgroups/check_swap/check_governor are all about the microVM guest this
+  # driver's microvm arm boots (KVM to run it, cgroups v2 for its restore latency, no swap
+  # so guest RAM is not paged out, a performance governor for its replenishment CPU burst) --
+  # none of them mean anything for a sweep that never boots a guest.
+  if arm_in_use microvm; then
+    check_kvm
+    check_cgroups
+    check_swap
+    GOVERNOR_STATE="$(check_governor)"
+    log "governor: $GOVERNOR_STATE"
+  fi
   validate_repo_cache_shape
   mkdir -p "$RESULTS"
 }
@@ -389,8 +538,28 @@ pss_bytes_for_pids() {
       fi
       continue # pid exited between discovery and sampling; not an unreadable file
     fi
-    local pid_kb
-    pid_kb="$(awk '/^Pss:/{sum+=$2} END{print sum+0}' "$smaps")"
+    # The read can still fail AFTER `-r` said it would succeed, and the two causes need
+    # OPPOSITE handling. Observed on both rigs during issue #291's shakedown:
+    #   - the pid exited in the window between the test and the read. A race; it contributes 0,
+    #     which is correct. Unhandled, awk printed `fatal: cannot open file` to stderr on every
+    #     occurrence -- 14 lines in one three-arm smoke -- which reads like a defect and is not.
+    #   - the open was REFUSED while the process is still alive: /proc/<pid>/smaps_rollup passes
+    #     a mode-bits `-r` test but is gated by ptrace permissions, so another user's process
+    #     yields EPERM. Seen on the metal box, where an unscoped `pgrep -f firecracker` matched a
+    #     colleague's `more firecracker-jailer-snapshot.sh`.
+    # Unhandled, BOTH silently contributed 0: awk's failure left pid_kb empty and bash arithmetic
+    # treats an empty string as 0. That is the RSS-fallback failure mode wearing different
+    # clothes -- Sigma PSS quietly under-reported, in the optimistic direction, with the record
+    # still looking complete. So a live-but-unreadable pid now takes the spec section 7.3 refusal
+    # it was always supposed to take.
+    local pid_kb pid_rc=0
+    pid_kb="$(awk '/^Pss:/{sum+=$2} END{print sum+0}' "$smaps" 2>/dev/null)" || pid_rc=$?
+    if [ "$pid_rc" -ne 0 ] || [ -z "$pid_kb" ]; then
+      if kill -0 "$pid" 2>/dev/null; then
+        die "smaps_rollup for pid $pid ($smaps) passed a readability test and then FAILED to read while the process is still alive - refusing to let it contribute 0 bytes to Sigma PSS (spec section 7.3's boxed warning). Most likely the pid is not ours: check SH_E11_VMM_PROC_PATTERN, which is matched with an unscoped pgrep -f and will pick up any process whose command line contains the pattern, including another user's."
+      fi
+      continue # exited between the readability test and the read; a race, not a bad file
+    fi
     total_kb=$((total_kb + pid_kb))
   done
   echo $((total_kb * 1024))
@@ -415,8 +584,35 @@ pss_bytes_for_pids() {
 # e10-lifecycle.sh), where `exit` merely terminates and cannot re-enter END. This was
 # the single instance of the shape. require_numeric below is the guard that keeps it
 # from being the last one.
+# FOUND BY THE FIRST-EVER EXECUTION of this driver on a Linux host with real memory
+# (issue #291's PR): the awk form above was `print $2*1024`, and awk's OFMT defaults to "%.6g".
+# On MAWK -- Debian's and Ubuntu's default awk -- that applies to an integral product too, so a
+# 16 GiB host printed `1.73035e+10`. require_numeric refuses that (its regex is
+# `-?[0-9]+(\.[0-9]+)?`), so host_signals_snapshot returned non-zero and EVERY RUNG WAS REFUSED.
+#
+# It is MAWK-SPECIFIC, and the scope was initially overstated in this comment: gawk and macOS awk
+# print `808960000000` for the same expression, because they apply OFMT only to non-integral
+# values. Both rigs this project runs on (the 72-cpu/754 GiB metal box and the nested-m8i EC2
+# instance) ship gawk and were never affected -- verified on both. So this fix did not rescue a
+# metal run; what it does is remove the dependence on which awk a host ships, which is the part
+# worth having, since a Debian/Ubuntu host would have recorded nothing at all.
+#
+# The cluster-free suite passed throughout on every platform, because its fixture uses
+# 8192000 kB -- small enough that even mawk prints it as an integer.
+#
+# `printf "%d"` is NOT the fix: Debian's mawk clamps %d to 32 bits, so it prints 2147483647 --
+# silently recording 2 GB where the truth is 17 GB, which is the optimistic-direction wrongness
+# spec section 7.3's boxed warning exists to prevent. `printf "%.0f"` works, and so does
+# OFMT="%.17g", but both leave the value's correctness dependent on which awk the host ships.
+#
+# So this reads /proc/meminfo with the same builtin loop the in-rung sampler uses
+# (proc_meminfo_available, added for issue #291 item 1). Bash arithmetic is 64-bit, there is no
+# format string to get wrong, and it forks nothing. Clobbering SAMPLE_MEM_AVAILABLE_BYTES here is
+# safe: the only caller is the POST-LOAD snapshot, which runs after the sampler has been reaped
+# and after aggregation has already read the sampler's file.
 mem_available_bytes() {
-  awk '/^MemAvailable:/{found=1; print $2*1024; exit} END{if (!found) print 0}' "$PROC_ROOT/meminfo" 2>/dev/null || echo 0
+  proc_meminfo_available || SAMPLE_MEM_AVAILABLE_BYTES=0
+  printf '%s\n' "$SAMPLE_MEM_AVAILABLE_BYTES"
 }
 
 # require_numeric echoes value unchanged when it is exactly ONE line holding one bare
@@ -462,9 +658,10 @@ dimension_literal() {
   require_numeric "$field" "$value"
 }
 
-# host_cpu_fraction samples /proc/stat twice, SAMPLE_WINDOW_S apart, and returns
-# the busy fraction over that window -- never a single-sample /proc/stat snapshot,
-# which is meaningless (it is a cumulative counter since boot).
+# host_cpu_fraction samples /proc/stat twice, "$1" seconds apart (default 1, its only
+# caller besides tests passes none), and returns the busy fraction over that window --
+# never a single-sample /proc/stat snapshot, which is meaningless (it is a cumulative
+# counter since boot).
 host_cpu_fraction() {
   local window="${1:-1}" a b idle_a idle_b total_a total_b
   a="$(awk '/^cpu /{print; exit}' "$PROC_ROOT/stat" 2>/dev/null)"
@@ -480,6 +677,258 @@ host_cpu_fraction() {
   total_b="$(awk '{s=0; for(i=2;i<=NF;i++) s+=$i; print s}' <<<"$b")"
   awk -v ia="$idle_a" -v ib="$idle_b" -v ta="$total_a" -v tb="$total_b" \
     'BEGIN{ dt=tb-ta; di=ib-ia; if (dt>0) printf "%.4f", 1-(di/dt); else print 0 }'
+}
+
+# ---------------------------------------------------------------------------
+# The in-rung sampler (issue #291 item 1).
+#
+# host_signals_snapshot below is KEPT, and its values are recorded under postLoad* names, so
+# an idle reading can never again pass as an under-load one. What it cannot do is sample
+# during the window: host_cpu_fraction SLEEPS for its diff, so calling it from inside a
+# concurrency rung would either stall the driver or measure one second of a window that may
+# be shorter than that.
+#
+# The every-tick path here therefore forks NOTHING. proc_stat_totals and
+# proc_meminfo_available read /proc with the `read` builtin and a file redirection (not a
+# pipe, so no subshell), the CPU fraction is formatted with `printf -v`, and the previous
+# /proc/stat reading is kept in globals rather than re-derived -- which is what removes the
+# `sleep` from inside a sample. Globals rather than printed values throughout, because
+# `x="$(f)"` is a fork and this runs beside the thing being measured.
+# ---------------------------------------------------------------------------
+
+# proc_stat_totals sets SAMPLE_IDLE and SAMPLE_TOTAL from the aggregate "cpu " line.
+# Returns non-zero when there is no such line, so a caller on a non-Linux host samples
+# nothing rather than recording a fabricated 0.
+#
+# Missing trailing fields (guest / guest_nice are absent on older kernels) are ASSIGNED
+# EMPTY by `read`, not left unset, and bash arithmetic treats an empty string as 0 -- so
+# `set -u` is satisfied and the sum is still correct.
+proc_stat_totals() {
+  local label user nice system idle iowait irq softirq steal guest guest_nice
+  SAMPLE_IDLE=0
+  SAMPLE_TOTAL=0
+  while read -r label user nice system idle iowait irq softirq steal guest guest_nice; do
+    [ "$label" = "cpu" ] || continue
+    SAMPLE_IDLE=$((idle + iowait))
+    SAMPLE_TOTAL=$((user + nice + system + idle + iowait + irq + softirq + steal + guest + guest_nice))
+    return 0
+  done <"$PROC_ROOT/stat"
+  return 1
+}
+
+# proc_meminfo_available sets SAMPLE_MEM_AVAILABLE_BYTES from MemAvailable, in bytes.
+# Returns non-zero when there is no MemAvailable line. mem_available_bytes' awk form stays
+# in place for the post-load snapshot, where one fork per rung costs nothing.
+#
+# The third `read` variable is needed (two would put "8192000 kB" in $value) and named
+# _rest because SC2034 -- "appears unused" -- is a WARNING, and shellcheck at -S warning is
+# a gate here, so `unit` would fail `make lint`.
+proc_meminfo_available() {
+  local key value _rest
+  SAMPLE_MEM_AVAILABLE_BYTES=0
+  while read -r key value _rest; do
+    if [ "$key" = "MemAvailable:" ]; then
+      SAMPLE_MEM_AVAILABLE_BYTES=$((value * 1024))
+      return 0
+    fi
+  done <"$PROC_ROOT/meminfo"
+  return 1
+}
+
+# host_sampler_tick appends ONE line to $1:
+#
+#     <cpuFraction> <memAvailableBytes> <pssBytes|-|refused> <processCount|->
+#
+# "-" marks a tick that did not carry the low-cadence signals; sampler_field skips those,
+# which is how pssSamples can legitimately differ from hostCpuSamples in the record.
+# "refused" (pssBytes column only) marks a low-cadence tick that DID try, but
+# pss_bytes_for_pids died on an unreadable smaps_rollup for a still-live pid (spec section
+# 7.3's boxed warning) -- a distinct, countable event, not an absent sample. See
+# pssRefusedTicks in run_density_rung (issue #291 item 4).
+#
+# The CPU fraction is computed in scaled integer arithmetic and the decimal point spliced in
+# by `printf -v`, because awk or bc would be a fork per tick. It is clamped to [0, 1]: a
+# CPU hotplug or a counter wrap can make the idle delta exceed the total delta, and a
+# negative "fraction" would be interpolated straight into the rung's JSON.
+host_sampler_tick() {
+  local out_file="$1"
+  local di dt scaled frac pss proc_count p vmm_pids virtiofsd_pids
+  proc_stat_totals || return 1
+  di=$((SAMPLE_IDLE - SAMPLE_PREV_IDLE))
+  dt=$((SAMPLE_TOTAL - SAMPLE_PREV_TOTAL))
+  SAMPLE_PREV_IDLE="$SAMPLE_IDLE"
+  SAMPLE_PREV_TOTAL="$SAMPLE_TOTAL"
+  scaled=0
+  if [ "$dt" -gt 0 ]; then
+    scaled=$(((dt - di) * 10000 / dt))
+  fi
+  [ "$scaled" -ge 0 ] || scaled=0
+  [ "$scaled" -le 10000 ] || scaled=10000
+  printf -v frac '%d.%04d' "$((scaled / 10000))" "$((scaled % 10000))"
+  proc_meminfo_available || SAMPLE_MEM_AVAILABLE_BYTES=0
+  SAMPLE_TICK=$((SAMPLE_TICK + 1))
+  pss="-"
+  proc_count="-"
+  # Tick 1 is ALWAYS a low-cadence tick. Otherwise a rung whose window fits in fewer than
+  # SAMPLE_LOW_EVERY ticks would record pssSamples=0 and processCountSamples=0 while having
+  # CPU samples -- and standbysResident is derived from processCount, so it would have had to
+  # fall back to the post-load count, reintroducing exactly the idle reading this fixes.
+  if [ "$SAMPLE_TICK" -eq 1 ] || [ $((SAMPLE_TICK % SAMPLE_LOW_EVERY)) -eq 0 ]; then
+    vmm_pids="$(discover_pids "$VMM_PROC_PATTERN")"
+    virtiofsd_pids="$(discover_pids "$VIRTIOFSD_PROC_PATTERN")"
+    # A `die` inside pss_bytes_for_pids exits only this command substitution's subshell, so
+    # the assignment lands empty with a non-zero status. That refusal (spec section 7.3's
+    # boxed warning: a still-live pid with an unreadable smaps_rollup) is a DIFFERENT event
+    # from an ordinary un-sampled tick, so it gets a distinct marker, "refused", rather than
+    # "-" -- otherwise it would silently vanish from this tick with no trace anywhere except
+    # the post-load snapshot's own separate refusal path, which only covers the moment after
+    # the window closes, not any in-window tick (issue #291 item 4). sampler_field and
+    # sampler_marker_count both know to treat "refused" as not-a-number.
+    # shellcheck disable=SC2086 # word-splitting into pss_bytes_for_pids' "$@" is intended
+    pss="$(pss_bytes_for_pids $vmm_pids $virtiofsd_pids)" || pss="refused"
+    [ -n "$pss" ] || pss="-"
+    proc_count=0
+    # shellcheck disable=SC2086
+    for p in $vmm_pids $virtiofsd_pids; do
+      [ -z "$p" ] || proc_count=$((proc_count + 1))
+    done
+  fi
+  printf '%s %s %s %s\n' "$frac" "$SAMPLE_MEM_AVAILABLE_BYTES" "$pss" "$proc_count" >>"$out_file"
+}
+
+# host_sampler_loop ticks into $1 until $2 exists, then, ONLY if no full tick has landed yet
+# (SAMPLE_TICK == 0), takes ONE final tick provided at least SAMPLE_MIN_TICK_MS has elapsed
+# since the loop started. Meant to be backgrounded by run_density_rung immediately after
+# wall_t0 and reaped immediately after wall_t1.
+#
+# The no-full-tick gate matters (issue #291 item 2): once a rung has a real, full-interval
+# tick, a second tick taken at stop is not a peer sample -- its window runs from the last
+# full tick to "sampler noticed the stop file", which for a rung that finishes near an
+# interval boundary is mostly post-window idle time. Averaging that in at equal weight with
+# real ticks biases hostCpuFraction toward "idle", the same direction as the original
+# driver-cost artifact. So once SAMPLE_TICK is nonzero, stop takes no extra tick -- the rung
+# keeps whatever full ticks it earned and nothing else. Only a rung shorter than one full
+# interval (SAMPLE_TICK still 0 at stop) uses the elapsed-time floor to still get exactly one
+# sample instead of zero.
+#
+# It waits in SAMPLE_SLICE_MS slices rather than one SAMPLE_INTERVAL_MS sleep so that the
+# stop file is noticed promptly. That costs one `sleep` fork per slice -- ten a second
+# against the ~370 process creations a second issue #291 item 2 removed.
+host_sampler_loop() {
+  local out_file="$1" stop_file="$2"
+  local slices_per_tick slice=0 last_ms slice_s
+  slices_per_tick=$((SAMPLE_INTERVAL_MS / SAMPLE_SLICE_MS))
+  [ "$slices_per_tick" -ge 1 ] || slices_per_tick=1
+  printf -v slice_s '%d.%03d' "$((SAMPLE_SLICE_MS / 1000))" "$((SAMPLE_SLICE_MS % 1000))"
+  proc_stat_totals || return 0 # no /proc/stat here: sample nothing rather than lie
+  SAMPLE_PREV_IDLE="$SAMPLE_IDLE"
+  SAMPLE_PREV_TOTAL="$SAMPLE_TOTAL"
+  SAMPLE_TICK=0
+  set_epoch_ms
+  last_ms="$EPOCH_MS"
+  while :; do
+    if [ -e "$stop_file" ]; then
+      if [ "$SAMPLE_TICK" -eq 0 ]; then
+        set_epoch_ms
+        if [ $((EPOCH_MS - last_ms)) -ge "$SAMPLE_MIN_TICK_MS" ]; then
+          host_sampler_tick "$out_file" || true
+        fi
+      fi
+      return 0
+    fi
+    sleep "$slice_s"
+    slice=$((slice + 1))
+    [ "$slice" -ge "$slices_per_tick" ] || continue
+    slice=0
+    host_sampler_tick "$out_file" || return 0
+    set_epoch_ms
+    last_ms="$EPOCH_MS"
+  done
+}
+
+# stop_host_sampler kills the backgrounded sampler if one is running. It runs FIRST in
+# cleanup_on_exit, before the `rm -rf $E11_TMPDIR`, because host_sampler_loop polls for a
+# stop file under that root: once the root is gone the file can never appear, and the
+# subshell would spin forever appending to a deleted path. `${VAR:-}` because the trap can
+# fire before this is ever assigned.
+stop_host_sampler() {
+  [ -n "${E11_SAMPLER_PID:-}" ] || return 0
+  kill "${E11_SAMPLER_PID:-}" 2>/dev/null
+  E11_SAMPLER_PID=""
+  return 0
+}
+
+# sampler_field prints one statistic over one COLUMN of a sampler file. `stat` is
+# mean|peak|min|count; `fmt` is a printf format (default %.4f -- pass %.0f for the byte
+# columns, whose consumers want integers, and whose mean is rounded rather than truncated).
+#
+# `fmt` is IGNORED for stat=count: a count cannot be fractional, so it always prints a bare
+# integer regardless of what is passed. Call sites below that ask for `count` omit the
+# fourth argument rather than passing a now-documented-as-inert '%d' (final review M12).
+#
+# Cells holding "-" OR "refused" are SKIPPED, not read as zero: "-" means the tick did not
+# carry the low-cadence signals, "refused" means it did but pss_bytes_for_pids died on an
+# unreadable smaps_rollup for a still-live pid (spec section 7.3's boxed warning) -- see
+# host_sampler_tick and pssRefusedTicks in run_density_rung (issue #291 item 4). Neither is a
+# 0, and a 0 in a mean is a claim about memory while an absent sample is not. It is also why
+# pssSamples can legitimately be smaller than hostCpuSamples.
+#
+# An empty file, or a column with no numeric cell, is the ABSENCE of a measurement and
+# returns non-zero rather than printing 0 -- the same refusal percentile makes, for the same
+# reason. `count` is the exception: it prints 0, so a caller can tell "no samples" from
+# "the aggregation failed".
+#
+# One awk per statistic per rung, after the sampler has been reaped: nothing here can
+# perturb a measurement.
+sampler_field() {
+  local file="$1" col="$2" stat="$3" fmt="${4:-%.4f}"
+  [ -s "$file" ] || {
+    [ "$stat" = "count" ] && { echo 0; return 0; }
+    return 1
+  }
+  awk -v col="$col" -v stat="$stat" -v fmt="$fmt" '
+    $col != "-" && $col != "refused" {
+      v = $col + 0
+      n++
+      s += v
+      if (n == 1 || v > mx) mx = v
+      if (n == 1 || v < mn) mn = v
+    }
+    END {
+      if (stat == "count") { print n + 0; exit 0 }
+      if (n == 0) { exit 1 }
+      if (stat == "mean") { printf fmt, s / n }
+      else if (stat == "peak") { printf fmt, mx }
+      else if (stat == "min") { printf fmt, mn }
+      else { exit 1 }
+    }' "$file"
+}
+
+# sampler_marker_count counts ticks in $1 whose column $2 holds exactly the literal $3
+# (e.g. "refused") rather than a number or "-". Used for pssRefusedTicks: a refusal is a
+# distinct, countable event, not indistinguishable from an ordinary un-sampled tick.
+sampler_marker_count() {
+  local file="$1" col="$2" marker="$3"
+  [ -s "$file" ] || {
+    echo 0
+    return 0
+  }
+  awk -v col="$col" -v marker="$marker" '$col == marker {n++} END{print n + 0}' "$file"
+}
+
+# host_cpu_count prints the online CPU count, for coresBusy. `getconf _NPROCESSORS_ONLN` is
+# the portable fallback (it works on darwin, where the test suite runs, and nproc may not
+# be installed). One fork per rung.
+host_cpu_count() {
+  local n=""
+  if command -v nproc >/dev/null 2>&1; then
+    n="$(nproc 2>/dev/null)" || n=""
+  fi
+  if [ -z "$n" ]; then
+    n="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" || n=""
+  fi
+  [ -n "$n" ] || n=1
+  printf '%s' "$n"
 }
 
 # host_signals_snapshot prints one JSON object: pssBytes (VMM + virtiofsd, PSS
@@ -536,6 +985,49 @@ host_signals_snapshot() {
 }
 
 # ---------------------------------------------------------------------------
+# Timing primitives (issue #291 item 2).
+#
+# $EPOCHREALTIME is a bash VARIABLE (bash >= 5.0), so reading it costs no process. It
+# replaces the two `date +%s%N` forks grpc_exec_record used to take per Exec -- and,
+# because t0 was stamped before the compound whose argument list held two python3 command
+# substitutions, those two interpreter startups were inside the measured latency.
+# Resolution drops from nanoseconds to microseconds, which is immaterial for millisecond
+# latencies.
+#
+# Both helpers avoid command substitution deliberately: `x="$(f)"` is a FORK, which is the
+# entire thing being removed here. epoch_delta_ms prints (it is called once per Exec, where
+# one fork for the substitution is what the caller already pays for the assignment), while
+# set_epoch_ms writes a global (it is called inside the sampler's tick loop, where nothing
+# may fork).
+# ---------------------------------------------------------------------------
+EPOCH_MS=0
+
+# epoch_delta_ms prints the whole milliseconds between two $EPOCHREALTIME readings.
+# Stripping the '.' turns <seconds>.<6 digits> into integer MICROSECONDS, which bash's
+# 64-bit arithmetic holds with room to spare (1.8e15 today). `10#` is defensive against a
+# reading whose integer part could ever begin with 0.
+epoch_delta_ms() {
+  local a="${1/./}" b="${2/./}"
+  echo $(((10#$b - 10#$a) / 1000))
+}
+
+# set_epoch_ms sets EPOCH_MS to now, in whole milliseconds, with no subprocess.
+set_epoch_ms() {
+  local e="${EPOCHREALTIME/./}"
+  EPOCH_MS=$((10#$e / 1000))
+}
+
+# require_epochrealtime refuses a shell whose $EPOCHREALTIME is missing or not
+# <digits>.<digits>. bash < 5.0 does not define it at all -- and bash 3.2 is both /bin/sh
+# and /bin/bash on macOS -- so under `set -u` the FIRST timed Exec would abort its slot,
+# every slot, and the rung would refuse with a message about converge. A locale rendering a
+# decimal comma is the other way this reads wrong; LC_ALL=C above pins it.
+require_epochrealtime() {
+  [[ "${EPOCHREALTIME:-}" =~ ^[0-9]+\.[0-9]+$ ]] ||
+    die "\$EPOCHREALTIME is '${EPOCHREALTIME:-<unset>}', not <seconds>.<microseconds>: this driver times every Exec from it (issue #291 item 2). Unset means bash < 5.0 (bash 3.2 is /bin/bash on macOS - run this under a bash 5 on PATH); a decimal comma means a locale is overriding the LC_ALL=C pin at the top of this file."
+}
+
+# ---------------------------------------------------------------------------
 # json_escape / percentile -- duplicated from e10-lifecycle.sh verbatim (see that
 # file's own copies); small enough that duplication beats sourcing a sibling
 # script for these two alone.
@@ -584,6 +1076,19 @@ e11_tool_call_mix() {
   echo "rm -f /tmp/e11-mix-$$.tmp"
 }
 
+# escaped_mix prints one PRE-ESCAPED JSON string literal (surrounding double quotes
+# included) per command of e11_tool_call_mix, in the mix's own order. It is called ONCE PER
+# RUNG, before the rung's slots start -- this is where the two python3 interpreter
+# startups per Exec went (issue #291 item 2). It uses the same json_escape the timed loop
+# used to call, so the bytes it produces are identical by construction rather than by a
+# reimplementation of JSON escaping in bash, which is where this change's real risk was.
+escaped_mix() {
+  local cmd
+  while IFS= read -r cmd; do
+    json_escape "$cmd"
+  done < <(e11_tool_call_mix)
+}
+
 # ---------------------------------------------------------------------------
 # The Exec RPC itself, extended from e10-lifecycle.sh's grpc_exec_ms with a
 # workspace_key (proto/sandbox/v1/sandbox.proto: Exec.workspace_key, field 6,
@@ -591,17 +1096,27 @@ e11_tool_call_mix() {
 # for execErrorsByCause.
 # ---------------------------------------------------------------------------
 grpc_exec_record() {
-  local relay_port="$1" sandbox_id="$2" workspace_key="$3" cmd="$4" req_id="$5" out_file="$6"
-  local t0 t1 ms err_log cause status
-  err_log="$(mktemp "$E11_TMPDIR/errlog.XXXXXX")"
-  t0="$(date +%s%N)"
+  local relay_port="$1" sandbox_id="$2" ws_json="$3" cmd_json="$4" req_id="$5" out_file="$6" err_log="$7"
+  local t0 t1 a b ms cause status
+  # ws_json and cmd_json arrive ALREADY ESCAPED, quotes included (escaped_mix / the caller's
+  # one-shot workspace_key escape). err_log is a fixed per-slot path: `2>` truncates it on
+  # every call, so the old mktemp+rm pair bought nothing. req_id is a number and needs no
+  # escaping.
+  t0="$EPOCHREALTIME"
   if grpcurl -plaintext -max-time "$EXEC_MAX_TIME_S" -import-path "$PROTO_IMPORT_PATH" -proto "$PROTO_REL_PATH" \
-    -d "{\"sandbox_id\":\"$sandbox_id\",\"exec\":{\"req_id\":$req_id,\"command\":$(json_escape "$cmd"),\"timeout_s\":30,\"workspace_key\":$(json_escape "$workspace_key")}}" \
+    -d "{\"sandbox_id\":\"$sandbox_id\",\"exec\":{\"req_id\":$req_id,\"command\":$cmd_json,\"timeout_s\":30,\"workspace_key\":$ws_json}}" \
     "localhost:${relay_port}" sandbox.v1.SandboxExec/Exec >/dev/null 2>"$err_log"; then
+    t1="$EPOCHREALTIME"
     status="ok"
     cause="-"
   else
+    t1="$EPOCHREALTIME"
     status="err"
+    # Subprocess forks in this function: grpcurl above (always -- it is the thing being
+    # measured) and these greps (only after an Exec has already failed, so they cannot
+    # contribute to a healthy rung's latency, and a failed Exec's latency is not in the
+    # distribution p95 is taken over anyway). ms below is pure arithmetic expansion, no
+    # command substitution and no extra fork (issue #291 item 1) -- so that count is complete.
     if grep -qi "workspace_key" "$err_log"; then
       cause="empty-workspace-key"
     elif grep -qi "mem" "$err_log"; then
@@ -616,10 +1131,9 @@ grpc_exec_record() {
       cause="unknown"
     fi
   fi
-  t1="$(date +%s%N)"
-  ms=$(((t1 - t0) / 1000000))
+  a="${t0/./}"; b="${t1/./}"
+  ms=$(( (10#$b - 10#$a) / 1000 ))
   echo "$ms $status $cause" >>"$out_file"
-  rm -f "$err_log"
 }
 
 # build_converge_script reproduces harness/src/converge.ts:buildConvergeScript()
@@ -654,6 +1168,37 @@ SCRIPT
 # req_id is a PARAMETER, not the constant 0 it used to be. Every slot's converge used
 # req_id 0 against one shared sandbox_id, so at c>=2 two concurrent converges collided --
 # see run_density_rung's own comment for what that collision does.
+# ---------------------------------------------------------------------------
+# Slot identity (issue #291 item 3). Phase 2 RECOMPUTES a slot's identity rather than
+# inheriting it from phase 1 -- the two phases are different subshells -- so all three
+# derivations live in one place each and cannot drift into two slots sharing a workspace or
+# a req_id space.
+# ---------------------------------------------------------------------------
+slot_run_id() {
+  printf 'e11-%s-d%s-ram%s-c%s-slot%s' "$1" "$2" "$3" "$4" "$5"
+}
+
+# The microvm arm REFUSES an empty workspace_key (proto/sandbox/v1/sandbox.proto's own doc
+# comment on Exec.workspace_key); the container arm may omit it, which means today's single
+# shared workspace. The driver-control arm follows the container path.
+slot_workspace_key() {
+  local arm="$1" run_id="$2"
+  case "$arm" in
+  microvm) printf '%s' "$run_id" ;;
+  *) : ;;
+  esac
+}
+
+# A DISJOINT req_id space per slot, base 1000000 apart. Every slot in a rung talks to ONE
+# shared sandbox_id and the relay demultiplexes responses BY req_id, so uniqueness is the
+# caller's job: two concurrent Execs sharing a req_id collide, and on the validation rig one
+# of the pair got the other's chunks and hung for 33 minutes. Converge uses the base itself
+# and the Exec mix counts up from it, and phase 1 drains fully before phase 2 issues
+# anything, so the collision cannot recur across the barrier either.
+slot_req_base() {
+  echo $(($1 * 1000000))
+}
+
 converge_slot() {
   local relay_port="$1" sandbox_id="$2" workspace_key="$3" run_id="$4" req_id="$5"
   local script t0 t1 rc=0
@@ -678,9 +1223,6 @@ drop_caches() {
   fi
 }
 
-# shuffle_e11_arms prints "container" and "microvm" in randomized order (spec
-# section 7.5: page-cache asymmetry between arms), same technique as
-# e10-lifecycle.sh's shuffle_arms.
 # wait_for_relay_port blocks until something is LISTENING on a loopback port, and dies
 # naming the log if it never happens. Both drivers previously did `sleep 2` and hoped.
 #
@@ -754,8 +1296,13 @@ assert_relay_alive() {
   die "$what is no longer listening on 127.0.0.1:$port - it started and then DIED mid-run; its log is above and in $logfile. Every Exec from here would time out against a dead relay rather than measure anything."
 }
 
+# shuffle_e11_arms prints $E11_ARMS in randomized order (spec section 7.5: page-cache
+# asymmetry between arms), same technique as e10-lifecycle.sh's shuffle_arms. It reads the
+# configured list rather than a hardcoded pair, so adding the driver-control arm did not need
+# a second randomiser that could drift from this one.
 shuffle_e11_arms() {
-  printf 'container\nmicrovm\n' | awk -v seed="$(($$ + $(date +%s)))" 'BEGIN{srand(seed)} {print rand()"\t"$0}' | sort -n | cut -f2-
+  printf '%s\n' "${E11_ARMS[@]}" |
+    awk -v seed="$(($$ + $(date +%s)))" 'BEGIN{srand(seed)} {print rand()"\t"$0}' | sort -n | cut -f2-
 }
 
 # kill_relay_by_port kills whatever is listening on $1, BY PORT rather than by
@@ -909,11 +1456,53 @@ stop_microvm_stack() {
   return 0
 }
 
+# start_null_stack starts ONLY the null-responder (issue #291 section 4). No redis, no relay,
+# no worker, no VMM: the control arm exists to measure what the DRIVER costs, so anything else
+# left in the path would be measured along with it. That is also why this arm reuses neither
+# E11_RELAY_PORT nor start_redis_loopback.
+#
+# One known gap in that isolation (issue #291 item 3): the null-responder answers every Exec
+# with a single End event and no Chunk, so grpcurl on this arm never decodes a chunk-carrying
+# stream. Real Execs for mix commands that produce stdout DO decode one or more Chunk events
+# per call on the container/microvm arms. That decode cost is part of "what the driver costs"
+# too, and this arm doesn't pay it -- so driver-control is a STRICT LOWER BOUND on driver-only
+# cost, and subtracting it over-attributes some residue to the backend rather than the driver,
+# the same direction of error as the artifact this branch exists to fix, at reduced magnitude.
+# Recorded in every rung's proxyLimitations under 'driverControlChunkDecode'. Deliberately NOT
+# fixed by making the responder emit chunks: that would change what this control arm measures
+# mid-branch, and is out of scope here.
+start_null_stack() {
+  [ "$E11_START_STACK" = "1" ] || {
+    log "driver-control stack: SH_E11_START_STACK=0, reusing an already-running null-responder"
+    return 0
+  }
+  E11_NULL_BIN="$RESULTS/.e11-null-responder-bin"
+  log "driver-control: building the null-responder"
+  (cd "$REMOTE_WORKER_DIR" && go build -o "$E11_NULL_BIN" ./cmd/null-responder) ||
+    die "go build ./cmd/null-responder failed - the driver-control arm has nothing to drive, so every Exec would time a missing binary rather than the driver's own overhead"
+
+  log "driver-control: starting the null-responder on 127.0.0.1:$NULL_RESPONDER_PORT"
+  "$E11_NULL_BIN" -listen "127.0.0.1:${NULL_RESPONDER_PORT}" \
+    >"$RESULTS/e11-driver-control-responder.log" 2>&1 &
+  E11_NULL_PID="$!"
+  wait_for_relay_port "$NULL_RESPONDER_PORT" "$RESULTS/e11-driver-control-responder.log" \
+    "the driver-control arm's null-responder"
+}
+
+stop_null_stack() {
+  [ "$E11_START_STACK" = "1" ] || return 0
+  # ${VAR:-} because this runs from the EXIT trap too, which can fire before it is assigned.
+  [ -n "${E11_NULL_PID:-}" ] && kill "${E11_NULL_PID:-}" 2>/dev/null
+  E11_NULL_PID=""
+  return 0
+}
+
 # ---------------------------------------------------------------------------
-# run_density_rung: THE per-rung driver. Called identically for the container arm
-# and the microvm arm (only sandbox_id, relay_port, and whether workspace_key is
-# empty differ at the CALL SITE, in main() below) -- this is what makes "both arms
-# driven by the same code path" true structurally rather than by claim.
+# run_density_rung: THE per-rung driver. Called identically for all three arms --
+# container, microvm, and driver-control (only sandbox_id, relay_port, and whether
+# workspace_key is empty differ at the CALL SITE, in main() below) -- this is what
+# makes "every arm driven by the same code path" true structurally rather than by
+# claim.
 #
 # Writes one RungSample-shaped JSON object (matching
 # experiments/src/microvm-density.ts's RungSample interface field-for-field) to
@@ -924,9 +1513,14 @@ run_density_rung() {
   log "rung: arm=$arm D=$d guest=${ram_mb}MiB c=$c"
 
   # Before issuing a single Exec: is the relay STILL there? See assert_relay_alive for the
-  # run this cost. The log name differs per arm, matching where each arm's relay writes.
+  # run this cost.
+  # The log name differs per arm, matching where each arm's server writes. assert_relay_alive
+  # tails it, so a wrong path here costs the operator the one message that says what died.
   local relay_log="$RESULTS/e11-container-relay.log"
-  [ "$arm" = "microvm" ] && relay_log="$RESULTS/e11-microvm-relay-d${d}-ram${ram_mb}.log"
+  case "$arm" in
+  microvm) relay_log="$RESULTS/e11-microvm-relay-d${d}-ram${ram_mb}.log" ;;
+  driver-control) relay_log="$RESULTS/e11-driver-control-responder.log" ;;
+  esac
   assert_relay_alive "$relay_port" "$relay_log" "the $arm arm's sandbox-relay"
 
   # Every temp path is under $E11_TMPDIR, named for the rung rather than mktemp-random, so
@@ -938,69 +1532,114 @@ run_density_rung() {
   converge_file="$E11_TMPDIR/converge-$rung_tag"
   : >"$converge_file"
 
-  local wall_t0 wall_t1 pids=()
-  wall_t0="$(date +%s%N)"
-  local i
+  # ---------------------------------------------------------------------------
+  # PHASE 1: converge, OUTSIDE the timed window (issue #291 item 3).
+  #
+  # Every slot converges and exits; all are waited on. A non-zero exit still refuses the
+  # rung, preserving the guarantee that a rung whose slots were not all measuring the same
+  # thing is never recorded. Nothing here is inside wall_t0..wall_t1, so a slow git fetch can
+  # no longer sit in the throughput denominator -- which is what made converge a throughput
+  # ceiling on BOTH arms by construction.
+  # ---------------------------------------------------------------------------
+  local i pids=() pid
   for i in $(seq 1 "$c"); do
     (
-      local wskey="" run_id="e11-${arm}-d${d}-ram${ram_mb}-c${c}-slot${i}"
-      if [ "$arm" = "microvm" ]; then
-        wskey="$run_id" # microvm arm REFUSES an empty workspace_key (proto doc comment)
-      fi               # container arm may omit/empty it (today's single shared workspace)
-
-      # A DISJOINT req_id space per slot. Every slot in this rung talks to ONE shared
-      # sandbox_id, and the relay demultiplexes responses BY req_id (spec 3.1: req_id is
-      # "only probabilistically unique across replicas", so uniqueness is the caller's
-      # job). Two concurrent Execs sharing a req_id therefore collide: on the validation
-      # rig one of the pair got the other's chunks -- with no reqId field on them -- and
-      # the loser's stream was never terminated, hanging for 33 minutes until killed. That
-      # is why the ladder could only ever complete its c=1 rung.
-      #
-      # Isolated with a three-arm probe before this fix was written: one Exec alone
-      # succeeded (30ms); two concurrent with the SAME req_id wedged one of them; two
-      # concurrent with DIFFERENT req_ids both succeeded (27ms, 28ms). So the collision is
-      # the cause, and disjoint spaces are the fix.
-      #
-      # Base 1000000 per slot, converge at the base and the Exec mix above it: disjoint for
-      # any ITERS_PER_SLOT below a million, which it always is.
-      local req_base=$((i * 1000000))
-      local cms cms_rc=0
-      cms="$(converge_slot "$relay_port" "$sandbox_id" "$wskey" "$run_id" "$req_base")" || cms_rc=$?
+      local run_id wskey cms cms_rc=0
+      run_id="$(slot_run_id "$arm" "$d" "$ram_mb" "$c" "$i")"
+      wskey="$(slot_workspace_key "$arm" "$run_id")"
+      cms="$(converge_slot "$relay_port" "$sandbox_id" "$wskey" "$run_id" "$(slot_req_base "$i")")" || cms_rc=$?
       echo "$cms" >>"$converge_file"
       if [ "$cms_rc" -ne 0 ]; then
         echo "e11: slot $i: converge FAILED after ${cms}ms (see $RESULTS/e11-converge.log) - its workspace was never prepared, so its Exec timings would measure something else" >&2
         exit 1
       fi
+    ) &
+    pids+=("$!")
+  done
+  local converge_failures=0
+  for pid in "${pids[@]}"; do
+    wait "$pid" || converge_failures=$((converge_failures + 1))
+  done
+  [ "$converge_failures" -eq 0 ] ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c had $converge_failures of $c slot(s) fail before their timed loop (the reason is above, and in $RESULTS/e11-converge.log) - refusing to record a rung whose slots were not all measuring the same thing"
 
-      local times_file="$slot_dir/slot-$i.times" req="$req_base"
-      # Create it empty first. The loop guard below reads it with `wc -l <"$times_file"`,
-      # and `2>/dev/null` there binds to wc -- NOT to the shell's own redirection, so a
-      # missing file printed "No such file or directory" to stderr on every slot's first
-      # iteration. The fallback made it harmless, but an operator reading the log saw what
-      # looked like a failure in the middle of a working rung.
+  # ---------------------------------------------------------------------------
+  # Payload construction, still BEFORE timing starts (issue #291 item 2). This block MOVES
+  # here from just above wall_t0, where Task 1 put it -- spec section 1: "pre-escape the 7 mix
+  # commands and the slot's workspace_key once per slot, before timing starts". The
+  # derivations now go through the same helpers phase 1 uses, so the two cannot drift.
+  # ---------------------------------------------------------------------------
+  local -a mix_json=() ws_json_by_slot=()
+  local mix_expected_count
+  mapfile -t mix_json < <(escaped_mix)
+  [ "${#mix_json[@]}" -gt 0 ] ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c: escaped_mix produced no commands, so every slot would loop forever issuing no Execs"
+  mix_expected_count="$(e11_tool_call_mix | wc -l)"
+  [ "${#mix_json[@]}" -eq "$mix_expected_count" ] ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c: escaped_mix produced ${#mix_json[@]} command(s) but e11_tool_call_mix has $mix_expected_count -- a partial escape would silently shrink the mix every slot loops over"
+  local run_id_i
+  for i in $(seq 1 "$c"); do
+    run_id_i="$(slot_run_id "$arm" "$d" "$ram_mb" "$c" "$i")"
+    ws_json_by_slot[i]="$(json_escape "$(slot_workspace_key "$arm" "$run_id_i")")"
+  done
+
+  # ---------------------------------------------------------------------------
+  # PHASE 2: the timed Exec loop, and nothing else.
+  # ---------------------------------------------------------------------------
+  local sampler_file="$E11_TMPDIR/sampler-$rung_tag" sampler_stop="$E11_TMPDIR/sampler-stop-$rung_tag"
+  : >"$sampler_file"
+  rm -f "$sampler_stop"
+  local wall_t0 wall_t1
+  wall_t0="$(date +%s%N)"
+  # The sampler brackets EXACTLY this window (issue #291 item 1). It is started after
+  # wall_t0 and reaped after wall_t1, and the converge barrier above is what makes that
+  # honest: with converge still inside the window, the git fetch's CPU would land in this
+  # mean and a fresh artifact would have been built. sampler_file/sampler_stop are set up
+  # (and any stale sampler_stop removed) BEFORE wall_t0 is stamped, so that bookkeeping
+  # never lands inside the timed window either.
+  host_sampler_loop "$sampler_file" "$sampler_stop" &
+  E11_SAMPLER_PID="$!"
+  pids=()
+  for ((i = 1; i <= c; i++)); do
+    (
+      # No run_id or workspace_key derivation in here: phase 2 needs only the pre-escaped key
+      # and the req_id base, so nothing that forks happens inside the timed window.
+      local req_base req
+      req_base="$(slot_req_base "$i")"
+      req="$req_base"
+
+      local times_file="$slot_dir/slot-$i.times" err_log="$slot_dir/slot-$i.err"
+      # Pre-escaped above, before wall_t0. Parameter expansion, not a command substitution:
+      # `local x="$(...)"` would trip SC2155, which is a WARNING and so a lint failure here.
+      local ws_json="${ws_json_by_slot[$i]}"
       : >"$times_file"
-      local want=$((ITERS_PER_SLOT + WARMUP_PER_SLOT))
-      while [ "$(wc -l <"$times_file" 2>/dev/null || echo 0)" -lt "$want" ]; do
-        while IFS= read -r cmd; do
+      : >"$err_log"
+      # A shell counter, not `wc -l` twice per Exec: the timed loop is this file's only
+      # writer, so the count is known without reading it back. `for mi in` over the array
+      # pre-escaped above also removes the process-substitution subshell the inner
+      # `while read` re-spawned on every pass over the mix.
+      local want=$((ITERS_PER_SLOT + WARMUP_PER_SLOT)) issued=0 mi
+      while [ "$issued" -lt "$want" ]; do
+        for mi in "${!mix_json[@]}"; do
           req=$((req + 1))
-          grpc_exec_record "$relay_port" "$sandbox_id" "$wskey" "$cmd" "$req" "$times_file"
-          [ "$(wc -l <"$times_file" 2>/dev/null || echo 0)" -ge "$want" ] && break
-        done < <(e11_tool_call_mix)
+          grpc_exec_record "$relay_port" "$sandbox_id" "$ws_json" "${mix_json[$mi]}" "$req" "$times_file" "$err_log"
+          issued=$((issued + 1))
+          [ "$issued" -ge "$want" ] && break
+        done
       done
     ) &
     pids+=("$!")
   done
-  # Each slot's exit status is CHECKED, not discarded: a slot exits non-zero only when its
-  # converge failed, which means its Exec timings measured a workspace that was never
-  # prepared. Recording that rung would put a fast-looking p95 and a small convergeMsP50
-  # into the ladder.
-  local pid slot_failures=0
+  local exec_failures=0
   for pid in "${pids[@]}"; do
-    wait "$pid" || slot_failures=$((slot_failures + 1))
+    wait "$pid" || exec_failures=$((exec_failures + 1))
   done
-  [ "$slot_failures" -eq 0 ] ||
-    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c had $slot_failures of $c slot(s) fail before their timed loop (the reason is above, and in $RESULTS/e11-converge.log) - refusing to record a rung whose slots were not all measuring the same thing"
   wall_t1="$(date +%s%N)"
+  : >"$sampler_stop"
+  wait "$E11_SAMPLER_PID" 2>/dev/null || true
+  E11_SAMPLER_PID=""
+  [ "$exec_failures" -eq 0 ] ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c had $exec_failures of $c slot(s) fail inside the timed loop - refusing to record a rung whose slots were not all measuring the same thing"
   local wall_s
   wall_s="$(require_numeric wallSeconds "$(awk -v ns=$((wall_t1 - wall_t0)) 'BEGIN{printf "%.4f", ns/1000000000.0}')")" ||
     die "rung arm=$arm c=$c could not measure its own wall time (see the refusal above) - throughput is derived from it, so there is nothing to record"
@@ -1073,28 +1712,86 @@ run_density_rung() {
   converge_p50="$(require_numeric convergeMsP50 "$converge_p50")" ||
     die "rung arm=$arm c=$c: convergeMsP50 failed validation (see the refusal above)"
 
-  local signals pss_bytes mem_bytes cpu_frac proc_count
-  # `|| die`, in run_density_rung's OWN shell (main calls it directly, not in a
-  # subshell), so a bad snapshot stops the sweep here instead of producing a rung with no
-  # record. Section 7.3's whole point is that a wrong density number is worse than none;
-  # a sweep that completes having recorded nothing is worse still, because it looks
-  # exactly like success (final review H2).
+  # ---------------------------------------------------------------------------
+  # The four host signals, now sampled DURING the window (issue #291 item 1).
   #
-  # require_vmm=1 only for the microvm arm's IN-RUNG snapshot, taken immediately after the
-  # slots finish: with D >= 1 at least one standby VMM is necessarily still resident there
-  # (StandbyIdle is 90s), so zero matching processes means the sampler is looking in the
-  # wrong place, not that memory is free. The two exceptions are deliberate: the container
-  # arm has no VMM at all, and a D=0 sweep legitimately keeps no standby resident.
+  # hostCpuFraction becomes the MEAN. That is not "mean is more representative": with today's
+  # idle samples both firstCrossing('cpu') and firstCrossing('memory') are Infinity and
+  # scorePrediction1 reads inconclusive, but if CPU crosses 0.9 anywhere while memory and
+  # process-count never do, `memOrProcAt <= cpuAt` is false and sealed prediction 1 flips
+  # straight to FALSIFIED. Scoring that off a single one-second peak -- a GC pause, a
+  # drop_caches, an unrelated process on a shared box -- would be the same class of error as
+  # the artifact being fixed, pointed the other way. The mean matches what crosses('cpu')
+  # asserts: THIS RUNG WAS CPU-SATURATED, not "this rung once touched saturation". Nothing is
+  # lost, because the peak is recorded beside it.
+  # ---------------------------------------------------------------------------
+  local cpu_samples cpu_mean cpu_peak cpu_min cores_busy ncpu
+  local mem_mean mem_min pss_mean pss_peak pss_samples proc_mean proc_peak proc_samples
+  local pss_refused_ticks
+  cpu_samples="$(require_numeric hostCpuSamples "$(sampler_field "$sampler_file" 1 count)")" ||
+    die "rung arm=$arm c=$c could not count its own host samples (see the refusal above)"
+  [ "$cpu_samples" -gt 0 ] ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c produced ZERO host samples over its timed window ($sampler_file is empty), so it has no under-load hostCpuFraction, memAvailableBytes, pssBytes or processCount at all. Refusing to backfill from the post-load snapshot: that idle reading IS the defect issue #291 item 1 is about, and crosses('cpu') can never fire on one. The window was shorter than ${SAMPLE_MIN_TICK_MS}ms - raise SH_E11_ITERS_PER_SLOT, or lower SH_E11_SAMPLE_INTERVAL_MS and SH_E11_SAMPLE_MIN_TICK_MS."
+  # A thin rung is legitimate (a fast arm at low c) and is NOT refused -- but it must not pass
+  # unremarked, because hostCpuSamples is easy to miss in a 30-field record and a 1-2 sample mean
+  # cannot support a saturation verdict. Warn at run time, where the operator is actually looking.
+  if [ "$cpu_samples" -lt 5 ]; then
+    log "WARNING: rung arm=$arm c=$c produced only $cpu_samples host sample(s) over its timed window - its hostCpuFraction is a mean of $cpu_samples tick(s) and must NOT be used to score a CPU saturation verdict. Raise SH_E11_ITERS_PER_SLOT (currently $ITERS_PER_SLOT) or lower SH_E11_SAMPLE_INTERVAL_MS (currently ${SAMPLE_INTERVAL_MS}ms) so the window spans >=10 ticks."
+  fi
+  cpu_mean="$(require_numeric hostCpuFraction "$(sampler_field "$sampler_file" 1 mean '%.4f')")" ||
+    die "rung arm=$arm c=$c: the sampled hostCpuFraction mean failed validation (see above)"
+  cpu_peak="$(require_numeric hostCpuFractionPeak "$(sampler_field "$sampler_file" 1 peak '%.4f')")" ||
+    die "rung arm=$arm c=$c: hostCpuFractionPeak failed validation (see above)"
+  cpu_min="$(require_numeric hostCpuFractionMin "$(sampler_field "$sampler_file" 1 min '%.4f')")" ||
+    die "rung arm=$arm c=$c: hostCpuFractionMin failed validation (see above)"
+  ncpu="$(host_cpu_count)"
+  # coresBusy, because "0.043 cores busy" is a number a human can act on where 0.0006 is not
+  # -- and 0.0006 on a 72-cpu host next to ~370 process creations a second is precisely the
+  # self-falsifying pair that exposed this bug.
+  cores_busy="$(require_numeric coresBusy "$(awk -v m="$cpu_mean" -v n="$ncpu" 'BEGIN{printf "%.4f", m*n}')")" ||
+    die "rung arm=$arm c=$c: coresBusy failed validation (see above)"
+  mem_mean="$(require_numeric memAvailableBytes "$(sampler_field "$sampler_file" 2 mean '%.0f')")" ||
+    die "rung arm=$arm c=$c: the sampled memAvailableBytes mean failed validation (see above)"
+  mem_min="$(require_numeric memAvailableBytesMin "$(sampler_field "$sampler_file" 2 min '%.0f')")" ||
+    die "rung arm=$arm c=$c: memAvailableBytesMin failed validation (see above)"
+  pss_samples="$(require_numeric pssSamples "$(sampler_field "$sampler_file" 3 count)")" ||
+    die "rung arm=$arm c=$c: pssSamples failed validation (see above)"
+  # pssRefusedTicks (issue #291 item 4): a low-cadence tick where pss_bytes_for_pids DIED on
+  # an unreadable smaps_rollup for a still-live pid (spec section 7.3's boxed warning) records
+  # "refused" in this column, not "-". Without this counter that refusal was indistinguishable
+  # from an ordinary un-sampled tick -- it just vanished from pssSamples along with the record
+  # of WHY. sampler_marker_count reads the sampler file directly, so a rung whose window ends
+  # with the sampler already reaped still gets an accurate count.
+  pss_refused_ticks="$(require_numeric pssRefusedTicks "$(sampler_marker_count "$sampler_file" 3 refused)")" ||
+    die "rung arm=$arm c=$c: pssRefusedTicks failed validation (see above)"
+  pss_mean="$(require_numeric pssBytes "$(sampler_field "$sampler_file" 3 mean '%.0f')")" ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c sampled $cpu_samples host ticks but not one carried a PSS reading, so Sigma PSS -- the one number spec section 7.3 insists must not be wrong -- has no under-load value for this rung. SH_E11_SAMPLE_LOW_EVERY is ${SAMPLE_LOW_EVERY}; tick 1 always carries it, so an empty column means pss_bytes_for_pids refused on every low-cadence tick ($pss_refused_ticks recorded as 'refused' -- see its own refusals above) or none ever ran."
+  pss_peak="$(require_numeric pssBytesPeak "$(sampler_field "$sampler_file" 3 peak '%.0f')")" ||
+    die "rung arm=$arm c=$c: pssBytesPeak failed validation (see above)"
+  proc_samples="$(require_numeric processCountSamples "$(sampler_field "$sampler_file" 4 count)")" ||
+    die "rung arm=$arm c=$c: processCountSamples failed validation (see above)"
+  proc_mean="$(require_numeric processCount "$(sampler_field "$sampler_file" 4 mean '%.0f')")" ||
+    die "rung arm=$arm c=$c: the sampled processCount mean failed validation (see above)"
+  proc_peak="$(require_numeric processCountPeak "$(sampler_field "$sampler_file" 4 peak '%.0f')")" ||
+    die "rung arm=$arm c=$c: processCountPeak failed validation (see above)"
+
+  # The POST-LOAD snapshot is KEPT, under explicitly different names. Its refusals are still
+  # the ones that matter most: require_vmm=1 on the microvm arm with D >= 1 means at least one
+  # standby VMM is necessarily still resident (StandbyIdle is 90s), so zero matching processes
+  # means the sampler is looking in the wrong place, not that memory is free. Keeping it under
+  # postLoad* names is what makes it impossible for an idle reading to pass as an under-load
+  # one ever again.
   local require_vmm=0
   if [ "$arm" = "microvm" ] && [ "$d" != "0" ]; then
     require_vmm=1
   fi
+  local signals post_pss post_mem post_cpu post_proc
   signals="$(host_signals_snapshot "$require_vmm")" ||
-    die "host signal snapshot failed for rung arm=$arm c=$c (see the refusal above) - refusing to write a rung record from signals that could not be sampled"
-  pss_bytes="$(python3 -c "import json,sys; print(json.load(sys.stdin)['pssBytes'])" <<<"$signals")"
-  mem_bytes="$(python3 -c "import json,sys; print(json.load(sys.stdin)['memAvailableBytes'])" <<<"$signals")"
-  cpu_frac="$(python3 -c "import json,sys; print(json.load(sys.stdin)['hostCpuFraction'])" <<<"$signals")"
-  proc_count="$(python3 -c "import json,sys; print(json.load(sys.stdin)['processCount'])" <<<"$signals")"
+    die "post-load host signal snapshot failed for rung arm=$arm c=$c (see the refusal above) - refusing to write a rung record from signals that could not be sampled"
+  post_pss="$(python3 -c "import json,sys; print(json.load(sys.stdin)['pssBytes'])" <<<"$signals")"
+  post_mem="$(python3 -c "import json,sys; print(json.load(sys.stdin)['memAvailableBytes'])" <<<"$signals")"
+  post_cpu="$(python3 -c "import json,sys; print(json.load(sys.stdin)['hostCpuFraction'])" <<<"$signals")"
+  post_proc="$(python3 -c "import json,sys; print(json.load(sys.stdin)['processCount'])" <<<"$signals")"
 
   # standbysResident: disclosed proxy (see header). idleStandbyResidency + reclaim
   # convergence: poll the same process-count proxy after every slot has finished,
@@ -1102,9 +1799,9 @@ run_density_rung() {
   # sampling at ReclaimScanInterval. Skipped for the container arm, which has no
   # standby concept at all -- recorded as 0 rather than waited-for.
   local standbys_resident=0 idle_residency=0 reclaim_converge_s=0
-  standbys_resident=$((proc_count > c ? proc_count - c : 0))
+  standbys_resident=$((proc_mean > c ? proc_mean - c : 0))
   if [ "$arm" = "microvm" ]; then
-    local waited=0 budget=135 interval=23 last_count="$proc_count" idle_snapshot
+    local waited=0 budget=135 interval=23 last_count="$post_proc" idle_snapshot
     while [ "$waited" -lt "$budget" ]; do
       sleep "$interval"
       waited=$((waited + interval))
@@ -1155,10 +1852,37 @@ rec = {
   'p95Ms': $p95,
   'coldAcquireRate': $cold_rate,
   'coldLatencyThresholdMs': $COLD_LATENCY_MS,
-  'pssBytes': $pss_bytes,
-  'memAvailableBytes': $mem_bytes,
-  'hostCpuFraction': $cpu_frac,
-  'processCount': $proc_count,
+  # The four RungSample host signals, now sampled DURING the timed window (#291 item 1).
+  # Same names, same place in the contract, under-load values.
+  'hostCpuFraction': $cpu_mean,
+  'memAvailableBytes': $mem_mean,
+  'pssBytes': $pss_mean,
+  'processCount': $proc_mean,
+  # Extremes and sample counts, so a mean can always be checked against what it averaged.
+  # hostCpuSamples exposes thin rungs: a mean of 2 samples deserves a visible caveat.
+  'hostCpuFractionPeak': $cpu_peak,
+  'hostCpuFractionMin': $cpu_min,
+  'hostCpuSamples': $cpu_samples,
+  'coresBusy': $cores_busy,
+  'memAvailableBytesMin': $mem_min,
+  'pssBytesPeak': $pss_peak,
+  'pssSamples': $pss_samples,
+  # A low-cadence tick that DID try to sample PSS but pss_bytes_for_pids died on an
+  # unreadable smaps_rollup for a still-live pid (spec section 7.3's boxed warning). Counted
+  # separately from pssSamples so a refusal is visible rather than indistinguishable from an
+  # ordinary un-sampled tick (issue #291 item 4).
+  'pssRefusedTicks': $pss_refused_ticks,
+  'processCountPeak': $proc_peak,
+  'processCountSamples': $proc_samples,
+  # Old and new records both carry hostCpuFraction meaning different things; without this
+  # marker someone compares them later and is misled by the fix itself.
+  'samplingMode': 'in-rung-1hz-mean',
+  # The retained post-load snapshot, explicitly named so an idle reading can never again
+  # pass as an under-load one.
+  'postLoadHostCpuFraction': $post_cpu,
+  'postLoadMemAvailableBytes': $post_mem,
+  'postLoadPssBytes': $post_pss,
+  'postLoadProcessCount': $post_proc,
   'standbysResident': $standbys_resident,
   'idleStandbyResidency': $idle_residency,
   'leaseSaturations': 0,
@@ -1168,6 +1892,7 @@ rec = {
   'arm': '$arm',
   'standbyDepth': $d_json,
   'guestRamMb': $ram_json,
+  'runId': '$E11_RUN_ID',
   'substrate': '$SUBSTRATE',
   'repoCacheShape': '$REPO_CACHE_SHAPE',
   'convergeMsP50': $converge_p50,
@@ -1178,6 +1903,8 @@ rec = {
     'leaseSaturations': 'always 0 - driver bypasses the harness lease layer entirely',
     'coldAcquireRate': 'latency-classification proxy (>= ${COLD_LATENCY_MS}ms), not the real replenishment signal - no stats endpoint exists',
     'standbysResident': 'proxy: max(processCount - c, 0) - no pool introspection endpoint exists',
+    'pssBytesCadence': 'pssBytes and processCount are sampled every ${SAMPLE_LOW_EVERY}th sampler tick (and always tick 1), not every tick: pgrep plus an N-file smaps_rollup walk at 1 Hz perturbs the density ceiling being measured. crosses(memory) reads memAvailableBytes, which IS every tick, so the bound classification is unaffected; PSS feeds the narrative. See pssSamples and processCountSamples for the actual counts (#291).',
+    'driverControlChunkDecode': 'driver-control is a STRICT LOWER BOUND on driver-only cost, not an exact one: the null-responder sends one End and no Chunk events, so grpcurl never decodes a chunk-carrying stream on this arm, while real Execs for mix commands that produce stdout do decode one or more Chunk events per call on the container/microvm arms. Subtracting driver-control latency therefore over-attributes some residue to the backend rather than the driver (#291 item 3).',
   },
 }
 open('$out_json_path', 'w').write(json.dumps(rec, indent=2))
@@ -1198,20 +1925,39 @@ open('$out_json_path', 'w').write(json.dumps(rec, indent=2))
   # which one.
   [ -s "$out_json_path" ] ||
     die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c wrote no record to $out_json_path - the record writer failed (its Python traceback is above). A sweep that completes having recorded nothing is the worst outcome for a benchmark, because it looks like success."
-  rm -rf "$slot_dir" "$all_times" "${all_times}.ok" "$converge_file"
+  rm -rf "$slot_dir" "$all_times" "${all_times}.ok" "$converge_file" "$sampler_file" "$sampler_stop"
 }
 
 # assemble_ladder collects every per-rung JSON file for one (arm, D, guest RAM)
 # slice into a single JSON array, ascending by c, ready for analyzeLadder.
 assemble_ladder() {
-  local pattern="$1" out_path="$2"
+  local pattern="$1" out_path="$2" rc=0
+  # Only THIS invocation's rungs. A record with no runId predates the stamp and is treated as
+  # stale, which is the safe direction: it cannot be shown to belong to this run.
   python3 -c "
-import glob, json
-files = sorted(glob.glob('$pattern'))
-recs = [json.load(open(f)) for f in files]
+import glob, json, sys
+run_id = '$E11_RUN_ID'
+kept, skipped = [], []
+for f in sorted(glob.glob('$pattern')):
+    r = json.load(open(f))
+    (kept if r.get('runId') == run_id else skipped).append((f, r))
+if skipped:
+    sys.stderr.write('e11: assemble_ladder SKIPPED %d stale rung record(s) not from this run (%s): %s\n'
+                     % (len(skipped), run_id, ', '.join(f.split('/')[-1] for f, _ in skipped)))
+if not kept:
+    sys.stderr.write('e11: assemble_ladder found no rung records from this run matching $pattern - '
+                     'refusing to write an empty or all-stale ladder to $out_path\n')
+    sys.exit(1)
+recs = [r for _, r in kept]
 recs.sort(key=lambda r: r['c'])
 open('$out_path', 'w').write(json.dumps(recs, indent=2))
 "
+  # The closing quote above MUST stay on its own line: extract_fn skips the span between
+  # `  python3 -c "` and a bare `"` (Task 3 taught it to, because this file's record writer has a
+  # column-0 `}` inside its python dict). Appending `|| die ...` to that line leaves the skip open,
+  # so extraction swallows the rest of the function and the tests source a snippet without it.
+  rc=$?
+  [ "$rc" -eq 0 ] || die "assemble_ladder could not build $out_path from this run's rungs (see the refusal above) - a ladder mixing runs is worse than no ladder, because detectKnee re-scales every health decision off its c=1 baseline"
 }
 
 # analyze_slice invokes experiments/src/microvm-density.ts's analyzeLadder against
@@ -1249,7 +1995,7 @@ analyze_slice() {
 # ---------------------------------------------------------------------------
 main() {
   preflight
-  log "arms: container, microvm (Firecracker only - hardware-corrections F5)"
+  log "arms: ${E11_ARMS[*]} (microvm is Firecracker only - hardware-corrections F5; driver-control is the null-responder, issue #291 section 4)"
   log "D values: ${D_VALUES[*]}   guest RAM (MiB): ${RAM_MB_VALUES[*]}   active runs: ${ACTIVE_RUNS[*]}"
   [ -n "$MODEL_STUB_CMD" ] || log "no SH_E11_MODEL_STUB_CMD set - driving the Exec mix directly (disclosed limitation, see header)"
 
@@ -1267,7 +2013,8 @@ main() {
     fi
     first=0
 
-    if [ "$arm" = "container" ]; then
+    case "$arm" in
+    container)
       start_container_stack
       for c in "${ACTIVE_RUNS[@]}"; do
         run_density_rung container - - "$c" "e11-container" "$E11_RELAY_PORT" \
@@ -1276,7 +2023,23 @@ main() {
       stop_container_stack
       assemble_ladder "$RESULTS/e11-rung-container-c*.json" "$RESULTS/e11-ladder-container.json"
       analyze_slice "$RESULTS/e11-ladder-container.json" || log "analyze_slice(container) failed - see output above"
-    else
+      ;;
+    driver-control)
+      start_null_stack
+      for c in "${ACTIVE_RUNS[@]}"; do
+        run_density_rung driver-control - - "$c" "e11-driver-control" "$NULL_RESPONDER_PORT" \
+          "$RESULTS/e11-rung-driver-control-c${c}.json"
+      done
+      stop_null_stack
+      assemble_ladder "$RESULTS/e11-rung-driver-control-c*.json" "$RESULTS/e11-ladder-driver-control.json"
+      # analyze_slice is SKIPPED here: analyzeLadder scores a ladder of COLD ACQUIRES against
+      # sealed predictions about a VM pool, and this arm has no pool and no acquires, so its
+      # verdicts would be noise attached to real prediction ids. The ladder file is still
+      # assembled, because subtracting this arm from the other two at each c is the entire
+      # purpose of the arm.
+      log "driver-control: ladder assembled at $RESULTS/e11-ladder-driver-control.json (analyze_slice skipped - no pool and no cold acquires; subtract this arm from the others at each c to get the driver's own share)"
+      ;;
+    microvm)
       local d ram_mb
       for d in "${D_VALUES[@]}"; do
         for ram_mb in "${RAM_MB_VALUES[@]}"; do
@@ -1292,7 +2055,8 @@ main() {
             log "analyze_slice(microvm d=$d ram=$ram_mb) failed - see output above"
         done
       done
-    fi
+      ;;
+    esac
   done <<<"$order"
 
   log "done. Per-slice ladders and analyses are in $RESULTS/e11-ladder-*.json"

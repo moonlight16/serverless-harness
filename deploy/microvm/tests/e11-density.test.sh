@@ -38,12 +38,20 @@ check() { if [ "$2" = "$3" ]; then echo "  ok: $1"; else
 fi; }
 
 # extract_fn prints the source text of a top-level "name() { ... }" function
-# (opening line "name() {" and closing bare "}") from $SCRIPT.
+# (opening line "name() {" and closing bare "}") from $SCRIPT. A function's own embedded
+# `python3 -c "..."` heredoc (see extract_record_writer below) can contain a dict literal
+# whose closing brace sits at column 0, colliding with the bash-function-close convention
+# this scans for -- so that whole span is skipped while looking for the real close.
 extract_fn() {
   local name="$1" start end
   start=$(grep -n "^${name}() {" "$SCRIPT" | head -n1 | cut -d: -f1)
   [ -n "$start" ] || return 1
-  end=$(awk -v s="$start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  end=$(awk -v s="$start" '
+    NR<=s { next }
+    !inpy && $0 == "  python3 -c \"" { inpy = 1; next }
+    inpy && $0 == "\"" { inpy = 0; next }
+    !inpy && /^}$/ { print NR; exit }
+  ' "$SCRIPT")
   [ -n "$end" ] || return 1
   sed -n "${start},${end}p" "$SCRIPT"
 }
@@ -287,7 +295,7 @@ fi
 # ---------------------------------------------------------------------------
 echo "== host signal assembly against a Linux-shaped /proc (final review H2)"
 
-signals_body="$(extract_fns die require_numeric mem_available_bytes discover_pids pss_bytes_for_pids host_cpu_fraction host_signals_snapshot || true)"
+signals_body="$(extract_fns die require_numeric proc_meminfo_available mem_available_bytes discover_pids pss_bytes_for_pids host_cpu_fraction host_signals_snapshot || true)"
 check "die/require_numeric/mem_available_bytes/host_signals_snapshot all extractable" \
   "$([ -n "$signals_body" ] && echo yes || echo no)" "yes"
 
@@ -328,6 +336,62 @@ if [ -n "$signals_body" ]; then
   check "mem_available_bytes emits exactly ONE line on a Linux-shaped meminfo" \
     "$(printf '%s\n' "$mem_out" | wc -l | tr -d ' ')" "1"
   check "mem_available_bytes converts kB to bytes correctly" "$mem_out" "8388608000"
+
+  # --- REGRESSION, found by the first-ever execution on a Linux host with real memory.
+  # The old awk form was `print $2*1024`, and awk's OFMT defaults to "%.6g", so any product
+  # needing more than 6 significant digits printed in SCIENTIFIC NOTATION. require_numeric
+  # refuses that, so host_signals_snapshot failed and EVERY RUNG WAS REFUSED. This fixture's
+  # 8192000 kB is small enough to print as an integer, which is exactly why the suite stayed
+  # green while the driver could not record a single rung on any host with >~16 GiB available.
+  printf 'MemAvailable:    790000000 kB\n' >"$sig_proc/meminfo-huge"
+  # NON-VACUOUSNESS, and it is PLATFORM-DEPENDENT -- which is the other half of why this
+  # defect survived every review. awk's OFMT default of "%.6g" is what produces the scientific
+  # form, but implementations differ on whether an integral double is subject to it: Debian's
+  # mawk prints 8.0896e+11, while macOS's awk and gawk print 808960000000. CI runs ubuntu, so
+  # the proof below does fire there; on a dev macOS it cannot, and a check that FAILED there
+  # would be a false alarm about correct code. So the pathology is proven where it exists and
+  # explicitly skipped where it does not -- the FIX's own behaviour is asserted either way.
+  huge_awk="$(awk '/^MemAvailable:/{print $2*1024; exit}' "$sig_proc/meminfo-huge")"
+  case "$huge_awk" in
+  *e+* | *E+*)
+    check "non-vacuousness: this awk DOES emit scientific notation on a 754GiB-class host" \
+      "yes" "yes"
+    huge_rc=0
+    (
+      # shellcheck disable=SC1090
+      . "$sig_snippet"
+      require_numeric memAvailableBytes "$huge_awk"
+    ) >/dev/null 2>&1 || huge_rc=$?
+    check "  ...and require_numeric refuses it (this is what refused every rung on metal)" \
+      "$([ "$huge_rc" -ne 0 ] && echo yes || echo no)" "yes"
+    ;;
+  *)
+    echo "  (skip: this awk prints '$huge_awk' rather than scientific notation, so the pre-fix"
+    echo "   pathology is not reproducible on this platform -- it IS on Debian/mawk, which is"
+    echo "   where the first real execution hit it. The fix is still asserted below.)"
+    ;;
+  esac
+  # THE FIX: a bare 64-bit integer, whatever awk the host ships.
+  huge_out=$(
+    PROC_ROOT="$sig_proc"
+    export PROC_ROOT
+    # shellcheck disable=SC1090
+    . "$sig_snippet"
+    cp "$sig_proc/meminfo-huge" "$sig_proc/meminfo"
+    mem_available_bytes
+  )
+  check "mem_available_bytes emits a bare integer on a 754GiB-class host" "$huge_out" "808960000000"
+  check "  ...on exactly one line" "$(printf '%s\n' "$huge_out" | wc -l | tr -d ' ')" "1"
+  huge_ok_rc=0
+  (
+    # shellcheck disable=SC1090
+    . "$sig_snippet"
+    require_numeric memAvailableBytes "808960000000"
+  ) >/dev/null 2>&1 || huge_ok_rc=$?
+  check "  ...which require_numeric accepts, so the rung can be recorded" "$huge_ok_rc" "0"
+  printf 'MemTotal:       16384000 kB\nMemFree:            1000 kB\nMemAvailable:    8192000 kB\n' >"$sig_proc/meminfo"
+  check "mem_available_bytes no longer forks an awk (it uses the sampler's builtin reader)" \
+    "$(printf '%s\n' "$(extract_fn mem_available_bytes)" | grep -cE '\bawk\b')" "0"
 
   # A meminfo with no MemAvailable line at all: the END fallback, still one line.
   printf 'MemTotal:       16384000 kB\n' >"$sig_proc/meminfo-noavail"
@@ -493,10 +557,18 @@ if [ -n "$writer_body" ] && [ -n "$dim_body" ]; then
       out_json_path="$2"
       arm=container d=- ram_mb=-
       c=1 throughput=0.5000 p95=12 cold_rate=0.0000
-      pss_bytes=0 mem_bytes=8388608000 cpu_frac=0.1000 proc_count=0
+      # The in-rung sampled signals (#291 item 1). cpu_mean is what crosses('cpu') reads.
+      cpu_mean=0.4100 cpu_peak=0.9700 cpu_min=0.0500 cpu_samples=12 cores_busy=29.5200
+      mem_mean=8388608000 mem_min=8000000000
+      pss_mean=524288 pss_peak=1048576 pss_samples=3 pss_refused_ticks=0
+      proc_mean=0 proc_peak=2 proc_samples=3
+      # The retained post-load snapshot, under its own names.
+      post_cpu=0.0006 post_mem=8388608000 post_pss=0 post_proc=0
+      SAMPLE_LOW_EVERY=5
       standbys_resident=0 idle_residency=0 reclaim_converge_s=0 converge_p50=7
       errors_json='{}'
       SUBSTRATE=nested-m8i REPO_CACHE_SHAPE=accept-cold-fetch COLD_LATENCY_MS=50
+      E11_RUN_ID=RUN-FIXTURE
       eval "$writer_body"
     )
   }
@@ -531,6 +603,31 @@ if [ -n "$writer_body" ] && [ -n "$dim_body" ]; then
   parsed="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["standbyDepth"], d["guestRamMb"], d["c"], d["p95Ms"])' "$ok_out" 2>&1)" || parsed_rc=$?
   check "  ...and json.load parses it (the real consumer of every rung record)" "$parsed_rc" "0"
   check "  ...with the not-applicable dimensions as JSON null, not 0" "$parsed" "None None 1 12"
+
+  new_fields_rc=0
+  new_fields="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+want = ["hostCpuFraction","hostCpuFractionPeak","hostCpuFractionMin","hostCpuSamples",
+        "coresBusy","memAvailableBytes","memAvailableBytesMin","pssBytes","pssBytesPeak",
+        "pssSamples","processCount","processCountPeak","processCountSamples","samplingMode",
+        "postLoadHostCpuFraction","postLoadMemAvailableBytes","postLoadPssBytes",
+        "postLoadProcessCount"]
+missing = [k for k in want if k not in d]
+print("missing:" + ",".join(missing) if missing else "all-present")
+' "$ok_out" 2>&1)" || new_fields_rc=$?
+  check "the record carries every field the #291 schema adds" "$new_fields" "all-present"
+  check "  ...and json.load accepted it" "$new_fields_rc" "0"
+  check "hostCpuFraction in the record is the UNDER-LOAD mean, not the post-load 0.0006" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hostCpuFraction"])' "$ok_out")" "0.41"
+  check "  ...and the idle reading is still there, under its own name" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["postLoadHostCpuFraction"])' "$ok_out")" "0.0006"
+  check "coresBusy is recorded, because 29.52 cores is legible where 0.41 is not" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["coresBusy"])' "$ok_out")" "29.52"
+  check "samplingMode marks how these numbers were taken" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["samplingMode"])' "$ok_out")" "in-rung-1hz-mean"
+  check "the PSS/processCount cadence is disclosed in the record's own proxyLimitations" \
+    "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("yes" if any("sampler tick" in v for v in d["proxyLimitations"].values()) else "no")' "$ok_out")" "yes"
 
   # --- And the microvm arm's numbers stay NUMBERS (null there would be the sweep losing
   # the dimension it is sweeping, so dimension_literal refuses it).
@@ -677,6 +774,909 @@ check "percentile's call sites no longer swallow its status with '|| echo 0'" \
 check "the five derived rung fields now go through require_numeric" \
   "$(grep -cE 'require_numeric (p95Ms|throughput|coldAcquireRate|convergeMsP50|wallSeconds)' "$SCRIPT")" "5"
 
+# ---------------------------------------------------------------------------
+# Issue #291 item 2: payload construction leaves the timed window.
+#
+# grpc_exec_record used to run mktemp, date, json_escape x2 (python3 x2), grpcurl, date,
+# rm, plus wc -l x2 in the caller's loop guard -- ~9 process creations per Exec, two of
+# them interpreter startups, and t0 was stamped BEFORE the compound whose argument list
+# contained both command substitutions, so both interpreter startups fell inside the
+# measured latency. At c=64 that is ~64 slots x ~9 spawns continuously, which is enough to
+# produce the observed c=8 knee with no contribution from the backend at all.
+#
+# Two properties are asserted: the payload is byte-identical to what json_escape produced
+# (the correctness risk in moving escaping out of the loop), and the timed window contains
+# none of the removed spawns (the regression that would silently undo the fix).
+# ---------------------------------------------------------------------------
+echo "== per-Exec payload construction is pre-escaped, outside the timed window (#291 item 2)"
+
+esc_body="$(extract_fns json_escape e11_tool_call_mix escaped_mix || true)"
+check "escaped_mix is extractable alongside json_escape and the mix" \
+  "$([ -n "$esc_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$esc_body" ]; then
+  esc_tmpdir="$(mktemp -d)"
+  esc_snippet="$esc_tmpdir/esc.sh"
+  printf '%s\n' "$esc_body" >"$esc_snippet"
+
+  # The hazardous command: a double quote AND a backslash, the two characters that make
+  # naive bash interpolation produce JSON that either fails to parse or silently changes
+  # the command the sandbox runs.
+  hazard='echo "a\b" > /tmp/x'
+
+  esc_pair=$(
+    # shellcheck disable=SC1090
+    . "$esc_snippet"
+    # Override the mix with the single hazardous command, so escaped_mix's own output can be
+    # compared against json_escape of the same string.
+    e11_tool_call_mix() { printf '%s\n' 'echo "a\b" > /tmp/x'; }
+    printf '%s\n%s\n' "$(escaped_mix)" "$(json_escape 'echo "a\b" > /tmp/x')"
+  )
+  esc_new="$(printf '%s\n' "$esc_pair" | sed -n 1p)"
+  esc_old="$(printf '%s\n' "$esc_pair" | sed -n 2p)"
+  check "escaped_mix is byte-identical to json_escape on a command with a quote and a backslash" \
+    "$esc_new" "$esc_old"
+
+  # And the assembled payload -- the thing grpcurl actually receives -- round-trips through
+  # the real consumer with the command unchanged.
+  esc_payload="{\"sandbox_id\":\"e11-test\",\"exec\":{\"req_id\":7,\"command\":$esc_new,\"timeout_s\":30,\"workspace_key\":\"ws-1\"}}"
+  esc_rt_rc=0
+  esc_rt="$(printf '%s' "$esc_payload" | python3 -c 'import json,sys; print(json.load(sys.stdin)["exec"]["command"])' 2>&1)" || esc_rt_rc=$?
+  check "the assembled payload parses as JSON" "$esc_rt_rc" "0"
+  check "  ...with the command byte-for-byte what was asked for" "$esc_rt" "$hazard"
+
+  # Ordering and count: the mix has 7 commands and escaped_mix must preserve both.
+  esc_count=$(
+    # shellcheck disable=SC1090
+    . "$esc_snippet"
+    escaped_mix | wc -l | tr -d ' '
+  )
+  check "escaped_mix emits one line per mix command (7)" "$esc_count" "7"
+  esc_first=$(
+    # shellcheck disable=SC1090
+    . "$esc_snippet"
+    escaped_mix | sed -n 1p
+  )
+  check "  ...in the mix's own order (first is 'true')" "$esc_first" '"true"'
+
+  rm -rf "$esc_tmpdir"
+fi
+
+echo "== the timed window forks nothing but grpcurl (#291 item 2, the regression guard)"
+# timed_window_body prints exactly what runs inside the measured window: run_density_rung's
+# lines strictly BETWEEN the wall_t0 and wall_t1 stamps (excluding both stamp lines
+# themselves -- neither stamp's own assignment runs DURING the interval it delimits), plus
+# the whole of grpc_exec_record, which every Exec in that window calls. Comments are
+# stripped, because the explanations of this defect name the removed commands.
+#
+# The `next` after `f=1` matters: awk evaluates every pattern-action rule against a record
+# in program order, so without it the SAME line that flips f to 1 would also satisfy the
+# later `f{print}` rule and print itself -- including the wall_t0 stamp (and its own
+# `date +%s%N`) in a window that is supposed to start strictly after it.
+timed_window_body() {
+  {
+    printf '%s\n' "$(extract_fn run_density_rung)" |
+      awk '/wall_t0="/{f=1; next} /wall_t1="/{exit} f{print}'
+    extract_fn grpc_exec_record
+  } | grep -v '^[[:space:]]*#'
+}
+tw_body="$(timed_window_body || true)"
+check "the timed window is extractable and non-empty" \
+  "$([ -n "$tw_body" ] && echo yes || echo no)" "yes"
+
+# NON-VACUOUSNESS: the detector must flag each removed command in a fixture that contains
+# it. Without this, "0 findings" below could mean the regex matches nothing.
+tw_detect() { printf '%s\n' "$1" | grep -cE '\bjson_escape\b|date \+%s%N|\bmktemp\b|\bwc -l\b'; }
+check "non-vacuousness: the detector flags a json_escape in the window" \
+  "$(tw_detect '  -d "{\"command\":$(json_escape "$cmd\")}"')" "1"
+check "non-vacuousness: the detector flags a date +%s%N in the window" \
+  "$(tw_detect '  t0="$(date +%s%N)"')" "1"
+check "non-vacuousness: the detector flags an mktemp in the window" \
+  "$(tw_detect '  err_log="$(mktemp "$E11_TMPDIR/errlog.XXXXXX")"')" "1"
+check "non-vacuousness: the detector flags a wc -l loop guard" \
+  "$(tw_detect '  while [ "$(wc -l <"$times_file")" -lt "$want" ]; do')" "1"
+
+if [ -n "$tw_body" ]; then
+  check "no json_escape, date, mktemp or wc runs inside the timed window" \
+    "$(tw_detect "$tw_body")" "0"
+  # The complement, so the check above cannot pass by the window having gone away.
+  check "  ...and grpcurl still does (the one spawn that is the measurement)" \
+    "$([ "$(printf '%s\n' "$tw_body" | grep -c 'grpcurl')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "  ...and latency is stamped from EPOCHREALTIME, a shell variable" \
+    "$([ "$(printf '%s\n' "$tw_body" | grep -c 'EPOCHREALTIME')" -ge 1 ] && echo yes || echo no)" "yes"
+fi
+
+echo "== grpc_exec_record contains no command substitution at all, arithmetic aside (M10)"
+# \$\([^(] matches a command-substitution open, "$(", NOT immediately followed by a second
+# "(" -- so it flags "$(cmd)" while leaving "$((expr))" (arithmetic expansion, used for the
+# ms computation below) alone. A plain grep for '\$(' would wrongly flag that arithmetic
+# expansion too, since "$((" contains "$(" as a substring.
+ger_nosubst() { printf '%s\n' "$1" | grep -cE '\$\([^(]'; }
+check "non-vacuousness: the detector flags a real command substitution" \
+  "$(ger_nosubst 't0="$(date +%s%N)"')" "1"
+check "non-vacuousness: the detector does NOT flag arithmetic expansion" \
+  "$(ger_nosubst 'ms=$(( (10#$b - 10#$a) / 1000 ))')" "0"
+ger_body="$(extract_fn grpc_exec_record | grep -v '^[[:space:]]*#' || true)"
+check "grpc_exec_record is extractable" "$([ -n "$ger_body" ] && echo yes || echo no)" "yes"
+if [ -n "$ger_body" ]; then
+  check "  ...and its body runs no command substitution -- not even one avoided fork" \
+    "$(ger_nosubst "$ger_body")" "0"
+  check "  ...while still using \$((...)) arithmetic expansion for the ms computation" \
+    "$([ "$(printf '%s\n' "$ger_body" | grep -cE '\$\(\(')" -ge 1 ] && echo yes || echo no)" "yes"
+fi
+
+echo "== epoch_delta_ms and the EPOCHREALTIME preflight"
+ep_body="$(extract_fns die epoch_delta_ms set_epoch_ms require_epochrealtime || true)"
+check "the epoch helpers are extractable" "$([ -n "$ep_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$ep_body" ]; then
+  ep_snippet="$(mktemp -d)/ep.sh"
+  printf '%s\n' "$ep_body" >"$ep_snippet"
+  ep() {
+    (
+      # shellcheck disable=SC1090
+      . "$ep_snippet"
+      epoch_delta_ms "$1" "$2"
+    )
+  }
+  check "epoch_delta_ms over 1.5s" "$(ep 1789672470.000000 1789672471.500000)" "1500"
+  check "epoch_delta_ms truncates sub-millisecond" "$(ep 1789672470.000000 1789672470.000999)" "0"
+  check "epoch_delta_ms handles a leading-zero microsecond field" \
+    "$(ep 1789672470.000000 1789672470.042000)" "42"
+  check "epoch_delta_ms across a second boundary" \
+    "$(ep 1789672470.900000 1789672471.100000)" "200"
+
+  # The preflight: a shell with no EPOCHREALTIME (bash < 5.0, which is /bin/bash on macOS)
+  # or a locale that renders a decimal comma both make every timed Exec an arithmetic
+  # error. This refuses in preflight instead.
+  ep_unset_rc=0
+  ep_unset_out=$(
+    (
+      # shellcheck disable=SC1090
+      . "$ep_snippet"
+      unset EPOCHREALTIME
+      require_epochrealtime
+    ) 2>&1
+  ) || ep_unset_rc=$?
+  check "require_epochrealtime refuses when EPOCHREALTIME is unset" \
+    "$([ "$ep_unset_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  case "$ep_unset_out" in *EPOCHREALTIME*) ep_named=yes ;; *) ep_named=no ;; esac
+  check "  ...and the refusal names EPOCHREALTIME" "$ep_named" "yes"
+  ep_comma_rc=0
+  ep_comma_out=$(
+    (
+      # shellcheck disable=SC1090
+      . "$ep_snippet"
+      # EPOCHREALTIME is a bash dynamic variable: per the bash manual, assigning to it
+      # while it still has its special properties is ignored on the NEXT read (which
+      # keeps returning the live clock, dot-formatted under this suite's LC_ALL=C) --
+      # only after `unset` does a plain string assignment actually stick. Without the
+      # unset here, this fixture would (mis)report a comma reading as accepted.
+      unset EPOCHREALTIME
+      EPOCHREALTIME='1789672470,123935'
+      require_epochrealtime
+    ) 2>&1
+  ) || ep_comma_rc=$?
+  check "require_epochrealtime refuses a locale decimal COMMA (LC_NUMERIC=de_DE)" \
+    "$([ "$ep_comma_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  case "$ep_comma_out" in *[Ll]ocale*) ep_loc=yes ;; *) ep_loc=no ;; esac
+  check "  ...and says so, so the fix is obvious" "$ep_loc" "yes"
+  ep_ok_rc=0
+  (
+    # shellcheck disable=SC1090
+    . "$ep_snippet"
+    unset EPOCHREALTIME
+    EPOCHREALTIME='1789672470.123935'
+    require_epochrealtime
+  ) >/dev/null 2>&1 || ep_ok_rc=$?
+  check "require_epochrealtime accepts a well-formed reading (does not refuse everything)" \
+    "$ep_ok_rc" "0"
+  rm -rf "$(dirname "$ep_snippet")"
+fi
+
+check "LC_ALL is pinned and exported for the whole driver" \
+  "$([ "$(grep -c '^export LC_ALL$' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "preflight calls require_epochrealtime" \
+  "$([ "$(printf '%s\n' "$(extract_fn preflight)" | grep -c 'require_epochrealtime')" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "== preflight only requires docker/pnpm/microVM hardware checks for arms that need them (issue #291 item 5)"
+ai_body="$(extract_fn arm_in_use || true)"
+check "arm_in_use is extractable" "$([ -n "$ai_body" ] && echo yes || echo no)" "yes"
+if [ -n "$ai_body" ]; then
+  ai_tmpdir="$(mktemp -d)"
+  ai_snippet="$ai_tmpdir/arm_in_use.sh"
+  printf '%s\n' "$ai_body" >"$ai_snippet"
+  run_arm_in_use() {
+    (
+      read -r -a E11_ARMS <<<"$2"
+      # shellcheck disable=SC1090
+      . "$ai_snippet"
+      arm_in_use "$1"
+    )
+  }
+  ai_rc=0
+  run_arm_in_use container "container driver-control" >/dev/null 2>&1 || ai_rc=$?
+  check "arm_in_use finds an arm that IS configured" "$ai_rc" "0"
+  ai_rc=0
+  run_arm_in_use microvm "container driver-control" >/dev/null 2>&1 || ai_rc=$?
+  check "  ...and refuses (nonzero) one that is NOT configured" \
+    "$([ "$ai_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  rm -rf "$ai_tmpdir"
+fi
+
+pf_body="$(extract_fn preflight || true)"
+check "preflight is extractable" "$([ -n "$pf_body" ] && echo yes || echo no)" "yes"
+if [ -n "$pf_body" ]; then
+  # Strip full-line comments first: this file's own header comments say "check_kvm" and
+  # "validate_arms" while explaining the ordering, which would otherwise satisfy grep -n
+  # before the real code line does and silently defeat the ordering assertions below.
+  pf_code="$(printf '%s\n' "$pf_body" | grep -v '^[[:space:]]*#')"
+  pf_line() { printf '%s\n' "$pf_code" | grep -n -- "$1" | head -n1 | cut -d: -f1; }
+  pf_validate="$(pf_line 'validate_arms')"
+  pf_guard="$(pf_line 'arm_in_use container')"
+  pf_docker="$(pf_line 'require_tool docker')"
+  pf_pnpm="$(pf_line 'require_tool pnpm')"
+  pf_vmm_guard="$(pf_line 'arm_in_use microvm')"
+  pf_kvm="$(pf_line 'check_kvm')"
+  check "validate_arms runs before any arm-conditional check reads E11_ARMS" \
+    "$([ -n "$pf_validate" ] && [ -n "$pf_guard" ] && [ "$pf_validate" -lt "$pf_guard" ] && echo yes || echo no)" "yes"
+  check "docker is required only inside an arm_in_use(container|microvm) guard" \
+    "$([ -n "$pf_docker" ] && [ -n "$pf_guard" ] && [ "$pf_guard" -lt "$pf_docker" ] && echo yes || echo no)" "yes"
+  check "pnpm is required only inside that same guard" \
+    "$([ -n "$pf_pnpm" ] && [ -n "$pf_guard" ] && [ "$pf_guard" -lt "$pf_pnpm" ] && echo yes || echo no)" "yes"
+  check "check_kvm is required only inside an arm_in_use(microvm) guard" \
+    "$([ -n "$pf_kvm" ] && [ -n "$pf_vmm_guard" ] && [ "$pf_vmm_guard" -lt "$pf_kvm" ] && echo yes || echo no)" "yes"
+  check "  ...and so are check_cgroups/check_swap/check_governor (all four gated together)" \
+    "$(printf '%s\n' "$pf_code" | awk '/arm_in_use microvm/{f=1} f' | grep -cE '^\s*(check_kvm|check_cgroups|check_swap|GOVERNOR_STATE="\$\(check_governor\)")$')" "4"
+  check "grpcurl and go stay unconditional -- every arm needs both" \
+    "$(printf '%s\n' "$pf_code" | grep -cE '^\s*require_tool (grpcurl|go) ')" "2"
+fi
+check "the slot's error log is a fixed path under the trap-owned root, not an mktemp" \
+  "$([ "$(grep -c 'err_log="\$slot_dir/slot-\$i.err"' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+# Spec section 1 says the escaping happens BEFORE TIMING STARTS, not merely outside the
+# per-Exec loop. Assert the order structurally: the mix is escaped, and every slot's
+# workspace_key with it, above the wall_t0 stamp.
+pe_rdr="$(extract_fn run_density_rung || true)"
+if [ -n "$pe_rdr" ]; then
+  pe_line() { printf '%s\n' "$pe_rdr" | grep -n -- "$1" | head -n1 | cut -d: -f1; }
+  pe_mix="$(pe_line 'mapfile -t mix_json')"
+  pe_ws="$(pe_line 'ws_json_by_slot\[i\]=')"
+  pe_t0="$(pe_line 'wall_t0="')"
+  check "the mix is pre-escaped inside run_density_rung" \
+    "$([ -n "$pe_mix" ] && echo yes || echo no)" "yes"
+  check "each slot's workspace_key is pre-escaped too" \
+    "$([ -n "$pe_ws" ] && echo yes || echo no)" "yes"
+  if [ -n "$pe_mix" ] && [ -n "$pe_ws" ] && [ -n "$pe_t0" ]; then
+    check "the mix is escaped BEFORE wall_t0 (before timing starts)" \
+      "$([ "$pe_mix" -lt "$pe_t0" ] && echo yes || echo no)" "yes"
+    check "the workspace keys are escaped before wall_t0 too" \
+      "$([ "$pe_ws" -lt "$pe_t0" ] && echo yes || echo no)" "yes"
+  fi
+  check "the mix is escaped exactly once per rung, not once per slot" \
+    "$(printf '%s\n' "$pe_rdr" | grep -c 'mapfile -t mix_json')" "1"
+fi
+
+# ---------------------------------------------------------------------------
+# Issue #291 item 1: host resource signals are sampled DURING the timed window.
+#
+# host_signals_snapshot was called after every slot subshell had exited and after the
+# throughput window closed, and host_cpu_fraction then SLEPT ONE SECOND and diffed
+# /proc/stat across that window -- so hostCpuFraction, memAvailableBytes and pssBytes all
+# described a quiesced machine. The recorded values contain their own falsification: 0.0006
+# on a 72-cpu host is 0.043 cores busy, while the same rung sustained ~41 Exec/sec at ~9
+# spawns each, on the order of 370 process creations per second.
+#
+# Worse than weak: crosses('cpu') in experiments/src/microvm-density.ts reads
+# hostCpuFraction >= 0.9, so a post-load 0.0006 makes the `cpu` bound STRUCTURALLY unable to
+# fire at any rung. EXPERIMENTS.md's "no CPU ceiling was reached" is a restatement of the
+# sampling bug, not a finding.
+#
+# The sampler that replaces it must not become the next artifact: reading 128 smaps_rollup
+# files per second while measuring a density ceiling perturbs the thing under test. So the
+# every-tick path uses only builtins, and the pgrep + N-file walk runs every Nth tick.
+# ---------------------------------------------------------------------------
+echo "== the sampler's every-tick path uses only builtins (#291 item 1)"
+
+samp_body="$(extract_fns die set_epoch_ms discover_pids pss_bytes_for_pids proc_stat_totals proc_meminfo_available host_sampler_tick host_sampler_loop || true)"
+# The concatenated extract_fns form above is only a strengthened guard when paired with the
+# single-name form: extract_fns PRINTS each function's body as it walks the list and only
+# FAILS at the first MISSING name, so bodies from functions that landed in earlier tasks
+# (die, set_epoch_ms, discover_pids, pss_bytes_for_pids) would keep $samp_body non-empty
+# even if every sampler-specific name below were absent. extract_fn on a single sampler
+# name has no such earlier-landed name to hide behind: it is empty if and only if that
+# function does not exist.
+samp_tick_solo="$(extract_fn host_sampler_tick || true)"
+check "host_sampler_tick alone is extractable (a guard extract_fns cannot fake)" \
+  "$([ -n "$samp_tick_solo" ] && echo yes || echo no)" "yes"
+# Symmetric with the host_sampler_tick guard above: extract_fns prints each body as it
+# walks its name list and only fails at the first MISSING name, so a same-list check stays
+# non-empty even if the LAST-named function (host_sampler_loop) is absent. A standalone
+# extract_fn on that name alone has no earlier-landed name to hide behind.
+samp_loop_solo="$(extract_fn host_sampler_loop || true)"
+check "host_sampler_loop alone is extractable (a guard extract_fns cannot fake)" \
+  "$([ -n "$samp_loop_solo" ] && echo yes || echo no)" "yes"
+check "the sampler functions are extractable" "$([ -n "$samp_body" ] && echo yes || echo no)" "yes"
+
+# The every-tick path must contain no external command. awk, sleep, date, pgrep, python3 and
+# wc are all forks; `sleep` is legitimate in host_sampler_loop's slice wait but must not
+# appear in the tick itself, and pgrep/awk reach the tick only through the low-cadence
+# branch, which is guarded.
+tick_only="$(extract_fn host_sampler_tick | grep -v '^[[:space:]]*#' || true)"
+check "host_sampler_tick body is extractable" "$([ -n "$tick_only" ] && echo yes || echo no)" "yes"
+tick_forks() { printf '%s\n' "$1" | grep -cE '\bawk\b|\bsleep\b|date \+|\bpython3\b|\bwc\b|\bcat\b'; }
+check "non-vacuousness: the fork detector flags an awk in a tick" \
+  "$(tick_forks '  frac="$(awk -v x=1 "BEGIN{print x}")"')" "1"
+if [ -n "$tick_only" ]; then
+  check "host_sampler_tick calls no awk, sleep, date, python3, wc or cat" \
+    "$(tick_forks "$tick_only")" "0"
+  check "  ...and formats the CPU fraction with printf -v (a builtin, not a subshell)" \
+    "$([ "$(printf '%s\n' "$tick_only" | grep -c 'printf -v')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "  ...and the pgrep walk is behind the low-cadence guard, not on every tick" \
+    "$([ "$(printf '%s\n' "$tick_only" | grep -c 'SAMPLE_LOW_EVERY')" -ge 1 ] && echo yes || echo no)" "yes"
+fi
+
+if [ -n "$samp_body" ]; then
+  sp_tmpdir="$(mktemp -d)"
+  sp_snippet="$sp_tmpdir/samp.sh"
+  printf '%s\n' "$samp_body" >"$sp_snippet"
+  sp_proc="$sp_tmpdir/proc"
+  mkdir -p "$sp_proc"
+
+  # --- CPU diff correctness, against two hand-written /proc/stat snapshots.
+  # Snapshot A: user=100 nice=0 system=100 idle=800 iowait=0, total 1000, idle+iowait 800.
+  # Snapshot B: user=600 nice=0 system=100 idle=1300 iowait=0, total 2000, idle+iowait 1300.
+  # dt=1000, di=500 -> busy fraction 1 - 500/1000 = 0.5000.
+  printf 'cpu  100 0 100 800 0 0 0 0 0 0\ncpu0 100 0 100 800 0 0 0 0 0 0\n' >"$sp_proc/stat"
+  printf 'MemTotal:       16384000 kB\nMemFree:            1000 kB\nMemAvailable:    8192000 kB\n' >"$sp_proc/meminfo"
+
+  sp_line=$(
+    PROC_ROOT="$sp_proc"
+    SAMPLE_LOW_EVERY=1000 # so tick 1 takes the LOW-cadence branch only if tick==1 forces it
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    proc_stat_totals
+    # shellcheck disable=SC2154 # assigned by proc_stat_totals, sourced above
+    SAMPLE_PREV_IDLE="$SAMPLE_IDLE"
+    # shellcheck disable=SC2154
+    SAMPLE_PREV_TOTAL="$SAMPLE_TOTAL"
+    SAMPLE_TICK=0 # the script-scope declaration is not in the extracted snippet
+    printf 'cpu  600 0 100 1300 0 0 0 0 0 0\ncpu0 600 0 100 1300 0 0 0 0 0 0\n' >"$PROC_ROOT/stat"
+    host_sampler_tick "$sp_tmpdir/out"
+    cat "$sp_tmpdir/out"
+  )
+  check "the CPU diff over two hand-written /proc/stat snapshots is 0.5000" \
+    "$(printf '%s\n' "$sp_line" | awk '{print $1}')" "0.5000"
+  check "MemAvailable is parsed from a fake /proc/meminfo and converted to bytes" \
+    "$(printf '%s\n' "$sp_line" | awk '{print $2}')" "8388608000"
+  check "the tick emits exactly one line" "$(printf '%s\n' "$sp_line" | wc -l | tr -d ' ')" "1"
+  rm -f "$sp_tmpdir/out"
+
+  # --- A zero-delta snapshot pair is 0.0000, not a division by zero.
+  printf 'cpu  100 0 100 800 0 0 0 0 0 0\n' >"$sp_proc/stat"
+  sp_zero=$(
+    PROC_ROOT="$sp_proc"
+    SAMPLE_LOW_EVERY=1000
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    proc_stat_totals
+    SAMPLE_PREV_IDLE="$SAMPLE_IDLE"
+    SAMPLE_PREV_TOTAL="$SAMPLE_TOTAL"
+    SAMPLE_TICK=0 # the script-scope declaration is not in the extracted snippet
+    host_sampler_tick "$sp_tmpdir/out"
+    awk '{print $1}' "$sp_tmpdir/out"
+  )
+  check "an identical snapshot pair yields 0.0000, not a divide-by-zero" "$sp_zero" "0.0000"
+  rm -f "$sp_tmpdir/out"
+
+  # --- A fully busy window is 1.0000 and never exceeds it.
+  printf 'cpu  100 0 100 800 0 0 0 0 0 0\n' >"$sp_proc/stat"
+  sp_busy=$(
+    PROC_ROOT="$sp_proc"
+    SAMPLE_LOW_EVERY=1000
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    proc_stat_totals
+    SAMPLE_PREV_IDLE="$SAMPLE_IDLE"
+    SAMPLE_PREV_TOTAL="$SAMPLE_TOTAL"
+    SAMPLE_TICK=0 # the script-scope declaration is not in the extracted snippet
+    printf 'cpu  1100 0 100 800 0 0 0 0 0 0\n' >"$PROC_ROOT/stat"
+    host_sampler_tick "$sp_tmpdir/out"
+    awk '{print $1}' "$sp_tmpdir/out"
+  )
+  check "a window with zero idle jiffies is 1.0000 (the value crosses('cpu') tests at 0.9)" \
+    "$sp_busy" "1.0000"
+  rm -f "$sp_tmpdir/out"
+
+  # --- No MemAvailable line: 0, and still one clean line (the H2 class, in the sampler).
+  printf 'MemTotal:       16384000 kB\n' >"$sp_proc/meminfo"
+  printf 'cpu  100 0 100 800 0 0 0 0 0 0\n' >"$sp_proc/stat"
+  sp_nomem=$(
+    PROC_ROOT="$sp_proc"
+    SAMPLE_LOW_EVERY=1000
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    proc_stat_totals
+    SAMPLE_PREV_IDLE="$SAMPLE_IDLE"
+    SAMPLE_PREV_TOTAL="$SAMPLE_TOTAL"
+    SAMPLE_TICK=0 # the script-scope declaration is not in the extracted snippet
+    host_sampler_tick "$sp_tmpdir/out"
+    cat "$sp_tmpdir/out"
+  )
+  check "no MemAvailable line -> 0 bytes, on one line" \
+    "$(printf '%s\n' "$sp_nomem" | awk '{print $2}')" "0"
+  check "  ...and still exactly one line (no two-line value, the H2 shape)" \
+    "$(printf '%s\n' "$sp_nomem" | wc -l | tr -d ' ')" "1"
+  printf 'MemTotal:       16384000 kB\nMemFree:            1000 kB\nMemAvailable:    8192000 kB\n' >"$sp_proc/meminfo"
+  rm -f "$sp_tmpdir/out"
+
+  # --- The low cadence: tick 1 always carries pss/processCount (so a rung can never end
+  # with zero of them while having CPU samples), then every SAMPLE_LOW_EVERY'th tick.
+  sp_marker="$(marker_token sampler)"
+  spawn_marker_process "$sp_marker"
+  sp_live="$MARKER_PID"
+  mkdir -p "$sp_proc/$sp_live"
+  printf 'Pss:                 512 kB\n' >"$sp_proc/$sp_live/smaps_rollup"
+  sp_cad=$(
+    PROC_ROOT="$sp_proc"
+    SAMPLE_LOW_EVERY=3
+    VMM_PROC_PATTERN="$sp_marker"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    proc_stat_totals
+    # shellcheck disable=SC2034
+    SAMPLE_PREV_IDLE="$SAMPLE_IDLE"
+    # shellcheck disable=SC2034
+    SAMPLE_PREV_TOTAL="$SAMPLE_TOTAL"
+    # shellcheck disable=SC2034 # the script-scope declaration is not in the extracted snippet
+    SAMPLE_TICK=0 # the script-scope declaration is not in the extracted snippet
+    for _ in 1 2 3 4 5 6; do host_sampler_tick "$sp_tmpdir/out"; done
+    awk '{print $3}' "$sp_tmpdir/out" | tr '\n' ' '
+  )
+  check "tick 1 carries pssBytes, then every 3rd tick does (ticks 1,3,6 of 6)" \
+    "$sp_cad" "524288 - 524288 - - 524288 "
+  sp_cad_proc=$(awk '{print $4}' "$sp_tmpdir/out" | tr '\n' ' ')
+  check "  ...and processCount follows the same cadence" "$sp_cad_proc" "1 - 1 - - 1 "
+  stop_marker_process "$sp_live"
+  rm -f "$sp_tmpdir/out"
+
+  # --- host_sampler_loop: ticks while running, stops on the stop file, and emits a final
+  # tick so a short rung is not left with zero samples.
+  printf 'cpu  100 0 100 800 0 0 0 0 0 0\n' >"$sp_proc/stat"
+  sp_stop="$sp_tmpdir/stop"
+  sp_out="$sp_tmpdir/loop-out"
+  : >"$sp_out"
+  (
+    PROC_ROOT="$sp_proc"
+    SAMPLE_INTERVAL_MS=200
+    SAMPLE_SLICE_MS=100
+    SAMPLE_MIN_TICK_MS=1
+    SAMPLE_LOW_EVERY=1000
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    host_sampler_loop "$sp_out" "$sp_stop"
+  ) &
+  sp_loop_pid=$!
+  sleep 1
+  : >"$sp_stop"
+  wait "$sp_loop_pid"
+  sp_n="$(wc -l <"$sp_out" | tr -d ' ')"
+  check "host_sampler_loop produced at least 3 ticks in ~1s at a 200ms interval" \
+    "$([ "$sp_n" -ge 3 ] && echo yes || echo no)" "yes"
+  check "  ...and exited on the stop file rather than running forever" \
+    "$([ -e "/proc/$sp_loop_pid" ] && echo running || echo exited)" "exited"
+  check "  ...and every line has exactly 4 fields" \
+    "$(awk 'NF != 4 {bad++} END{print bad+0}' "$sp_out")" "0"
+
+  # A rung shorter than one interval still gets one sample, from the stop tick.
+  : >"$sp_out"
+  rm -f "$sp_stop"
+  (
+    PROC_ROOT="$sp_proc"
+    SAMPLE_INTERVAL_MS=60000
+    SAMPLE_SLICE_MS=100
+    SAMPLE_MIN_TICK_MS=1
+    SAMPLE_LOW_EVERY=1000
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    host_sampler_loop "$sp_out" "$sp_stop"
+  ) &
+  sp_short_pid=$!
+  sleep 0.5
+  : >"$sp_stop"
+  wait "$sp_short_pid"
+  check "a window shorter than one interval still yields one sample (the stop tick)" \
+    "$(wc -l <"$sp_out" | tr -d ' ')" "1"
+
+  # ...but the stop tick REFUSES to fabricate a sample over an interval too short to diff.
+  : >"$sp_out"
+  rm -f "$sp_stop"
+  (
+    PROC_ROOT="$sp_proc"
+    # shellcheck disable=SC2034
+    SAMPLE_INTERVAL_MS=60000
+    # shellcheck disable=SC2034
+    SAMPLE_SLICE_MS=100
+    # shellcheck disable=SC2034
+    SAMPLE_MIN_TICK_MS=60000
+    # shellcheck disable=SC2034 # read by host_sampler_loop once sourced
+    SAMPLE_LOW_EVERY=1000
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    host_sampler_loop "$sp_out" "$sp_stop"
+  ) &
+  sp_tiny_pid=$!
+  sleep 0.4
+  : >"$sp_stop"
+  wait "$sp_tiny_pid"
+  check "a window below SAMPLE_MIN_TICK_MS records NO sample rather than a noise diff" \
+    "$(wc -l <"$sp_out" | tr -d ' ')" "0"
+
+  # A rung that has ALREADY landed a real full-interval tick gets no diluted extra sample at
+  # stop, even when SAMPLE_MIN_TICK_MS is tiny enough that the elapsed-time floor alone would
+  # otherwise let one through (issue #291 item 2). SAMPLE_MIN_TICK_MS=1 here is deliberate: it
+  # isolates the SAMPLE_TICK==0 gate as the ONLY thing standing between "at least one full tick
+  # already landed" and an extra stop-tick, so a regression that drops that gate turns this
+  # into a failure rather than passing by an unrelated floor.
+  #
+  # host_sampler_loop checks for the stop file only once per SLICE, at the top of its loop,
+  # BEFORE it sleeps -- so if the stop file appears while a slice's sleep is already in
+  # flight, that slice (and, if it is the last slice of a tick group, the tick that goes with
+  # it) still completes; the loop only notices stop on its NEXT top-of-loop check. A fixed
+  # "sleep N then write stop" cannot dodge that: whatever N is, there is no way to guarantee
+  # the write lands in the brief gap right after a tick rather than mid-slice. So instead of
+  # guessing a delay, POLL for the first tick to land and write the stop file within one poll
+  # tick of seeing it -- that reaction is a handful of the loop's own SAMPLE_SLICE_MS slices
+  # away from the second tick, giving a wide, timing-independent margin against mistaking a
+  # legitimately-scheduled second tick for the dilution bug this checks for.
+  : >"$sp_out"
+  rm -f "$sp_stop"
+  (
+    PROC_ROOT="$sp_proc"
+    # shellcheck disable=SC2034
+    SAMPLE_INTERVAL_MS=1000
+    # shellcheck disable=SC2034
+    SAMPLE_SLICE_MS=200
+    # shellcheck disable=SC2034
+    SAMPLE_MIN_TICK_MS=1
+    # shellcheck disable=SC2034 # read by host_sampler_loop once sourced
+    SAMPLE_LOW_EVERY=1000
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sp_snippet"
+    host_sampler_loop "$sp_out" "$sp_stop"
+  ) &
+  sp_dil_pid=$!
+  sp_before=0
+  for _ in $(seq 1 400); do
+    sp_before="$(wc -l <"$sp_out" | tr -d ' ')"
+    [ "$sp_before" -ge 1 ] && break
+    sleep 0.02
+  done
+  : >"$sp_stop"
+  wait "$sp_dil_pid"
+  sp_after="$(wc -l <"$sp_out" | tr -d ' ')"
+  check "at least one full tick landed before stop was signalled (scenario sanity check)" \
+    "$([ "$sp_before" -ge 1 ] && echo yes || echo no)" "yes"
+  check "no diluted extra tick is appended once a full tick has already landed" \
+    "$sp_after" "$sp_before"
+
+  rm -rf "$sp_tmpdir"
+fi
+
+echo "== sampler_field's arithmetic over a fixed synthetic sample file (#291 item 1)"
+sf_body="$(extract_fns sampler_field host_cpu_count || true)"
+check "sampler_field and host_cpu_count are extractable" \
+  "$([ -n "$sf_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$sf_body" ]; then
+  sf_tmpdir="$(mktemp -d)"
+  sf_snippet="$sf_tmpdir/sf.sh"
+  printf '%s\n' "$sf_body" >"$sf_snippet"
+  # Three ticks. Ticks 1 and 3 carry the low-cadence signals; tick 2 does not, and its "-"
+  # cells must be SKIPPED rather than read as zero -- a 0 in a mean is a claim, an absent
+  # sample is not.
+  sf_file="$sf_tmpdir/samples"
+  {
+    echo '0.1000 8000000000 524288 2'
+    echo '0.5000 4000000000 - -'
+    echo '0.9000 6000000000 1048576 4'
+  } >"$sf_file"
+  sf() {
+    (
+      # shellcheck disable=SC1090
+      . "$sf_snippet"
+      sampler_field "$sf_file" "$1" "$2" "${3:-%.4f}"
+    )
+  }
+  check "cpu mean over 3 ticks" "$(sf 1 mean)" "0.5000"
+  check "cpu peak" "$(sf 1 peak)" "0.9000"
+  check "cpu min" "$(sf 1 min)" "0.1000"
+  check "cpu sample count" "$(sf 1 count '%d')" "3"
+  check "memAvailable mean, as an integer" "$(sf 2 mean '%.0f')" "6000000000"
+  check "memAvailable min (the only extreme that can indicate pressure)" "$(sf 2 min '%.0f')" "4000000000"
+  check "pss mean SKIPS the '-' tick (2 samples, not 3)" "$(sf 3 mean '%.0f')" "786432"
+  check "pss peak" "$(sf 3 peak '%.0f')" "1048576"
+  check "pss sample count is 2, exposing the reduced cadence" "$(sf 3 count '%d')" "2"
+  check "processCount mean, rounded to an integer" "$(sf 4 mean '%.0f')" "3"
+  check "processCount peak" "$(sf 4 peak '%.0f')" "4"
+  check "processCount sample count" "$(sf 4 count '%d')" "2"
+
+  # An empty file is the ABSENCE of a measurement, not a zero -- same refusal shape as
+  # percentile. count prints 0 so the caller can distinguish "no samples" from "failed".
+  sf_empty="$sf_tmpdir/empty"
+  : >"$sf_empty"
+  sf_empty_rc=0
+  (
+    # shellcheck disable=SC1090
+    . "$sf_snippet"
+    sampler_field "$sf_empty" 1 mean '%.4f'
+  ) >/dev/null 2>&1 || sf_empty_rc=$?
+  check "an empty sample file is a refusal, not a 0.0000 mean" \
+    "$([ "$sf_empty_rc" -ne 0 ] && echo yes || echo no)" "yes"
+
+  # A column that is "-" on EVERY tick is likewise absent, not zero.
+  sf_alldash="$sf_tmpdir/alldash"
+  printf '0.1000 8000000000 - -\n0.2000 8000000000 - -\n' >"$sf_alldash"
+  sf_dash_rc=0
+  (
+    # shellcheck disable=SC1090
+    . "$sf_snippet"
+    sampler_field "$sf_alldash" 3 mean '%.0f'
+  ) >/dev/null 2>&1 || sf_dash_rc=$?
+  check "an all-'-' column is a refusal too" \
+    "$([ "$sf_dash_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  sf_dash_count=$(
+    # shellcheck disable=SC1090
+    . "$sf_snippet"
+    sampler_field "$sf_alldash" 3 count '%d'
+  )
+  check "  ...while its count is 0, which is what the record shows" "$sf_dash_count" "0"
+
+  sf_ncpu=$(
+    # shellcheck disable=SC1090
+    . "$sf_snippet"
+    host_cpu_count
+  )
+  check "host_cpu_count prints a positive integer (coresBusy = mean x this)" \
+    "$([ "$sf_ncpu" -ge 1 ] 2>/dev/null && echo yes || echo no)" "yes"
+
+  rm -rf "$sf_tmpdir"
+fi
+
+echo "== a refused PSS read is counted, not silently dropped like an ordinary '-' tick (#291 item 4)"
+smc_body="$(extract_fns sampler_field sampler_marker_count || true)"
+check "sampler_field and sampler_marker_count are extractable" \
+  "$([ -n "$smc_body" ] && echo yes || echo no)" "yes"
+if [ -n "$smc_body" ]; then
+  smc_tmpdir="$(mktemp -d)"
+  smc_snippet="$smc_tmpdir/smc.sh"
+  printf '%s\n' "$smc_body" >"$smc_snippet"
+  # Five ticks in column 3 (pssBytes): one real reading, one ordinary un-sampled "-", two
+  # DISTINCT refusals (pss_bytes_for_pids died on an unreadable smaps_rollup), and one more
+  # real reading -- so pssRefusedTicks (refused=2) must differ from both pssSamples
+  # (sampler_field count=2, the two numeric ticks) and from a naive "non-dash" count (which
+  # would wrongly fold the refusals in as if they were data).
+  smc_file="$smc_tmpdir/samples"
+  {
+    echo '0.1000 8000000000 524288 2'
+    echo '0.2000 8000000000 - -'
+    echo '0.3000 8000000000 refused -'
+    echo '0.4000 8000000000 refused -'
+    echo '0.5000 8000000000 1048576 4'
+  } >"$smc_file"
+  smc() {
+    (
+      # shellcheck disable=SC1090
+      . "$smc_snippet"
+      "$@"
+    )
+  }
+  check "pssRefusedTicks counts exactly the 'refused' markers, via sampler_marker_count" \
+    "$(smc sampler_marker_count "$smc_file" 3 refused)" "2"
+  check "  ...and a marker no tick actually holds counts zero, not an error" \
+    "$(smc sampler_marker_count "$smc_file" 3 no-such-marker)" "0"
+  check "  ...an empty sampler file also counts zero refusals rather than failing" \
+    "$(smc sampler_marker_count "$smc_tmpdir/does-not-exist" 3 refused)" "0"
+  check "pssSamples (sampler_field count) is 2 -- the refusals are NOT folded in as data" \
+    "$(smc sampler_field "$smc_file" 3 count '%d')" "2"
+  check "  ...and pssBytes' mean is over only those 2 real readings, refusals excluded" \
+    "$(smc sampler_field "$smc_file" 3 mean '%.0f')" "786432"
+  rm -rf "$smc_tmpdir"
+fi
+
+echo "== the sampler brackets exactly the timed window, and nothing else (#291 item 1)"
+sw_rdr="$(extract_fn run_density_rung || true)"
+if [ -n "$sw_rdr" ]; then
+  sw_line() { printf '%s\n' "$sw_rdr" | grep -n -- "$1" | head -n1 | cut -d: -f1; }
+  sw_t0="$(sw_line 'wall_t0="')"
+  sw_start="$(sw_line 'host_sampler_loop ')"
+  sw_t1="$(sw_line 'wall_t1="')"
+  sw_snap="$(sw_line 'host_signals_snapshot "\$require_vmm"')"
+  check "the sampler is started inside run_density_rung" \
+    "$([ -n "$sw_start" ] && echo yes || echo no)" "yes"
+  if [ -n "$sw_t0" ] && [ -n "$sw_start" ] && [ -n "$sw_t1" ]; then
+    check "the sampler starts AFTER wall_t0 (never before the window it describes)" \
+      "$([ "$sw_t0" -lt "$sw_start" ] && echo yes || echo no)" "yes"
+    check "the sampler starts BEFORE the first Exec is issued" \
+      "$([ "$sw_start" -lt "$(sw_line 'grpc_exec_record ')" ] && echo yes || echo no)" "yes"
+  fi
+  if [ -n "$sw_t1" ] && [ -n "$sw_snap" ]; then
+    check "the post-load snapshot is still taken, AFTER wall_t1" \
+      "$([ "$sw_t1" -lt "$sw_snap" ] && echo yes || echo no)" "yes"
+  fi
+  check "the sampler is reaped before aggregation (a wait on its pid)" \
+    "$([ "$(printf '%s\n' "$sw_rdr" | grep -c 'wait "\$E11_SAMPLER_PID"')" -ge 1 ] && echo yes || echo no)" "yes"
+fi
+check "hostCpuFraction is recorded from the sampler's MEAN, not the post-load snapshot" \
+  "$([ "$(grep -c "'hostCpuFraction': \$cpu_mean," "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "the post-load snapshot keeps its own four explicitly named fields" \
+  "$(grep -cE "'postLoad(HostCpuFraction|MemAvailableBytes|PssBytes|ProcessCount)':" "$SCRIPT")" "4"
+check "samplingMode marks these records so they cannot be compared with pre-fix ones" \
+  "$(grep -c "'samplingMode': 'in-rung-1hz-mean'," "$SCRIPT")" "1"
+check "the reduced PSS/processCount cadence is disclosed in proxyLimitations" \
+  "$([ "$(grep -c 'sampled every .* sampler tick' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "a rung with zero host samples is REFUSED, not backfilled from the idle snapshot" \
+  "$([ "$(grep -c 'produced ZERO host samples over its timed window' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "standbysResident is derived from the SAMPLED process count, not the post-load one" \
+  "$([ "$(grep -c 'standbys_resident=\$((proc_mean > c' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "the sampler is killed from the EXIT trap, so a die mid-rung cannot orphan it" \
+  "$([ "$(printf '%s\n' "$(extract_fn cleanup_on_exit)" | grep -c 'stop_host_sampler')" -ge 1 ] && echo yes || echo no)" "yes"
+
+# ---------------------------------------------------------------------------
+# Issue #291 item 3: converge is out of the throughput denominator.
+#
+# wall_t0 was stamped, then each slot ran converge_slot -- a git fetch -- and only then its
+# Exec loop, and wall_t1 closed after all of it. throughput = successful Execs / wall
+# seconds, so a slow fetch WAS a throughput ceiling, on both arms, by construction. The
+# header's claim that converge is timed separately was true only of p50/p95.
+#
+# run_density_rung now runs two phases with a full drain between them. Each slot's run_id,
+# workspace_key and req_base are deterministic in (arm, d, ram_mb, c, i), so phase 2
+# recomputes them and lands on the workspace phase 1 prepared, and req_id spaces stay
+# disjoint across the barrier.
+# ---------------------------------------------------------------------------
+echo "== the timed window starts AFTER every slot has converged (#291 item 3)"
+
+bar_rdr="$(extract_fn run_density_rung || true)"
+check "run_density_rung is still extractable after the phase split" \
+  "$([ -n "$bar_rdr" ] && echo yes || echo no)" "yes"
+
+if [ -n "$bar_rdr" ]; then
+  bar_line() { printf '%s\n' "$bar_rdr" | grep -n -- "$1" | head -n1 | cut -d: -f1; }
+  bar_conv="$(bar_line 'converge_slot ')"
+  bar_conv_wait="$(bar_line 'wait "\$pid" || converge_failures=')"
+  bar_t0="$(bar_line 'wall_t0="')"
+  bar_exec="$(bar_line 'grpc_exec_record ')"
+  bar_t1="$(bar_line 'wall_t1="')"
+  for pair in "converge_slot:$bar_conv" "converge wait:$bar_conv_wait" "wall_t0:$bar_t0" \
+    "grpc_exec_record:$bar_exec" "wall_t1:$bar_t1"; do
+    check "the ${pair%%:*} line is present in run_density_rung" \
+      "$([ -n "${pair##*:}" ] && echo yes || echo no)" "yes"
+  done
+  if [ -n "$bar_conv" ] && [ -n "$bar_conv_wait" ] && [ -n "$bar_t0" ] && [ -n "$bar_exec" ] && [ -n "$bar_t1" ]; then
+    check "converge_slot runs before the converge phase is drained" \
+      "$([ "$bar_conv" -lt "$bar_conv_wait" ] && echo yes || echo no)" "yes"
+    check "the converge phase is drained BEFORE wall_t0 is stamped (the barrier)" \
+      "$([ "$bar_conv_wait" -lt "$bar_t0" ] && echo yes || echo no)" "yes"
+    check "wall_t0 is stamped before the first Exec is issued" \
+      "$([ "$bar_t0" -lt "$bar_exec" ] && echo yes || echo no)" "yes"
+    check "wall_t1 closes after the last Exec" \
+      "$([ "$bar_exec" -lt "$bar_t1" ] && echo yes || echo no)" "yes"
+    check "no converge_slot call remains between wall_t0 and wall_t1" \
+      "$(printf '%s\n' "$bar_rdr" | awk -v a="$bar_t0" -v b="$bar_t1" 'NR>a && NR<b' | grep -c 'converge_slot ')" "0"
+  fi
+  check "both phases derive the run id from ONE helper, so they cannot drift" \
+    "$(printf '%s\n' "$bar_rdr" | grep -c 'slot_run_id ')" "2"
+  check "both phases derive the req_id base from ONE helper" \
+    "$(printf '%s\n' "$bar_rdr" | grep -c 'slot_req_base ')" "2"
+fi
+
+echo "== the slot-identity helpers are deterministic in (arm, d, ram_mb, c, i)"
+id_body="$(extract_fns slot_run_id slot_workspace_key slot_req_base || true)"
+check "the slot-identity helpers are extractable" \
+  "$([ -n "$id_body" ] && echo yes || echo no)" "yes"
+if [ -n "$id_body" ]; then
+  id_snippet="$(mktemp -d)/id.sh"
+  printf '%s\n' "$id_body" >"$id_snippet"
+  idf() {
+    (
+      # shellcheck disable=SC1090
+      . "$id_snippet"
+      "$@"
+    )
+  }
+  check "slot_run_id is the documented shape" \
+    "$(idf slot_run_id microvm 2 256 8 3)" "e11-microvm-d2-ram256-c8-slot3"
+  check "slot_run_id is deterministic (same args, same id)" \
+    "$([ "$(idf slot_run_id microvm 2 256 8 3)" = "$(idf slot_run_id microvm 2 256 8 3)" ] && echo yes || echo no)" "yes"
+  check "slot_run_id distinguishes slots, so two slots cannot share a workspace" \
+    "$([ "$(idf slot_run_id microvm 2 256 8 3)" != "$(idf slot_run_id microvm 2 256 8 4)" ] && echo yes || echo no)" "yes"
+  check "the microvm arm gets a non-empty workspace_key (it REFUSES an empty one)" \
+    "$(idf slot_workspace_key microvm e11-x-slot1)" "e11-x-slot1"
+  check "the container arm gets an empty workspace_key (today's shared workspace)" \
+    "$(idf slot_workspace_key container e11-x-slot1)" ""
+  check "the driver-control arm follows the container path" \
+    "$(idf slot_workspace_key driver-control e11-x-slot1)" ""
+  check "slot_req_base spaces slots a million apart" "$(idf slot_req_base 3)" "3000000"
+  check "  ...so no two slots' req_id ranges can overlap at any sane ITERS_PER_SLOT" \
+    "$([ "$(idf slot_req_base 4)" -gt "$(($(idf slot_req_base 3) + 100000))" ] && echo yes || echo no)" "yes"
+  rm -rf "$(dirname "$id_snippet")"
+fi
+
+echo "== a converge failure in phase 1 refuses the rung, and phase 2 never starts"
+# The barrier's whole point, EXECUTED rather than grepped: the real run_density_rung is run
+# with converge_slot and grpc_exec_record stubbed, so the assertion is about the real
+# control flow. A marker file records whether any Exec was issued at all.
+bar_body="$(extract_fns die log require_numeric json_escape e11_tool_call_mix escaped_mix slot_run_id slot_workspace_key slot_req_base run_density_rung || true)"
+check "run_density_rung is extractable together with its slot helpers" \
+  "$([ -n "$bar_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$bar_body" ]; then
+  bar_tmpdir="$(mktemp -d)"
+  bar_probe="$bar_tmpdir/probe.sh"
+  mkdir -p "$bar_tmpdir/results" "$bar_tmpdir/tmp"
+  {
+    echo 'set -uo pipefail'
+    printf '%s\n' "$bar_body"
+    # Stubs, defined AFTER the real functions so they win.
+    echo 'assert_relay_alive() { :; }'
+    echo 'converge_slot() { echo 5; return "$BAR_CONVERGE_RC"; }'
+    echo 'grpc_exec_record() { : >"$BAR_MARKER"; echo "1 ok -" >>"$6"; }'
+    echo 'host_sampler_loop() { :; }'
+    echo 'percentile() { echo 1; }'
+    echo 'run_density_rung "$@"'
+  } >"$bar_probe"
+
+  bar_env() {
+    env BAR_CONVERGE_RC="$1" BAR_MARKER="$bar_tmpdir/exec-was-issued" \
+      E11_TMPDIR="$bar_tmpdir/tmp" RESULTS="$bar_tmpdir/results" \
+      ITERS_PER_SLOT=1 WARMUP_PER_SLOT=0 COLD_LATENCY_MS=50 \
+      SUBSTRATE=nested-m8i REPO_CACHE_SHAPE=accept-cold-fetch \
+      PROC_ROOT="$bar_tmpdir/proc" VMM_PROC_PATTERN=__none__ VIRTIOFSD_PROC_PATTERN=__none__ \
+      SAMPLE_INTERVAL_MS=1000 SAMPLE_SLICE_MS=100 SAMPLE_MIN_TICK_MS=200 SAMPLE_LOW_EVERY=5 \
+      EXEC_MAX_TIME_S=45 PROTO_IMPORT_PATH=/tmp PROTO_REL_PATH=x.proto \
+      bash "$bar_probe" container - - 2 e11-test 8444 "$bar_tmpdir/out.json"
+  }
+
+  rm -f "$bar_tmpdir/exec-was-issued"
+  bar_fail_rc=0
+  bar_fail_out="$(bar_env 1 2>&1)" || bar_fail_rc=$?
+  check "a converge failure in phase 1 makes the rung exit NONZERO" \
+    "$([ "$bar_fail_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  case "$bar_fail_out" in *"slot(s) fail before their timed loop"*) bar_named=yes ;; *) bar_named=no ;; esac
+  check "  ...with the refusal that names the rung and the count" "$bar_named" "yes"
+  check "  ...and NOT ONE Exec was issued: the barrier held" \
+    "$([ -e "$bar_tmpdir/exec-was-issued" ] && echo issued || echo none)" "none"
+  check "  ...and no rung record was written" \
+    "$([ -s "$bar_tmpdir/out.json" ] && echo wrote || echo nothing)" "nothing"
+
+  # NON-VACUOUSNESS: with converge SUCCEEDING, the same probe does reach phase 2. Without
+  # this, "none" above could mean the probe never ran at all. Only the marker is asserted --
+  # the probe is free to die later, in the record writer it has no real inputs for.
+  rm -f "$bar_tmpdir/exec-was-issued" "$bar_tmpdir/out.json"
+  bar_env 0 >/dev/null 2>&1 || true
+  check "non-vacuousness: with converge succeeding, phase 2 DOES issue Execs" \
+    "$([ -e "$bar_tmpdir/exec-was-issued" ] && echo issued || echo none)" "issued"
+
+  rm -rf "$bar_tmpdir"
+fi
+
 echo "== a FAILED converge is not recorded as a fast converge"
 # converge_slot used to discard grpcurl's status and return the timing anyway, so a converge
 # that never prepared the workspace still produced a small convergeMsP50 -- wrong in the
@@ -685,8 +1685,13 @@ check "converge_slot returns the RPC's own status" \
   "$([ "$(printf '%s\n' "$(extract_fn converge_slot)" | grep -c 'return "\$rc"')" -ge 1 ] && echo yes || echo no)" "yes"
 check "a slot whose converge failed exits non-zero instead of continuing" \
   "$([ "$(grep -c 'converge FAILED after' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
-check "and every slot's exit status is checked, not discarded by a bare wait" \
-  "$(grep -c 'wait "\$pid" || slot_failures=' "$SCRIPT")" "1"
+# Two wait loops since the converge barrier landed (#291 item 3): one per phase, each
+# checking every slot's status. A bare `wait` in either would discard the reason a slot
+# failed.
+check "the converge phase checks every slot's exit status, not a bare wait" \
+  "$(grep -c 'wait "\$pid" || converge_failures=' "$SCRIPT")" "1"
+check "the timed phase checks every slot's exit status too" \
+  "$(grep -c 'wait "\$pid" || exec_failures=' "$SCRIPT")" "1"
 check "  ...with the rung refused when any slot failed" \
   "$([ "$(grep -c 'slot(s) fail before their timed loop' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 
@@ -695,7 +1700,7 @@ check "  ...with the rung refused when any slot failed" \
 # ---------------------------------------------------------------------------
 echo "== pssBytes: 0 is refused on the microvm arm, and still legitimate on the container arm"
 
-vmm_body="$(extract_fns die require_numeric mem_available_bytes discover_pids pss_bytes_for_pids host_cpu_fraction host_signals_snapshot || true)"
+vmm_body="$(extract_fns die require_numeric proc_meminfo_available mem_available_bytes discover_pids pss_bytes_for_pids host_cpu_fraction host_signals_snapshot || true)"
 if [ -n "$vmm_body" ]; then
   vmm_tmpdir="$(mktemp -d)"
   vmm_snippet="$vmm_tmpdir/signals.sh"
@@ -822,8 +1827,10 @@ if [ -n "$trap_body" ]; then
   : >"$doomed/slots-container-d--ram--c1/slot-1.times"
   {
     echo 'set -uo pipefail'
+    echo 'stop_host_sampler() { echo sampler >>"$ORDER"; }'
     echo 'stop_container_stack() { echo container >>"$ORDER"; }'
     echo 'stop_microvm_stack() { echo microvm >>"$ORDER"; }'
+    echo 'stop_null_stack() { echo null >>"$ORDER"; }'
     printf '%s\n' "$trap_body"
     echo 'trap cleanup_on_exit EXIT'
     echo 'exit 7'
@@ -831,8 +1838,11 @@ if [ -n "$trap_body" ]; then
   tr_rc=0
   ORDER="$tr_order" E11_TMPDIR="$doomed" bash "$tr_probe" || tr_rc=$?
   check "the trap does not swallow the script's exit status" "$tr_rc" "7"
-  check "it kills BOTH arms' stacks (kill before remove, as build-snapshot.sh does)" \
-    "$(tr '\n' ' ' <"$tr_order")" "container microvm "
+  # The sampler goes FIRST: it is a background subshell that polls for its stop file, so
+  # after `rm -rf $E11_TMPDIR` that file can never appear and it would spin forever writing
+  # to a deleted path (#291 item 1).
+  check "it kills the sampler and every arm's stack (kill before remove)" \
+    "$(tr '\n' ' ' <"$tr_order")" "sampler container microvm null "
   check "and it removes the temp root, so no mktemp -d slot dir survives a die" \
     "$([ -e "$doomed" ] && echo survived || echo gone)" "gone"
 
@@ -855,6 +1865,204 @@ check "every temp path lives under the trap-owned root, not a bare mktemp local"
   "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -cE 'mktemp( -d)? *$|mktemp( -d)?\)')" "0"
 check "the temp root itself is created once, at script scope" \
   "$(grep -c '^E11_TMPDIR="\$(mktemp -d' "$SCRIPT")" "1"
+
+# ---------------------------------------------------------------------------
+# A read that fails AFTER `-r` passed: race vs refusal (issue #291 shakedown).
+#
+# /proc/<pid>/smaps_rollup passes a mode-bits `-r` test but its open is gated by ptrace
+# permissions, and the pid can also exit in the window between the test and the read. Both were
+# observed on real hardware, and unhandled BOTH silently contributed 0 kB to Sigma PSS -- awk's
+# failure left pid_kb empty and bash arithmetic reads an empty string as 0. That is the
+# RSS-fallback failure mode in disguise: the one number spec section 7.3 boxes as
+# non-negotiable, under-reported in the optimistic direction, record still looking complete.
+#
+# awk is stubbed to fail rather than simulated into failing, so the branch is exercised
+# deterministically on any platform.
+# ---------------------------------------------------------------------------
+echo "== a smaps read that fails after -r passed: alive REFUSES, exited is a silent race"
+
+race_body="$(extract_fns die pss_bytes_for_pids || true)"
+check "pss_bytes_for_pids is extractable for the race test" \
+  "$([ -n "$race_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$race_body" ]; then
+  race_tmpdir="$(mktemp -d)"
+  race_snippet="$race_tmpdir/race.sh"
+  printf '%s\n' "$race_body" >"$race_snippet"
+  race_proc="$race_tmpdir/proc"
+
+  # --- ALIVE and unreadable: must refuse. A real live pid, so kill -0 succeeds.
+  race_marker="$(marker_token race)"
+  spawn_marker_process "$race_marker"
+  race_live="$MARKER_PID"
+  mkdir -p "$race_proc/$race_live"
+  printf 'Pss:                 512 kB\n' >"$race_proc/$race_live/smaps_rollup"
+  # NON-VACUOUSNESS: with awk working, this pid reads fine and contributes its 512 kB.
+  race_ok=$(
+    PROC_ROOT="$race_proc"
+    # shellcheck disable=SC1090
+    . "$race_snippet"
+    pss_bytes_for_pids "$race_live"
+  )
+  check "non-vacuousness: with a working awk the live pid contributes its PSS" "$race_ok" "524288"
+  race_rc=0
+  race_out=$(
+    (
+      PROC_ROOT="$race_proc"
+      # shellcheck disable=SC1090
+      . "$race_snippet"
+      # Stub AFTER sourcing so it shadows the real awk inside pss_bytes_for_pids.
+      awk() { return 1; }
+      pss_bytes_for_pids "$race_live"
+    ) 2>&1
+  ) || race_rc=$?
+  check "a failed read on a LIVE pid refuses (nonzero), rather than contributing 0" \
+    "$([ "$race_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  case "$race_out" in *"$race_live"*) race_named=yes ;; *) race_named=no ;; esac
+  check "  ...and the refusal names the pid" "$race_named" "yes"
+  case "$race_out" in *SH_E11_VMM_PROC_PATTERN*) race_hint=yes ;; *) race_hint=no ;; esac
+  check "  ...and points at the unscoped pattern, the likeliest cause" "$race_hint" "yes"
+  stop_marker_process "$race_live"
+
+  # --- EXITED: a race. Contributes 0, exits clean, and prints NOTHING -- the noise that made a
+  # benign race look like a defect (14 awk fatal lines in one three-arm smoke).
+  race_dead=999999
+  mkdir -p "$race_proc/$race_dead"
+  printf 'Pss:                 512 kB\n' >"$race_proc/$race_dead/smaps_rollup"
+  race_dead_rc=0
+  race_dead_err=$(
+    (
+      PROC_ROOT="$race_proc"
+      # shellcheck disable=SC1090
+      . "$race_snippet"
+      awk() { return 1; }
+      pss_bytes_for_pids "$race_dead" >/dev/null
+    ) 2>&1
+  ) || race_dead_rc=$?
+  check "a failed read on an EXITED pid is a race: exit 0, not a refusal" "$race_dead_rc" "0"
+  check "  ...and it prints nothing at all (no awk fatal noise)" "$race_dead_err" ""
+  race_dead_val=$(
+    (
+      PROC_ROOT="$race_proc"
+      # shellcheck disable=SC1090
+      . "$race_snippet"
+      awk() { return 1; }
+      pss_bytes_for_pids "$race_dead"
+    ) 2>/dev/null
+  )
+  check "  ...and the exited pid contributes 0 bytes" "$race_dead_val" "0"
+
+  rm -rf "$race_tmpdir"
+fi
+
+echo "== a thin rung warns at run time instead of passing unremarked"
+# hostCpuSamples is recorded, but it is one field in a 30-field record and a 1-2 sample mean
+# cannot support a saturation verdict. Both arms measured at 75-256 Exec/sec on the nested rig
+# produced exactly one sample at the shipped ITERS_PER_SLOT, so this is the common case, not the
+# corner case. It must WARN, not refuse -- a thin rung is legitimate.
+thin_rdr="$(extract_fn run_density_rung || true)"
+if [ -n "$thin_rdr" ]; then
+  check "run_density_rung warns when a rung is built from very few host samples" \
+    "$([ "$(printf '%s\n' "$thin_rdr" | grep -c 'produced only \$cpu_samples host sample')" -ge 1 ] && echo yes || echo no)" "yes"
+  check "  ...as a log, NOT a die (a thin rung is legitimate)" \
+    "$(printf '%s\n' "$thin_rdr" | grep 'produced only \$cpu_samples host sample' | grep -c '^ *log ')" "1"
+  check "  ...and it names both knobs an operator would reach for" \
+    "$([ "$(printf '%s\n' "$thin_rdr" | grep 'produced only' | grep -c 'SH_E11_ITERS_PER_SLOT.*SH_E11_SAMPLE_INTERVAL_MS')" -ge 1 ] && echo yes || echo no)" "yes"
+  thin_warn_line="$(printf '%s\n' "$thin_rdr" | grep -n 'cpu_samples" -lt 5' | head -n1 | cut -d: -f1)"
+  thin_mean_line="$(printf '%s\n' "$thin_rdr" | grep -n 'require_numeric hostCpuFraction' | head -n1 | cut -d: -f1)"
+  check "the warning is evaluated after the sample count is known" \
+    "$([ -n "$thin_warn_line" ] && [ -n "$thin_mean_line" ] && [ "$thin_warn_line" -lt "$thin_mean_line" ] && echo yes || echo no)" "yes"
+fi
+check "the ITERS_PER_SLOT default carries the >=10-ticks sizing rule" \
+  "$([ "$(grep -c 'AT LEAST ~10 SAMPLER TICKS' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
+# ---------------------------------------------------------------------------
+# A ladder may only contain rungs from THIS run (issue #291 shakedown).
+#
+# $RESULTS accumulates across runs and nothing clears it. assemble_ladder globbed
+# e11-rung-<arm>-c*.json, so a rung from an earlier run with different settings joined the current
+# ladder silently -- observed for real: a c=2 rung from a 20-iter smoke reappeared inside a
+# 600-iter ladder carrying its one-sample hostCpuFraction. detectKnee anchors on the c=1 baseline,
+# so a stale c=1 re-scales every health decision after it.
+# ---------------------------------------------------------------------------
+echo "== assemble_ladder takes only this run's rungs, and says what it dropped"
+
+al_body="$(extract_fns die assemble_ladder || true)"
+# Guarded on assemble_ladder ALONE, not on the concatenation: extract_fns prints each body as it
+# iterates and only fails at the first MISSING name, so `die` alone would make the concatenation
+# non-empty and this guard would pass while the snippet lacked the function under test. That
+# happened while writing this very block -- the sourced snippet had only `die` and every call
+# below exited 127.
+check "assemble_ladder alone is extractable (a guard extract_fns cannot fake)" \
+  "$([ -n "$(extract_fn assemble_ladder || true)" ] && echo yes || echo no)" "yes"
+
+if [ -n "$al_body" ]; then
+  al_tmpdir="$(mktemp -d)"
+  al_snippet="$al_tmpdir/al.sh"
+  printf '%s\n' "$al_body" >"$al_snippet"
+  mk_rung() { printf '{"c": %s, "runId": %s, "throughput": 1.0}\n' "$1" "$2" >"$al_tmpdir/e11-rung-x-c$1.json"; }
+  # Two rungs from this run, one left over from an earlier one.
+  mk_rung 1 '"RUN-CURRENT"'
+  mk_rung 4 '"RUN-CURRENT"'
+  mk_rung 2 '"RUN-STALE"'
+  al_out="$al_tmpdir/ladder.json"
+  al_rc=0
+  al_err=$(
+    (
+      E11_RUN_ID="RUN-CURRENT"
+      # shellcheck disable=SC1090
+      . "$al_snippet"
+      assemble_ladder "$al_tmpdir/e11-rung-x-c*.json" "$al_out"
+    ) 2>&1
+  ) || al_rc=$?
+  check "it succeeds when at least one rung is from this run" "$al_rc" "0"
+  check "  ...and the ladder contains ONLY this run's rungs" \
+    "$(python3 -c 'import json,sys; print(",".join(str(r["c"]) for r in json.load(open(sys.argv[1]))))' "$al_out")" "1,4"
+  case "$al_err" in *SKIPPED*e11-rung-x-c2.json*) al_said=yes ;; *) al_said=no ;; esac
+  check "  ...and it NAMES the stale record it dropped, rather than dropping it silently" "$al_said" "yes"
+
+  # NON-VACUOUSNESS: without the runId filter a glob would have taken all three.
+  check "non-vacuousness: the glob really does match all three files" \
+    "$(ls "$al_tmpdir"/e11-rung-x-c*.json | wc -l | tr -d ' ')" "3"
+
+  # An all-stale directory is a refusal, not an empty ladder.
+  al_stale_rc=0
+  al_stale_err=$(
+    (
+      E11_RUN_ID="RUN-DIFFERENT"
+      # shellcheck disable=SC1090
+      . "$al_snippet"
+      assemble_ladder "$al_tmpdir/e11-rung-x-c*.json" "$al_tmpdir/ladder2.json"
+    ) 2>&1
+  ) || al_stale_rc=$?
+  check "an all-stale directory REFUSES rather than writing an empty ladder" \
+    "$([ "$al_stale_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "  ...and writes no ladder file at all" \
+    "$([ -e "$al_tmpdir/ladder2.json" ] && echo wrote || echo nothing)" "nothing"
+  case "$al_stale_err" in *"mixing runs is worse than no ladder"*) al_why=yes ;; *) al_why=no ;; esac
+  check "  ...and the refusal explains why a mixed ladder is worse than none" "$al_why" "yes"
+
+  # A record predating the stamp has no runId and must count as stale (the safe direction).
+  printf '{"c": 8, "throughput": 1.0}\n' >"$al_tmpdir/e11-rung-x-c8.json"
+  al_nostamp=$(
+    (
+      # shellcheck disable=SC2034 # read by assemble_ladder once sourced below; this is the
+      # LEXICALLY LAST E11_RUN_ID assignment, which is where shellcheck reports the file-wide finding
+      E11_RUN_ID="RUN-CURRENT"
+      # shellcheck disable=SC1090
+      . "$al_snippet"
+      assemble_ladder "$al_tmpdir/e11-rung-x-c*.json" "$al_tmpdir/ladder3.json"
+    ) 2>&1 >/dev/null
+  )
+  check "a record with NO runId is treated as stale (it cannot be shown to be ours)" \
+    "$(python3 -c 'import json,sys; print(",".join(str(r["c"]) for r in json.load(open(sys.argv[1]))))' "$al_tmpdir/ladder3.json")" "1,4"
+  case "$al_nostamp" in *e11-rung-x-c8.json*) al_named8=yes ;; *) al_named8=no ;; esac
+  check "  ...and it is named among the skipped" "$al_named8" "yes"
+
+  rm -rf "$al_tmpdir"
+fi
+check "every rung record carries the run id" \
+  "$(grep -c "'runId': '\$E11_RUN_ID'," "$SCRIPT")" "1"
 
 echo "== RSS is never read as a fallback anywhere pss_bytes_for_pids or its callers run"
 # Comment lines (the header's own disclosure that RSS/VmRSS is deliberately
@@ -1026,8 +2234,10 @@ check "SH_VMM=firecracker is set when starting the microvm worker" \
   "$(grep -c 'SH_VMM=firecracker' "$SCRIPT")" "1"
 
 echo "== virtiofsd's legitimate absence on the Firecracker-only arm is documented"
+# Three since the in-rung sampler landed (#291 item 1): the config binding, the post-load
+# snapshot, and the sampler's low-cadence tick.
 check "virtiofsd is still sampled for (summed, can legitimately be 0)" \
-  "$(grep -c 'VIRTIOFSD_PROC_PATTERN' "$SCRIPT")" "2"
+  "$(grep -c 'VIRTIOFSD_PROC_PATTERN' "$SCRIPT")" "3"
 check "the header states 0 virtiofsd PSS here is expected, not a bug" \
   "$([ "$(grep -c 'EXPECTED result of an absent process' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 
@@ -1098,6 +2308,143 @@ check "the redis image is overridable so an operator can pin a digest" \
   "$(grep -c 'SH_E11_REDIS_IMAGE' "$SCRIPT")" "2"
 check "redis is started with RDB snapshots disabled (--save '')" \
   "$([ "$(grep -c -- "--save ''" "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
+# ---------------------------------------------------------------------------
+# Issue #291 section 4: the driver-overhead control arm.
+#
+# The whole reason this artifact survived a metal run is that there was no arm whose latency
+# was known to be all driver. A third arm drives the IDENTICAL run_density_rung against
+# remote-worker/cmd/null-responder -- one End per Exec, no relay, no Redis, no worker, no VMM
+# -- so subtracting it at each c gives the driver's own contribution. If that share is large
+# at high c, a fixed-but-still-grpcurl driver would show a knee that is STILL an artifact and
+# item 3 of the issue becomes mandatory before the authoritative run.
+#
+# It is ON BY DEFAULT, opt-out. A control that has to be remembered is a control that will not
+# be run.
+# ---------------------------------------------------------------------------
+echo "== the driver-control arm runs by default and is driven by the same function (#291 section 4)"
+check "SH_E11_ARMS defaults to all three arms, control included" \
+  "$([ "$(grep -c 'SH_E11_ARMS-container microvm driver-control' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "  ...via \${VAR-default}, not \${VAR:-default}: an explicit empty value must still refuse (issue #291 item 8)" \
+  "$([ "$(grep -c 'SH_E11_ARMS:-container microvm driver-control' "$SCRIPT")" -eq 0 ] && echo yes || echo no)" "yes"
+check "main() drives the control arm through run_density_rung, not a second function" \
+  "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -c 'run_density_rung driver-control')" "1"
+check "no arm-specific Exec-driving function was added for it" \
+  "$(grep -Ec '^run_density_rung_(container|microvm|driver_control|control)\(\)' "$SCRIPT")" "0"
+check "the control arm's stack is ONLY the null-responder (no redis, no relay, no worker)" \
+  "$(printf '%s\n' "$(extract_fn start_null_stack)" | grep -cE 'start_redis_loopback|sandbox-relay|cmd/worker|cmd/microvm-worker')" "0"
+check "  ...and it builds the binary Task 5 added" \
+  "$([ "$(printf '%s\n' "$(extract_fn start_null_stack)" | grep -c 'go build -o "\$E11_NULL_BIN" ./cmd/null-responder')" -ge 1 ] && echo yes || echo no)" "yes"
+check "  ...on loopback only" \
+  "$([ "$(printf '%s\n' "$(extract_fn start_null_stack)" | grep -c -- '-listen "127.0.0.1:')" -ge 1 ] && echo yes || echo no)" "yes"
+check "  ...and waits for it to listen rather than sleeping and hoping" \
+  "$([ "$(printf '%s\n' "$(extract_fn start_null_stack)" | grep -c 'wait_for_relay_port')" -ge 1 ] && echo yes || echo no)" "yes"
+check "the control arm is torn down from the EXIT trap like the others" \
+  "$([ "$(printf '%s\n' "$(extract_fn cleanup_on_exit)" | grep -c 'stop_null_stack')" -ge 1 ] && echo yes || echo no)" "yes"
+check "analyze_slice is SKIPPED for the control arm (a ladder with no cold acquires)" \
+  "$([ "$(grep -c 'analyze_slice skipped' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "  ...but its ladder is still assembled, because the subtraction needs it" \
+  "$(grep -c 'e11-ladder-driver-control.json' "$SCRIPT")" "2"
+
+echo "== SH_E11_ARMS unset defaults to all three arms; SH_E11_ARMS='' stays empty (issue #291 item 8)"
+# \${VAR-default} (no colon) only substitutes when VAR is UNSET, unlike \${VAR:-default} which
+# also substitutes when VAR is set-but-empty. Eval the real default-expansion line in isolation
+# (not the whole script, which has unrelated top-level side effects) to prove the two cases
+# actually differ, not just that the source text changed.
+arms_default_line="$(grep -m1 'read -r -a E11_ARMS <<<"\${SH_E11_ARMS' "$SCRIPT")"
+check "the E11_ARMS default-expansion line is found" \
+  "$([ -n "$arms_default_line" ] && echo yes || echo no)" "yes"
+if [ -n "$arms_default_line" ]; then
+  arms_unset_out=$(
+    (
+      unset SH_E11_ARMS
+      eval "$arms_default_line"
+      printf '%s\n' "${E11_ARMS[*]}"
+    )
+  )
+  check "  ...unset SH_E11_ARMS falls back to all three arms" \
+    "$arms_unset_out" "container microvm driver-control"
+  arms_empty_len=$(
+    (
+      # shellcheck disable=SC2034 # read by the eval'd default-expansion line below
+      SH_E11_ARMS=""
+      eval "$arms_default_line"
+      echo "${#E11_ARMS[@]}"
+    )
+  )
+  check "  ...SH_E11_ARMS='' (explicitly empty) is NOT defaulted -- stays zero arms" \
+    "$arms_empty_len" "0"
+fi
+
+echo "== only the three named arms validate, and shuffling covers whatever is configured"
+arms_body="$(extract_fns die validate_arms shuffle_e11_arms || true)"
+check "validate_arms is extractable" "$([ -n "$arms_body" ] && echo yes || echo no)" "yes"
+if [ -n "$arms_body" ]; then
+  arms_tmpdir="$(mktemp -d)"
+  arms_snippet="$arms_tmpdir/arms.sh"
+  printf '%s\n' "$arms_body" >"$arms_snippet"
+  run_arms() {
+    (
+      read -r -a E11_ARMS <<<"$1"
+      # shellcheck disable=SC1090
+      . "$arms_snippet"
+      validate_arms
+    )
+  }
+  for good in "container" "microvm" "driver-control" "container microvm driver-control" "microvm driver-control"; do
+    arms_rc=0
+    run_arms "$good" >/dev/null 2>&1 || arms_rc=$?
+    check "SH_E11_ARMS='$good' validates" "$arms_rc" "0"
+  done
+  arms_bad_rc=0
+  arms_bad_out="$(run_arms "container cloud-hypervisor" 2>&1)" || arms_bad_rc=$?
+  check "an invented arm is refused (nonzero)" \
+    "$([ "$arms_bad_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  case "$arms_bad_out" in *cloud-hypervisor*) arms_named=yes ;; *) arms_named=no ;; esac
+  check "  ...and the refusal names the bad value" "$arms_named" "yes"
+  arms_empty_rc=0
+  run_arms "" >/dev/null 2>&1 || arms_empty_rc=$?
+  check "an EMPTY arm list is refused: a sweep with no arms measures nothing" \
+    "$([ "$arms_empty_rc" -ne 0 ] && echo yes || echo no)" "yes"
+
+  shuf_out=$(
+    (
+      read -r -a E11_ARMS <<<"container microvm driver-control"
+      # shellcheck disable=SC1090
+      . "$arms_snippet"
+      shuffle_e11_arms | sort | tr '\n' ' '
+    )
+  )
+  check "shuffle_e11_arms emits exactly the configured arms, in some order" \
+    "$shuf_out" "container driver-control microvm "
+  shuf_two=$(
+    (
+      # shellcheck disable=SC2034 # read by shuffle_e11_arms once sourced below
+      read -r -a E11_ARMS <<<"container driver-control"
+      # shellcheck disable=SC1090
+      . "$arms_snippet"
+      shuffle_e11_arms | wc -l | tr -d ' '
+    )
+  )
+  check "  ...and it does not hardcode two arms any more" "$shuf_two" "2"
+  rm -rf "$arms_tmpdir"
+fi
+
+echo "== the control arm records a rung with null swept dimensions and no require_vmm trip"
+# It follows the CONTAINER path: dimension_literal maps its "-" dimensions to None, and
+# require_vmm stays 0 because that flag is gated on arm = microvm. Converge hits the responder
+# too, which is correct -- the control measures the driver's cost for BOTH phases.
+check "the control arm passes '-' for both swept dimensions, like the container arm" \
+  "$([ "$(grep -c 'run_density_rung driver-control - -' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+rv_rdr="$(extract_fn run_density_rung || true)"
+if [ -n "$rv_rdr" ]; then
+  check "require_vmm is gated on the microvm arm alone, so the control arm cannot trip it" \
+    "$(printf '%s\n' "$rv_rdr" | grep -c 'if \[ "\$arm" = "microvm" \] && \[ "\$d" != "0" \]')" "1"
+  check "the idle standby-residency poll is likewise microvm-only" \
+    "$(printf '%s\n' "$rv_rdr" | grep -c 'if \[ "\$arm" = "microvm" \]; then')" "1"
+  check "the control arm has its own relay-log path for assert_relay_alive" \
+    "$(printf '%s\n' "$rv_rdr" | grep -c 'e11-driver-control-responder.log')" "1"
+fi
 
 echo "== between-arm relay teardown kills by PORT, not just the captured PID"
 # E11_RELAY_PID is $(pnpm ... start & echo $!) from inside a subshell -- on a host where

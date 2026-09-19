@@ -23,6 +23,24 @@ import { detectKnee, type LadderPoint } from './sharing.js';
  *  - `leaseSaturations` is a hard admission-control signal, not a soft one (spec §6):
  *    the lease cap sits in front of the VM tier, so a saturated lease means the rung
  *    never actually exercised the VM tier's own limit. See analyzeLadder's lease guard.
+ *  - The four host signals -- `pssBytes`, `memAvailableBytes`, `hostCpuFraction`,
+ *    `processCount` -- are sampled DURING the rung's timed window and carry that window's
+ *    MEAN. Before issue #291 they were sampled after every slot had exited, and
+ *    `host_cpu_fraction` then slept one second and diffed /proc/stat across that window, so
+ *    all four described a quiesced machine. The consequence was not merely weak evidence:
+ *    `crosses('cpu')` tests `hostCpuFraction >= 0.9`, so a post-load 0.0006 on a 72-cpu host
+ *    made the `cpu` bound structurally unable to fire at ANY rung, and E11's "no CPU ceiling
+ *    was reached" was a restatement of the sampling bug. Records written before the fix carry
+ *    no `samplingMode`; records written after carry `"in-rung-1hz-mean"`. The two are NOT
+ *    comparable on any of these four fields.
+ *  - The mean, not the peak, is what `hostCpuFraction` carries, and that choice is narrower
+ *    than "the mean is more representative". `scorePrediction1` flips sealed prediction 1
+ *    straight to `falsified` if CPU crosses 0.9 anywhere while memory and process-count never
+ *    do. Scoring that off a single one-second peak -- a GC pause, a `drop_caches`, an
+ *    unrelated process on a shared box -- would be the same class of error as the artifact
+ *    being fixed, pointed the other way. The mean matches what `crosses('cpu')` asserts:
+ *    THIS RUNG WAS CPU-SATURATED, not "this rung once touched saturation". Nothing is lost,
+ *    because `hostCpuFractionPeak` is recorded beside it.
  */
 export interface RungSample {
   /** Concurrent active runs at this rung. */
@@ -57,6 +75,60 @@ export interface RungSample {
   leaseSaturations: number;
   /** ExecError counts at this rung, keyed by cause (e.g. "memory-gate", "process-limit"). */
   execErrorsByCause: Record<string, number>;
+
+  /**
+   * The rest of this interface is what the driver RECORDS beside each mean (issue #291 §5).
+   * All optional, because records written before that fix do not have them, and no scorer
+   * reads any of them: they exist so a mean can always be checked against what it averaged.
+   */
+  /** Highest and lowest `hostCpuFraction` tick over the timed window. */
+  hostCpuFractionPeak?: number;
+  hostCpuFractionMin?: number;
+  /**
+   * Sampler ticks behind `hostCpuFraction`. Exposes thin rungs: a fast `c=1` rung may yield
+   * only 2-3 samples, and a mean of 2 samples deserves a visible caveat.
+   */
+  hostCpuSamples?: number;
+  /** `hostCpuFraction` x the host's online CPU count. "0.043 cores" is legible; 0.0006 is not. */
+  coresBusy?: number;
+  /** Lowest `memAvailableBytes` tick -- the only extreme of this signal that indicates pressure. */
+  memAvailableBytesMin?: number;
+  /** Highest Sigma PSS tick over the timed window. */
+  pssBytesPeak?: number;
+  /**
+   * Ticks behind `pssBytes` / `processCount`. Lower than `hostCpuSamples` by design: those two
+   * need `pgrep` plus an N-file smaps_rollup walk, so the driver takes them every Nth tick
+   * (default 5, always including tick 1). Defensible because `crosses('memory')` reads
+   * `memAvailableBytes`, which IS every tick -- PSS feeds the narrative, not the bound.
+   */
+  pssSamples?: number;
+  /**
+   * Low-cadence ticks where the sampler DID try to read PSS but the read was refused (a
+   * still-live VMM/virtiofsd pid with an unreadable smaps_rollup -- spec section 7.3's boxed
+   * warning never falls back to RSS, so this fires instead). Not part of `pssSamples`, which
+   * only counts ticks that produced a number: a refusal is a distinct, countable event, not
+   * an ordinary un-sampled tick (issue #291 item 4). No scoring logic reads this field today;
+   * it exists so a rung with a suspiciously low `pssSamples` can be told apart from one that
+   * simply landed on few low-cadence ticks.
+   */
+  pssRefusedTicks?: number;
+  processCountSamples?: number;
+  /** Highest `processCount` tick over the timed window. */
+  processCountPeak?: number;
+  /**
+   * How the four host signals above were taken. `"in-rung-1hz-mean"` since issue #291;
+   * absent on older records, which took them from an idle host after the window closed.
+   */
+  samplingMode?: string;
+  /**
+   * The retained post-load snapshot, taken once after every slot exited. Kept under its own
+   * names precisely so an idle reading can never again pass as an under-load one. NOTHING in
+   * this module reads these.
+   */
+  postLoadHostCpuFraction?: number;
+  postLoadMemAvailableBytes?: number;
+  postLoadPssBytes?: number;
+  postLoadProcessCount?: number;
 }
 
 export type Bound = 'replenishment' | 'memory' | 'process-count' | 'cpu';
