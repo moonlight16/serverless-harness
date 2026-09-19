@@ -13,6 +13,7 @@ import {
   SandboxPoolSaturatedError,
   type SelectedSandbox,
 } from './select-sandbox.js';
+import { leaseTimings } from './lease-timings.js';
 import { convergeWorkspace, cleanupWorkspace, captureWorkspaceDiff } from './converge.js';
 import {
   setupSwebenchWorkspace,
@@ -386,10 +387,14 @@ async function runPromptLeaf(
   // behavior swap: with no KAGENTI_SANDBOX_POOL_SELECTOR set it falls back to exactly that same
   // single-pod resolution and returns null when nothing is configured.
   let selected: SelectedSandbox | null;
+  // Read once and reuse, as the solve and verdict paths do: the heartbeat interval below is armed
+  // outside this try, and two separate reads of the environment can disagree if it is mutated
+  // between them.
+  const promptTimings = leaseTimings(process.env);
   try {
     selected = await selectPoolSandbox(sandboxEnvironment(env), cwd, sid, {
-      cap: Number(process.env.KAGENTI_SANDBOX_CAP ?? '20'),
-      ttlMs: Number(process.env.KAGENTI_SANDBOX_LEASE_TTL_MS ?? '60000'),
+      cap: promptTimings.cap,
+      ttlMs: promptTimings.ttlMs,
       remoteSandbox: process.env.SH_REMOTE_SANDBOX === '1',
     });
   } catch (err) {
@@ -420,11 +425,12 @@ async function runPromptLeaf(
   let overlayDigest: string | undefined;
   try {
     if (selected) {
-      const hbMs = Number(process.env.KAGENTI_SANDBOX_HEARTBEAT_MS ?? '20000');
       const lease = selected;
       heartbeat = setInterval(() => {
-        void lease.heartbeat();
-      }, hbMs);
+        // Best-effort: a failed renewal must not reject into an unhandled rejection and kill the
+        // leaf. The lease's TTL expiring is the safe outcome -- the sandbox returns to the pool.
+        void lease.heartbeat().catch(() => {});
+      }, promptTimings.heartbeatMs);
     }
     // Promoted config: resolve the prose half into this pod's /tmp and mirror the bundle into the
     // sandbox we hold a lease on. Both halves come from one digest, and a failure of either fails
@@ -572,9 +578,10 @@ export const realProduceSolve: ProduceSolve = async (env, config, capture) => {
 
   // A solve leaf MUST have a real sandbox worktree — fail fast (before any Redis/session work) if the
   // pool is unconfigured. selectPoolSandbox returns null when no sandbox is configured (see select-sandbox.ts).
+  const solveTimings = leaseTimings(process.env);
   const selected = await selectPoolSandbox(sandboxEnvironment(env), cwd, sid, {
-    cap: Number(process.env.KAGENTI_SANDBOX_CAP ?? '20'),
-    ttlMs: Number(process.env.KAGENTI_SANDBOX_LEASE_TTL_MS ?? '60000'),
+    cap: solveTimings.cap,
+    ttlMs: solveTimings.ttlMs,
   });
   if (!selected) throw new Error('solve leaf requires a configured sandbox pool');
 
@@ -597,7 +604,7 @@ export const realProduceSolve: ProduceSolve = async (env, config, capture) => {
         repoUrl: env.repoUrl!,
         baseCommit: env.ref!,
         envKey: env.env_key!,
-        runId: sid,
+        sessionId: sid,
       });
       // Separate setup-duty from solve-duty (spec §4): the driver reads this line for setup ms,
       // and solve-duty = total exec-timing delta − setupMs.
@@ -609,10 +616,11 @@ export const realProduceSolve: ProduceSolve = async (env, config, capture) => {
     // A solve leaf edits files in its worktree; point the agent's sandbox cwd at that worktree so the
     // model's edits (relative or absolute) land where captureWorkspaceDiff reads them.
     const agentConfig = { ...selected.config, podCwd: workspaceRef };
-    const hbMs = Number(process.env.KAGENTI_SANDBOX_HEARTBEAT_MS ?? '20000');
     heartbeat = setInterval(() => {
-      void selected.heartbeat();
-    }, hbMs);
+      // Best-effort, as in runPromptLeaf: an unhandled rejection here would end the leaf, whereas
+      // letting the lease lapse just returns the sandbox to the pool.
+      void selected.heartbeat().catch(() => {});
+    }, solveTimings.heartbeatMs);
 
     const agentDir = getAgentDir();
     const settingsManager = SettingsManager.create(cwd, agentDir);
@@ -719,9 +727,10 @@ export const realProduceVerdict: ProduceVerdict = async (item, env, config, capt
   // verdict fast-path so a recovered verdict does not lease a pod. Returns null ⇒ no sandbox
   // configured (local tools). Throws SandboxPoolSaturatedError when a configured pool is full.
   const remoteSandbox = process.env.SH_REMOTE_SANDBOX === '1';
+  const verdictTimings = leaseTimings(process.env);
   const selected = await selectPoolSandbox(sandboxEnvironment(env), cwd, sid, {
-    cap: Number(process.env.KAGENTI_SANDBOX_CAP ?? '20'),
-    ttlMs: Number(process.env.KAGENTI_SANDBOX_LEASE_TTL_MS ?? '60000'),
+    cap: verdictTimings.cap,
+    ttlMs: verdictTimings.ttlMs,
     remoteSandbox,
   });
   const converging = selected != null && !!env.repoUrl && !!env.ref;
@@ -746,10 +755,11 @@ export const realProduceVerdict: ProduceVerdict = async (item, env, config, capt
       }
     }
     if (selected) {
-      const hbMs = Number(process.env.KAGENTI_SANDBOX_HEARTBEAT_MS ?? '20000');
       heartbeat = setInterval(() => {
-        void selected.heartbeat();
-      }, hbMs);
+        // Best-effort, as in runPromptLeaf: an unhandled rejection here would end the leaf, whereas
+        // letting the lease lapse just returns the sandbox to the pool.
+        void selected.heartbeat().catch(() => {});
+      }, verdictTimings.heartbeatMs);
     }
 
     // Gate front-end (design §3): decide whether to pause, abort, or seed a prompt.

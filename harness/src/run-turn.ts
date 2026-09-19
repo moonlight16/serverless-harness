@@ -16,12 +16,16 @@ import {
 import { RedisSessionBackend } from '@sh/session-backend';
 import { BufferedRedisBackend } from './buffered-redis-backend.js';
 import { flushExtension } from './flush-extension.js';
+import { randomUUID } from 'node:crypto';
+import { k8sSandboxExtension, type K8sSandboxConfig, type SandboxTransport } from '@sh/k8s-sandbox';
+// Value import, and safe: select-sandbox.ts imports nothing from run-turn.js, so unlike the
+// run-leaf↔run-turn pair below there is no cycle to avoid here.
 import {
-  k8sSandboxExtension,
-  resolveSandboxConfig,
-  type K8sSandboxConfig,
-  type SandboxTransport,
-} from '@sh/k8s-sandbox';
+  selectPoolSandbox,
+  SandboxPoolSaturatedError,
+  SandboxPoolEmptyError,
+  type SelectDeps,
+} from './select-sandbox.js';
 import { checkpointExtension } from './checkpoint-extension.js';
 import { budgetVoterExtension, branchSpend } from './budget-voter.js';
 import { toolChoiceExtension } from './tool-choice-extension.js';
@@ -30,6 +34,66 @@ import { toolChoiceExtension } from './tool-choice-extension.js';
 import type { LeafUsage } from './run-leaf.js';
 import { sseExtension, type TurnStreamFrame } from './turn-stream.js';
 import { promotedLoaderOptions, type PromotedConfig } from './config-resolver.js';
+import { leaseTimings } from './lease-timings.js';
+
+// Re-exported because they are now part of executeTurn's CONTRACT: since /turn leases from the pool,
+// every caller of executeTurn can be handed these errors and needs to distinguish them from a generic
+// failure (both are transient — a 503, not a 500). harness/package.json exposes no ./select-sandbox
+// subpath, and this is the module those callers already import.
+export { SandboxPoolSaturatedError, SandboxPoolEmptyError };
+
+/**
+ * One session store per process, not per turn.
+ *
+ * `executeTurnCore` used to `new RedisSessionBackend(...)` on every call and never close it. Its
+ * constructor connects eagerly, so each turn leaked one live Redis connection — and this predates
+ * the supervisor, but the supervisor is what makes it fatal: before P6 a turn was served by a
+ * Knative container that went away afterwards, whereas a supervisor worker is process-lived and
+ * admits S concurrent turns for hours. The leak then climbs to `maxclients` (10000), Redis answers
+ * `ERR max number of clients reached`, and node-redis raises that as an `'error'` on a client with
+ * no listener, so every worker exits at once. Measured: all four died simultaneously ~13 minutes
+ * into a sustained ladder.
+ *
+ * Sharing is safe because the store is stateless per session — the URL is the only construction
+ * input and every method takes the session id — and node-redis multiplexes concurrent commands over
+ * one connection.
+ *
+ * Unlike the stores in select-sandbox.ts there is no drop-on-failure wrapper here, and the reason is
+ * that the hazard such a wrapper guards against — memoising a client that never connected — is now
+ * fixed at its source instead of worked around at each call site. `RedisSessionBackend` used to
+ * assign `ready` once in its constructor and never reassign it, so a rejected `connect()` poisoned
+ * every later method call on that instance forever; memoising one process-wide would then have
+ * traded a bounded per-turn leak for an unbounded outage, and in the very window the leak never
+ * mattered in (the first turn after boot). It now RE-ARMS: a failed attempt clears itself so the
+ * next call reconnects (packages/session-backend/src/redis-backend.ts, `arm()`), which fixes it for
+ * every caller of the class rather than for this memo alone.
+ *
+ * Worth knowing which failures reach that path: probed on the pinned redis@6.2.1, both shapes do — a
+ * REFUSED connect rejects with `ECONNREFUSED`, and a black-holed SYN rejects once the 5s
+ * `connectTimeout` raises `ConnectionTimeoutError`. In a cluster the second is the one to expect: a
+ * Service with no ready endpoints, or a NetworkPolicy drop, black-holes the SYN instead of refusing
+ * it.
+ *
+ * The re-arm handles the promise channel. A socket lost AFTER connecting is the event channel, and
+ * that one is fatal without an `'error'` listener regardless of any memoisation — hence
+ * `swallowRedisErrors`, which every long-lived client here now registers.
+ */
+let sessionStoreMemo: { url: string; store: RedisSessionBackend<FileEntry> } | null = null;
+
+function sharedSessionStore(url: string): RedisSessionBackend<FileEntry> {
+  if (!sessionStoreMemo || sessionStoreMemo.url !== url) {
+    // A changed REDIS_URL is a different Redis; replace rather than silently address the old one.
+    if (sessionStoreMemo) void sessionStoreMemo.store.close().catch(() => {});
+    sessionStoreMemo = { url, store: new RedisSessionBackend<FileEntry>(url) };
+  }
+  return sessionStoreMemo.store;
+}
+
+/** Test-only: drop the cached session store. */
+export function resetSharedSessionStore(): void {
+  if (sessionStoreMemo) void sessionStoreMemo.store.close().catch(() => {});
+  sessionStoreMemo = null;
+}
 
 /**
  * The sandbox a turn's tool calls run in: a resolved pod/pool config (null ⇒ run tools in the
@@ -43,18 +107,124 @@ export interface TurnSandbox {
 }
 
 /**
- * Decide which sandbox a turn runs its tools in. A caller that has already leased one (a prompt
- * leaf, which must reach the very sandbox it holds a lease on — including a remote one behind the
- * relay) injects it and env resolution is skipped entirely. `/turn` injects nothing and keeps the
- * original behavior: resolve from the environment, or null for local tools.
+ * A turn's sandbox plus the lease lifecycle that keeps it. `leased` is true ONLY when THIS call
+ * took the lease, which is what makes `heartbeat`/`release` safe to drive unconditionally: for an
+ * injected sandbox the caller owns the lease, and renewing or returning someone else's would let
+ * one turn release the sandbox another turn is still executing in.
  */
-export async function resolveTurnSandbox(
+export interface AcquiredTurnSandbox {
+  sandbox: TurnSandbox;
+  leased: boolean;
+  /** Renew this call's lease. A no-op unless `leased`. */
+  heartbeat: () => Promise<void>;
+  /** Return this call's lease. A no-op unless `leased`. */
+  release: () => Promise<void>;
+}
+
+/**
+ * The id a turn holds its sandbox lease under. Unique per TURN — never the session id.
+ *
+ * Named for what it identifies (the lease's HOLDER) rather than a "run": #279 established that `run`
+ * is not a harness concept and that the old lease `runId` was `session_id` under another name. This
+ * value is the counter-example that makes the identity real — it MUST differ from the session id, for
+ * the two reasons below — so it gets its own descriptive name, as docs/glossary.md prescribes.
+ *
+ * The holder id is the ZSET *member* in `ACQUIRE_LUA` (sandbox-lease.ts), not a payload, so a repeated
+ * value is one lease rather than two: `ZADD` on an existing member updates its score and leaves
+ * `ZCARD` unchanged. A session id is stable across every turn of a session by design (that is what
+ * lets `:openFromCheckpoint` reopen one), so deriving the holder from it would have made the RESUME
+ * path — the one the supervisor exists to serve — the path that shares leases, and broken the pool
+ * two ways:
+ *
+ *  - **The cap undercounts.** N concurrent turns of one session occupy ONE slot, so with
+ *    `KAGENTI_SANDBOX_CAP=20` a single session can pile arbitrarily many turns onto one pod while the
+ *    pool still reports headroom — deflating the very saturation accounting `SandboxPoolSaturatedError`
+ *    and its new 503 are computed from.
+ *  - **The first turn to finish releases a sandbox another is still using.** `release` is `zRem`, so
+ *    one turn's `finally` removes the shared member while its sibling is mid-execution; the pod then
+ *    reads as free for new work, and the sibling's heartbeat (`zAdd`) resurrects the member seconds
+ *    later, so `load()` returns a different answer depending on where in the heartbeat interval it is
+ *    sampled.
+ *
+ * The session id is prefixed for greppability only — nothing reads the holder back, and the UUID is
+ * what carries the uniqueness. The session id itself still reaches `selectPoolSandbox` separately,
+ * because it is what keys the microVM workspace and must stay stable across a session's turns.
+ */
+export function turnLeaseHolder(sessionId?: string): string {
+  return `${sessionId ?? 'anon'}:${randomUUID()}`;
+}
+
+/**
+ * Decide which sandbox a turn runs its tools in, and lease it when it comes from a pool.
+ *
+ * A caller that has already leased one (a prompt leaf, which must reach the very sandbox it holds
+ * a lease on — including a remote one behind the relay) injects it, and resolution is skipped.
+ *
+ * `/turn` injects nothing, and this is where its behavior CHANGED. It used to call
+ * `resolveSandboxConfig` alone — the single-pod path — so it ignored
+ * `KAGENTI_SANDBOX_POOL_SELECTOR`, `SH_SANDBOX_DISCOVERY` and `SH_REMOTE_SANDBOX` entirely, and on
+ * a deployment that configured a pool it ran the turn's tool calls in the harness process itself
+ * (ADR 0028 deferred this as "prompt leaves inherit /turn's sandbox routing"; run-leaf.ts closed
+ * it for leaves only). Proven on hardware: a tool call's file landed in the supervisor unit's own
+ * PrivateTmp namespace, never in any sandbox container, while a direct probe of the relay's Exec
+ * RPC reached the pool fine at the same moment.
+ *
+ * Going through `selectPoolSandbox` is what makes the no-pool path safe **by construction** rather
+ * than by care: its own first branch is `if (!selector) return resolveSandboxConfig(...)`, i.e.
+ * exactly the call this function used to make, with a no-op lease. A deployment with no
+ * `KAGENTI_SANDBOX_POOL_SELECTOR` therefore resolves identically to before, and no future caller
+ * of `executeTurn` can bypass this seam to get the old behavior back.
+ *
+ * One intended behavior change beyond routing: with a selector set and NO candidates,
+ * `selectPoolSandbox` throws rather than falling back. Previously such a deployment silently ran
+ * tools locally, which is the failure §5.4 exists to prevent — a turn that cannot reach the
+ * sandbox it is configured to use is not a turn that should quietly succeed.
+ */
+export async function acquireTurnSandbox(
   injected: TurnSandbox | undefined,
   env: NodeJS.ProcessEnv,
   headCwd: string,
-): Promise<TurnSandbox> {
-  if (injected) return injected;
-  return { config: await resolveSandboxConfig(env, headCwd) };
+  sessionId: string | undefined,
+  deps: SelectDeps = {},
+): Promise<AcquiredTurnSandbox> {
+  const noop = async () => {};
+  if (injected) return { sandbox: injected, leased: false, heartbeat: noop, release: noop };
+
+  // Same knobs and defaults as every leaf's call, deliberately: two lease conventions for one lease
+  // store is how a cap means different things depending on which path took it. That is now ONE shared
+  // reader rather than the same `Number(env.X ?? …)` repeated at each of the four lease-taking paths,
+  // so hardening it (an empty or unparseable value no longer becoming 0/NaN) could not harden this
+  // path and leave a leaf behind.
+  const { cap, ttlMs } = leaseTimings(env);
+  // The holder is derived HERE rather than taken from the caller, so a per-turn id cannot be forgotten
+  // at one of several call sites — the M1 defect was exactly one such expression.
+  const holderId = turnLeaseHolder(sessionId);
+  const selected = await selectPoolSandbox(
+    env,
+    headCwd,
+    // An anonymous turn has no session, so there is no continuity to preserve and no shared workspace
+    // it should join: keying it by its unique holder gives it its own, which is the correct answer for
+    // a one-off. Sharing a literal 'anon' workspace across unrelated turns would be the cross-turn
+    // bleed spec §2.3 is about, and an EMPTY key is refused outright by microvm-worker (§3.4).
+    sessionId ?? holderId,
+    { cap, ttlMs, holderId, remoteSandbox: env.SH_REMOTE_SANDBOX === '1' },
+    deps,
+  );
+  if (!selected)
+    return { sandbox: { config: null }, leased: false, heartbeat: noop, release: noop };
+
+  // `leased` comes from the seam rather than from re-reading the environment here. It is false on the
+  // single-pod path even though selectPoolSandbox returned a value: that branch has no lease behind
+  // its no-op heartbeat/release, and arming a renewal timer for it would add an interval to every turn
+  // on every non-pool deployment — which would show up in the very loop_lag_p99 figure E8 reads.
+  // Re-deriving it (`Boolean(env.KAGENTI_SANDBOX_POOL_SELECTOR)`, agreeing with selectPoolSandbox's
+  // own `if (!selector)`) worked, but duplicated that predicate across two files.
+  return {
+    sandbox: { config: selected.config, transport: selected.transport },
+    leased: selected.leased,
+    heartbeat: selected.heartbeat,
+    release: selected.release,
+  };
 }
 
 /**
@@ -430,19 +600,75 @@ export interface ExecuteTurnInput {
 }
 
 /**
- * Shared turn core: opens (or, when createIfAbsent, creates) a session, wires the extension
- * stack, resolves the model, runs one Pi turn, and extracts text + best-effort usage.
+ * Shared turn entry point: opens (or, when createIfAbsent, creates) a session, leases a sandbox for
+ * the turn's tool calls, then hands both to the core, which wires the extension stack, resolves the
+ * model, runs one Pi turn, and extracts text + best-effort usage.
  *
  * runTurn (`/turn`) binds createIfAbsent:false — a missing session id 404s ("no session in
  * backend"). A prompt leaf binds createIfAbsent:true — a fresh id creates, a re-dispatched id
  * resumes — and may pass a pre-resolved `selection` (leaf precedence over /turn's config default).
+ *
+ * The two steps are in that order on purpose, and the order is pinned: see the note below.
  */
 export async function executeTurn(input: ExecuteTurnInput): Promise<TurnResult> {
-  const { prompt, sessionId, config, createIfAbsent } = input;
-  const redisUrl = config?.redisUrl ?? 'redis://localhost:6379';
-  const cwd = config?.cwd ?? process.cwd();
+  const cwd = input.config?.cwd ?? process.cwd();
 
-  const store = new RedisSessionBackend<FileEntry>(redisUrl);
+  // Open the session BEFORE acquiring, because the two failures are not equal: a missing session is
+  // permanent (404 `session_not_found`) and no capacity is transient (503). Acquiring first threw the
+  // capacity error before the 404 could be raised, so a `/turn` for a session that will never exist
+  // was told to retry — every such request, in `records` mode with nothing attached yet — and it did
+  // a pod list, N `lease.load()`s and an acquire/release on the way to failing. Ordering is the whole
+  // fix; `turnErrorStatus` already prefers the 404, it just never got the chance to.
+  const opened = await openTurnSession(input, cwd);
+
+  // The lease lifecycle stays HERE rather than in executeTurnCore so that every exit path returns it:
+  // a normal return, a throw, and an abort (input.signal → session.abort(), which resolves the prompt
+  // and unwinds through this finally). A leaked lease would hold a pool slot for its full TTL and, at
+  // E8's concurrency, starve the pool it is meant to measure.
+  const acquired = await acquireTurnSandbox(input.sandbox, process.env, cwd, input.sessionId);
+
+  let leaseRenewal: ReturnType<typeof setInterval> | undefined;
+  if (acquired.leased) {
+    // leaseTimings, not Number(env.X ?? …): an empty or unparseable KAGENTI_SANDBOX_HEARTBEAT_MS
+    // yielded 0/NaN, which setInterval clamps to 1 ms — ~1000 renewals a second per in-flight turn,
+    // against the Redis this change exists to relieve. It also clamps the interval inside the TTL.
+    leaseRenewal = setInterval(() => {
+      // Best-effort: a failed renewal must not reject into an unhandled rejection and kill the
+      // worker. The lease's TTL expiring is the safe outcome — the sandbox returns to the pool.
+      void acquired.heartbeat().catch(() => {});
+    }, leaseTimings(process.env).heartbeatMs);
+  }
+
+  try {
+    return await executeTurnCore(input, acquired.sandbox, opened);
+  } finally {
+    // Clear first, then release: if release throws, the interval is already gone rather than
+    // left running against a lease nobody holds.
+    if (leaseRenewal) clearInterval(leaseRenewal);
+    await acquired.release().catch(() => {});
+  }
+}
+
+/** The session a turn runs in, plus the store and buffered backend its extensions are wired to. */
+interface OpenedTurnSession {
+  store: RedisSessionBackend<FileEntry>;
+  backend: BufferedRedisBackend;
+  sessionManager: Awaited<ReturnType<typeof SessionManager.openFromCheckpoint>>;
+}
+
+/**
+ * Open (or, when createIfAbsent, create) the turn's session.
+ *
+ * Split out of executeTurnCore so `executeTurn` can run it ahead of the pool acquire — see the note
+ * there. Everything it builds is handed on, so the split adds no second store or backend.
+ */
+async function openTurnSession(input: ExecuteTurnInput, cwd: string): Promise<OpenedTurnSession> {
+  const { sessionId, config, createIfAbsent } = input;
+  const redisUrl = config?.redisUrl ?? 'redis://localhost:6379';
+
+  // Shared per process, not per turn — see sharedSessionStore's note. One connection per turn leaked
+  // to maxclients and killed every worker simultaneously on a sustained run.
+  const store = sharedSessionStore(redisUrl);
   const backend = new BufferedRedisBackend(store);
 
   let sessionManager;
@@ -468,14 +694,28 @@ export async function executeTurn(input: ExecuteTurnInput): Promise<TurnResult> 
     sessionManager = SessionManager.create(cwd, undefined, undefined, backend);
   }
 
+  return { store, backend, sessionManager };
+}
+
+async function executeTurnCore(
+  input: ExecuteTurnInput,
+  turnSandbox: TurnSandbox,
+  opened: OpenedTurnSession,
+): Promise<TurnResult> {
+  const { prompt, config } = input;
+  const cwd = config?.cwd ?? process.cwd();
+  // Opened by executeTurn ahead of the pool acquire, so a missing session 404s before any lease work.
+  const { store, backend, sessionManager } = opened;
+
   const agentDir = getAgentDir();
   const settingsManager = SettingsManager.create(cwd, agentDir);
 
   const budgetLimit = Number(process.env.SH_BUDGET_TOKENS);
   const budgetMargin = Number(process.env.SH_BUDGET_MARGIN);
-  // resolveTurnSandbox returns exactly k8sSandboxExtension's argument, and is handed over
-  // untransformed below — so a leased transport cannot be dropped by a field-by-field rebuild here.
-  const sandbox = await resolveTurnSandbox(input.sandbox, process.env, cwd);
+  // acquireTurnSandbox (called by executeTurn, which owns the lease lifecycle) hands back exactly
+  // k8sSandboxExtension's argument, and it is passed on untransformed below — so a leased
+  // transport cannot be dropped by a field-by-field rebuild here.
+  const sandbox = turnSandbox;
   // Surface whether sandbox routing actually resolved: a null config means tool calls run in
   // the harness pod's own filesystem (local), not a sandbox pod — a common cause of "the file
   // never appeared in the sandbox". Cheap one-line signal in container logs.

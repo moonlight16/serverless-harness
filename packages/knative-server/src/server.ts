@@ -182,14 +182,70 @@ async function handleTurn(req: IncomingMessage, res: ServerResponse): Promise<vo
     res.writeHead(200, JSON_HEADERS).end(JSON.stringify(result));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    const status = message.includes('no session in backend') ? 404 : 500;
-    res.writeHead(status, JSON_HEADERS).end(
+    const status = turnErrorStatus(err);
+    res.writeHead(status, turnErrorHeaders(status)).end(
       JSON.stringify({
         error: status === 404 ? 'session_not_found' : message,
         ...(sessionId ? { sessionId } : {}),
       }),
     );
   }
+}
+
+/**
+ * HTTP status for a failed turn. Shared by the sync path and the SSE pre-first-frame window
+ * because §3.4 regime 2 requires the two to be byte-identical, and they were two duplicated
+ * blocks — which is exactly how such a pair drifts the moment one of them grows a case.
+ *
+ * 503 for a pool with no capacity, not 500: whether every candidate sandbox is at its cap
+ * (`SandboxPoolSaturatedError`) or there is no candidate yet (`SandboxPoolEmptyError` — pods
+ * rolling, an HPA scaling from zero, presence records not re-mirrored after a restart), the turn can
+ * succeed on a retry, and a 500 tells the caller it never can. `/runs` already treats saturation this
+ * way (it bounded-waits then 503s) and `classifyOutcome` keeps BOTH retryable for the async queue, so
+ * returning 500 here would make one signal mean two different things depending on the route.
+ *
+ * The two are deliberately not distinguished: from the caller's side "no capacity right now, retry"
+ * is one fact, and splitting it would only invite a client to treat one as fatal.
+ *
+ * Matched on the error's own `name` marker rather than `instanceof`, and rather than another
+ * message substring. `name` is set in each class's constructor, so it is class identity and not
+ * prose — a reworded message cannot change an HTTP status, which is the trap the
+ * `no session in backend` line below already sits in and which is not worth extending.
+ *
+ * `instanceof` would be the idiom (run-leaf.ts uses it for this very class) but it is only sound
+ * WITHIN the harness package. Reaching across the workspace boundary makes the status depend on
+ * both packages resolving the identical module instance — which is false whenever a test mocks
+ * `@sh/harness/run-turn` wholesale, as server.test.ts does: the import then yields vitest's
+ * "no export" stub and `instanceof` throws, turning three unrelated turn errors into 500s. That
+ * was observed, not hypothesised. The paired test constructs the REAL class, so this string stays
+ * pinned to the class rather than drifting from it.
+ */
+const NO_CAPACITY = new Set(['SandboxPoolSaturatedError', 'SandboxPoolEmptyError']);
+
+export function turnErrorStatus(err: unknown): number {
+  if (err instanceof Error && NO_CAPACITY.has(err.name)) return 503;
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes('no session in backend') ? 404 : 500;
+}
+
+/**
+ * Response headers for a failed turn — i.e. `Retry-After` on the 503s, from the same knob `/runs`
+ * advertises (`KAGENTI_SYNC_SATURATION_RETRY_AFTER_S`).
+ *
+ * The 503 above takes `/runs` as its precedent, and `/runs` does two things with saturation: it
+ * bounded-waits, and it tells the client when to come back. Adopting the status without the header
+ * left a client that honours `Retry-After` with no hint from the one route whose answer is "retry" —
+ * so the reasoning about not letting one signal mean two things by route argued for carrying it.
+ *
+ * The bounded wait is deliberately NOT carried over. On `/runs` it is sound because
+ * `selectPoolSandbox` throws before taking a lease or doing agent work, so re-running `runLeaf` only
+ * re-attempts acquisition (see §4.3 above); on `/turn` the session is already open by the time the
+ * acquire runs, and re-entering `executeTurn` to retry would re-open it. That asymmetry is real and
+ * E8 reads the region it shows up in, so it is worth stating rather than quietly matching.
+ */
+export function turnErrorHeaders(status: number): Record<string, string> {
+  if (status !== 503) return JSON_HEADERS;
+  return { ...JSON_HEADERS, 'Retry-After': String(saturationWaitConfig().retryAfterS) };
 }
 
 // Serialize frames to the SSE wire form, flushing SSE headers on the FIRST frame (lazy flush →
@@ -260,8 +316,8 @@ async function handleTurnStream(
       // Pre-first-frame: nothing streamed yet, so reuse the EXACT sync mapping — a bad sessionId
       // still returns real 404 JSON, byte-identical to the sync path (§3.4 regime 2).
       const message = err instanceof Error ? err.message : String(err);
-      const status = message.includes('no session in backend') ? 404 : 500;
-      res.writeHead(status, JSON_HEADERS).end(
+      const status = turnErrorStatus(err);
+      res.writeHead(status, turnErrorHeaders(status)).end(
         JSON.stringify({
           error: status === 404 ? 'session_not_found' : message,
           ...(sessionId ? { sessionId } : {}),

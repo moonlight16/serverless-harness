@@ -70,7 +70,6 @@ const RUNTIME_FIELDS = [
   'sandboxPod',
   'sandboxSelector',
   'leaseKey',
-  'runId',
   'lastTurnAt',
   'turns',
   // A best-effort in-flight HINT, used only to choose 202 vs 204 on delete (plan gap #11). Never

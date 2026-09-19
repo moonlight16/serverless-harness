@@ -133,11 +133,12 @@ describe('projectResources', () => {
   it('reports a leaf-job harness and a lease when the runtime hash carries one', async () => {
     const out = projectResources(
       rec,
-      { harnessPod: 'leaf-worker-abc', leaseKey: 'sh:sandbox:sandbox-0-0:leases', runId: 'run-9' },
+      { harnessPod: 'leaf-worker-abc', leaseKey: 'sh:sandbox:sandbox-0-0:leases' },
       { podName: 'sandbox-0-0', phase: 'Running', tenant: 'github:1234' },
     ) as Record<string, Record<string, unknown> | null>;
     expect(out.harness!.mode).toBe('leaf-job');
-    expect(out.lease).toMatchObject({ key: 'sh:sandbox:sandbox-0-0:leases', runId: 'run-9' });
+    expect(out.lease).toMatchObject({ key: 'sh:sandbox:sandbox-0-0:leases' });
+    expect(out.lease).not.toHaveProperty('runId');
   });
 
   it('reports ready:false and a null pod when the harness never self-reported', async () => {

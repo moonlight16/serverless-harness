@@ -4,9 +4,10 @@ import type { SessionRecord } from './ownership.js';
 /**
  * The /resources projection (spec §7.4).
  *
- * There is no session -> pod index in the tree (spec §2.4: leases are a ZSET whose member is the RUN
- * id, not the session id), so the harness SELF-REPORTS into sh:cp:session:<sid>:runtime. That hash is
- * written by the brain tier, so it is untrusted, DISPLAY-ONLY data and is never consulted for authz
+ * There is no session -> pod index in the tree (spec §2.4: leases are a ZSET keyed by pod, with the
+ * sanitized session id as the member -- see docs/glossary.md), so the harness SELF-REPORTS into
+ * sh:cp:session:<sid>:runtime. That hash is written by the brain tier, so it is untrusted,
+ * DISPLAY-ONLY data and is never consulted for authz
  * -- which is why this module emits only fields it knows by name rather than spreading the hash.
  *
  * Fail-soft throughout: for an introspection endpoint, partial data with explicit unknowns beats an
@@ -78,7 +79,6 @@ export function projectResources(
     lease: runtime.leaseKey
       ? {
           key: runtime.leaseKey,
-          runId: runtime.runId ?? null,
           expiresAt: null,
           ttlSeconds: null,
         }
