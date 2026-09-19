@@ -487,7 +487,7 @@ exec_client_label() {
 # those four would be expanded or reinterpreted by bash and/or python before the writer ever ran.
 driver_control_note_for() {
   case "$1" in
-  go) printf '%s' "driver-control is a lower bound on driver-only cost on the Go path too, not a demonstrably tighter one: the Go client decodes the same ExecEvent stream on every arm via stream.Recv(), while grpcurl JSON-formats every received message even when it writes to /dev/null on this arm -- a real difference in decode cost, but as a fraction of the driver-only measurement here (roughly 50x smaller than on the grpcurl path) its net effect on tightness is UNMEASURED (#294)." ;;
+  go) printf '%s' "driver-control is a lower bound on driver-only cost on the Go path too, not a demonstrably tighter one: the Go client decodes the same ExecEvent stream on every arm via stream.Recv(), while grpcurl JSON-formats every received message even when it writes to /dev/null on this arm -- a real difference in decode cost, but as a fraction of the driver-only measurement its net effect on tightness is UNMEASURED (#294)." ;;
   *) printf '%s' "driver-control is a STRICT LOWER BOUND on driver-only cost, not an exact one: the null-responder sends one End and no Chunk events, so grpcurl never decodes a chunk-carrying stream on this arm, while real Execs for mix commands that produce stdout do decode one or more Chunk events per call on the container/microvm arms. Subtracting driver-control latency therefore over-attributes some residue to the backend rather than the driver (#291 item 3)." ;;
   esac
 }
@@ -1930,7 +1930,7 @@ run_density_rung() {
   cpu_samples="$(require_numeric hostCpuSamples "$(sampler_field "$sampler_file" 1 count)")" ||
     die "rung arm=$arm c=$c could not count its own host samples (see the refusal above)"
   [ "$cpu_samples" -gt 0 ] ||
-    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c produced ZERO host samples over its timed window ($sampler_file is empty), so it has no under-load hostCpuFraction, memAvailableBytes, pssBytes or processCount at all. Refusing to backfill from the post-load snapshot: that idle reading IS the defect issue #291 item 1 is about, and crosses('cpu') can never fire on one. The window was shorter than ${SAMPLE_MIN_TICK_MS}ms - raise SH_E11_ITERS_PER_SLOT, or lower SH_E11_SAMPLE_INTERVAL_MS and SH_E11_SAMPLE_MIN_TICK_MS."
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c produced ZERO host samples over its timed window ($sampler_file is empty), so it has no under-load hostCpuFraction, memAvailableBytes, pssBytes or processCount at all. Refusing to backfill from the post-load snapshot: that idle reading IS the defect issue #291 item 1 is about, and crosses('cpu') can never fire on one. The window was shorter than ${SAMPLE_MIN_TICK_MS}ms - lower SH_E11_SAMPLE_INTERVAL_MS, SH_E11_SAMPLE_MIN_TICK_MS and SH_E11_SAMPLE_SLICE_MS (the tick floor is SAMPLE_SLICE_MS, currently ${SAMPLE_SLICE_MS}ms, because slices_per_tick is SAMPLE_INTERVAL_MS/SAMPLE_SLICE_MS floored at 1). Raising SH_E11_ITERS_PER_SLOT also works for a SINGLE ladder, but NOT when you are comparing two clients: both arms must issue the same Exec count per slot to stay comparable, so fix the cadence instead."
   # A thin rung is legitimate (a fast arm at low c) and is NOT refused -- but it must not pass
   # unremarked, because hostCpuSamples is easy to miss in a 30-field record and a 1-2 sample mean
   # cannot support a saturation verdict. Warn at run time, where the operator is actually looking.

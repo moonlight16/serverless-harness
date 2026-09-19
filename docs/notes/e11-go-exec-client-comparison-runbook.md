@@ -47,8 +47,13 @@ mv deploy/microvm/.results deploy/microvm/.results-go
   produced fewer than five. The reference run's 15–103 is healthy at these settings. A
   faster client finishes its window sooner, so the Go run's tick counts will be lower --
   but what has to change is **sampler cadence, not Exec count**: lower
-  `SH_E11_SAMPLE_INTERVAL_MS` and/or `SH_E11_SAMPLE_MIN_TICK_MS` until the Go run clears at
-  least 10 ticks at the **same** `ITERS_PER_SLOT=200` the reference table used. Raising
+  `SH_E11_SAMPLE_INTERVAL_MS`, `SH_E11_SAMPLE_MIN_TICK_MS` **and `SH_E11_SAMPLE_SLICE_MS`**
+  until the Go run clears at least 10 ticks at the **same** `ITERS_PER_SLOT=200` the
+  reference table used. `SAMPLE_SLICE_MS` matters and is easy to miss: `host_sampler_loop`
+  computes `slices_per_tick` as `SAMPLE_INTERVAL_MS / SAMPLE_SLICE_MS` floored at 1, so once
+  `SAMPLE_INTERVAL_MS` reaches `SAMPLE_SLICE_MS` (default 100 ms) lowering it further has no
+  effect at all — the floor is `SAMPLE_SLICE_MS`, and 10 ticks inside a sub-200 ms window
+  needs both of them well below 100 ms. Raising
   `ITERS_PER_SLOT` for the Go arm alone is wrong here: it moves the one variable this
   runbook exists to hold fixed (both arms must issue the same Exec count per slot to stay
   comparable), and it papers over a cadence problem with more work instead of a faster
