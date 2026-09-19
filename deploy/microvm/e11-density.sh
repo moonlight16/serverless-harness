@@ -494,8 +494,8 @@ driver_control_note_for() {
 
 exec_error_note_for() {
   case "$1" in
-  go) printf '%s' "an in-stream ExecEvent.error is recorded as status=err with its cause classified from the message. The grpcurl path records it as ok, because the relay yields that event and then returns a gRPC OK status. The two clients therefore DISAGREE on throughput, p95 and execErrorsByCause for any rung that produced ExecErrors on the container or microvm arms; they agree exactly on driver-control, where the null-responder never sends one (#294)." ;;
-  *) printf '%s' "an in-stream ExecEvent.error is recorded as status=ok. The relay yields that event and then returns a gRPC OK status, so grpcurl exits 0: an ExecError-failed Exec counts toward throughput, enters the distribution p95 is taken over, and never reaches execErrorsByCause. Pre-existing on this path and fixed on the go path (#294)." ;;
+  go) printf '%s' "an in-stream ExecEvent.error is recorded as status=err with its cause classified from the message. The grpcurl path records it as ok, because the relay yields that event and then returns a gRPC OK status. The two clients therefore DISAGREE on throughput, p95 and execErrorsByCause for any rung that produced ExecErrors on the container or microvm arms; they agree exactly on driver-control, where the null-responder never sends one (#294; the relay defect itself is issue #295)." ;;
+  *) printf '%s' "an in-stream ExecEvent.error is recorded as status=ok. The relay yields that event and then returns a gRPC OK status, so grpcurl exits 0: an ExecError-failed Exec counts toward throughput, enters the distribution p95 is taken over, and never reaches execErrorsByCause. Pre-existing on this path and fixed on the go path (#294; the relay defect itself is issue #295)." ;;
   esac
 }
 

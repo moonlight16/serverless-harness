@@ -57,7 +57,7 @@ It does not touch this issue's comparison. The null-responder only ever sends `E
 on the `driver-control` arm the two drivers are identical by construction, and the Go
 client can classify `ExecEvent.error` correctly at zero cost to the single-variable
 comparison. It is therefore fixed on the Go path, disclosed in the record, and reported
-for its own issue rather than folded in silently.
+for its own issue rather than folded in silently. Filed as #295.
 
 ## Non-goals
 

@@ -724,7 +724,7 @@ Driver: `deploy/microvm/e10-lifecycle.sh`; cluster-free proof of its structure:
 >   `packages/sandbox-relay/src/relay.ts`'s `routeExec` does this, so `grpcurl` exits 0 and a
 >   failed Exec counts toward `throughput` and into the `p95` distribution instead of ever
 >   reaching `execErrorsByCause`. It affects the published `throughput`, `p95` and
->   `coldAcquireRate` on the container and microvm arms above; not yet tracked by an issue.
+>   `coldAcquireRate` on the container and microvm arms above. Tracked as issue #295.
 >
 > The numbers stay. They are the record of what the broken instrument produced, and the
 > re-run is defined by comparison against them. Rung records written by the repaired driver

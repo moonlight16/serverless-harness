@@ -80,7 +80,7 @@ mv deploy/microvm/.results deploy/microvm/.results-go
   microvm run: the unscoped `firecracker` pattern matched another user's shell on the metal
   box, and under `sudo` a foreign process's PSS would be summed in.
 - **Sequencing, before this comparison extends past `driver-control`.** The relay's
-  `routeExec`-yields-`ExecEvent.error`-then-returns-OK defect (see `EXPERIMENTS.md` §E11)
+  `routeExec`-yields-`ExecEvent.error`-then-returns-OK defect (issue #295, and `EXPERIMENTS.md` §E11)
   makes zero difference here: the null-responder only ever sends `End`, so on
   `driver-control` the two clients are identical by construction and there is nothing for
   that defect to touch. It is not zero difference on `container`/`microvm` -- fix the relay
