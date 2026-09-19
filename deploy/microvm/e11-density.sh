@@ -292,10 +292,13 @@ CONVERGE_MAX_TIME_S="${SH_E11_CONVERGE_MAX_TIME_S:-360}" # guards timeout_s:300
 # Why this is opt-in rather than a replacement: measured on metal with the driver-control arm
 # (no relay, no Redis, no worker, no VMM), the grpcurl driver ALONE peaked at c=8 and then
 # declined, burning 64 of 72 cores at c=64 with its own p95 of 753ms -- the same knee position
-# and curve shape EXPERIMENTS.md published for both real arms. The Go client exists to remove
-# that, but the number that proves it must come from running BOTH against the null-responder on
-# one host with nothing else changed. Until that comparison exists, the bash path is the
-# reference and stays the default.
+# and curve shape EXPERIMENTS.md published for both real arms. (That 753ms is PR #293's
+# repaired driver at ITERS_PER_SLOT=200; EXPERIMENTS.md's own published 1686ms is the pre-#291
+# driver at ITERS_PER_SLOT=20 -- different drivers at different counts, a mismatch that runs
+# in this finding's favor, not against it.) The Go client exists to remove that, but the
+# number that proves it must come from running BOTH against the null-responder on one host
+# with nothing else changed. Until that comparison exists, the bash path is the reference and
+# stays the default.
 EXEC_CLIENT="${SH_E11_EXEC_CLIENT:-grpcurl}"
 # Built once per run by build_exec_driver, beside the null-responder's binary.
 E11_EXEC_DRIVER_BIN="$RESULTS/.e11-exec-driver-bin"
@@ -479,10 +482,12 @@ exec_client_label() {
 # so the suite can drive both paths in isolation -- the branch that chose between these strings used
 # to live inline in run_density_rung, where no test could reach it, and a swap between the two would
 # have made every go-driven record assert something false about its own trustworthiness.
-# Neither string may contain an apostrophe: both are interpolated into single-quoted python literals.
+# Neither string may contain an apostrophe, a dollar sign, a backtick, or a backslash: both reach
+# the record writer's python3 -c "..." body through a DOUBLE-quoted bash string (below), so any of
+# those four would be expanded or reinterpreted by bash and/or python before the writer ever ran.
 driver_control_note_for() {
   case "$1" in
-  go) printf '%s' "driver-control remains a lower bound on driver-only cost, but a tighter one than on the grpcurl path: the Go client decodes the same ExecEvent stream on every arm, so the only residual difference is that the null-responder sends one End and no Chunk, while real Execs for mix commands producing stdout decode one or more Chunk events per call (#294)." ;;
+  go) printf '%s' "driver-control is a lower bound on driver-only cost on the Go path too, not a demonstrably tighter one: the Go client decodes the same ExecEvent stream on every arm via stream.Recv(), while grpcurl JSON-formats every received message even when it writes to /dev/null on this arm -- a real difference in decode cost, but as a fraction of the driver-only measurement here (roughly 50x smaller than on the grpcurl path) its net effect on tightness is UNMEASURED (#294)." ;;
   *) printf '%s' "driver-control is a STRICT LOWER BOUND on driver-only cost, not an exact one: the null-responder sends one End and no Chunk events, so grpcurl never decodes a chunk-carrying stream on this arm, while real Execs for mix commands that produce stdout do decode one or more Chunk events per call on the container/microvm arms. Subtracting driver-control latency therefore over-attributes some residue to the backend rather than the driver (#291 item 3)." ;;
   esac
 }
@@ -1734,8 +1739,11 @@ run_density_rung() {
   done
 
   # The Go client's plan, written HERE -- before wall_t0 -- so nothing it costs lands inside the
-  # timed window (issue #294, and the fork guard in tests/e11-density.test.sh asserts it).
-  local plan_file="$E11_TMPDIR/plan-$rung_tag.json"
+  # timed window (issue #294, and the fork guard in tests/e11-density.test.sh asserts it). It
+  # lives under $RESULTS, not $E11_TMPDIR: cleanup_on_exit rm -rf's $E11_TMPDIR on every exit,
+  # including a refused rung's die, so a plan written there would not survive to be read -- only
+  # $RESULTS (never cleaned) actually makes it the artifact an operator can read after a refusal.
+  local plan_file="$RESULTS/plan-$rung_tag.json"
   if [ "$EXEC_CLIENT" = "go" ]; then
     local -a plan_argv=()
     local plan_cmd
@@ -1748,6 +1756,10 @@ run_density_rung() {
     write_rung_plan "$plan_file" "localhost:${relay_port}" "$sandbox_id" \
       "$ITERS_PER_SLOT" "$WARMUP_PER_SLOT" 30 "$EXEC_MAX_TIME_S" \
       "$mix_expected_count" "$c" "${plan_argv[@]}"
+    # A header BEFORE wall_t0, so it costs nothing inside the timed window: $RESULTS/e11-exec-driver.log
+    # is opened with >> and nothing ever truncates it, so every rung of every run appends untagged --
+    # and the Go refusal below points the operator at exactly this file.
+    printf '== %s\n' "$rung_tag" >>"$RESULTS/e11-exec-driver.log"
   fi
 
   # ---------------------------------------------------------------------------

@@ -723,8 +723,8 @@ check "  ...and does NOT claim status=ok for itself" \
   "$(printf '%s' "$een_go" | grep -Fc 'is recorded as status=ok')" "0"
 check "the grpcurl exec-error disclosure says status=ok" \
   "$(printf '%s' "$een_gc" | grep -Fc 'recorded as status=ok')" "1"
-check "the go driver-control disclosure describes the tighter bound" \
-  "$(printf '%s' "$dcn_go" | grep -Fc 'tighter one than on the grpcurl path')" "1"
+check "the go driver-control disclosure marks the bound's tightness as unmeasured" \
+  "$(printf '%s' "$dcn_go" | grep -Fc 'its net effect on tightness is UNMEASURED')" "1"
 check "the grpcurl driver-control disclosure keeps the STRICT LOWER BOUND wording" \
   "$(printf '%s' "$dcn_gc" | grep -Fc 'STRICT LOWER BOUND')" "1"
 # The two paths must actually differ -- if both branches returned the same string, every check above
@@ -737,9 +737,12 @@ check "the two driver-control disclosures differ between clients" \
 # future third client cannot silently acquire the go disclosures.
 check "an unrecognised client gets the grpcurl disclosures" \
   "$([ "$(eval "$dn_body"; exec_error_note_for xyzzy)" = "$een_gc" ] && echo yes || echo no)" "yes"
-# Apostrophe safety: these are interpolated into single-quoted python literals.
-check "no disclosure contains an apostrophe" \
-  "$(printf '%s%s%s%s' "$dcn_go" "$dcn_gc" "$een_go" "$een_gc" | tr -cd "'" | wc -c | tr -d ' ')" "0"
+# Unsafe-character safety: these disclosure strings are interpolated into the record writer's
+# python3 -c "..." body through a DOUBLE-quoted bash string (deploy/microvm/e11-density.sh), so
+# an apostrophe, a $, a backtick or a backslash in the disclosure text would be expanded or
+# reinterpreted by bash and/or python before the record writer ever ran -- reject all four.
+check "no disclosure contains an apostrophe, a dollar sign, a backtick, or a backslash" \
+  "$(printf '%s%s%s%s' "$dcn_go" "$dcn_gc" "$een_go" "$een_gc" | tr -cd "'\$\`\\\\" | wc -c | tr -d ' ')" "0"
 
 # ---------------------------------------------------------------------------
 # percentile: a missing/empty input is a refusal, not a zero (review 4001908597).
@@ -2815,9 +2818,16 @@ else
     "$seam_dir/null-responder" --listen "127.0.0.1:$seam_port" >"$seam_dir/responder.log" 2>&1 &
     seam_pid=$!
     # A CI timeout or SIGINT between here and the kill below would otherwise leave a gRPC
-    # listener bound to this port for as long as the machine stays up. The trap is cleared
-    # after the normal teardown so it cannot fire twice or mask a later signal.
-    trap 'kill "$seam_pid" 2>/dev/null || true' INT TERM EXIT
+    # listener bound to this port for as long as the machine stays up. Split from a single
+    # combined trap (review item 5): under bash a non-exiting INT/TERM handler returns
+    # control to the script rather than terminating it, so a Ctrl-C or CI SIGTERM only reaped
+    # the listener and let the suite continue -- and if the signal landed after the last seam
+    # check, the suite printed "Total failures: 0" and exited 0 for a job someone cancelled.
+    # The INT/TERM trap now reaps the listener AND re-exits with the conventional 128+signum
+    # status for SIGINT (130), so cancellation is honored; EXIT keeps doing only cleanup. Both
+    # are cleared after the normal teardown so neither can fire twice or mask a later signal.
+    trap 'kill "$seam_pid" 2>/dev/null || true; exit 130' INT TERM
+    trap 'kill "$seam_pid" 2>/dev/null || true' EXIT
     # Wait for the listener rather than sleeping a guessed interval.
     seam_up=no
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do

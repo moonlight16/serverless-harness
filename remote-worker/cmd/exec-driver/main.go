@@ -7,7 +7,9 @@
 // request. Measured on metal with the driver-control arm -- no relay, no Redis, no worker, no
 // VMM -- that driver alone peaked at c=8 and then declined, burning 64 of 72 cores at c=64
 // with its own p95 of 753ms against the published microVM arm's 1686ms. The published knee
-// was the driver's.
+// was the driver's. Those two figures are not the same instrument twice -- 753ms is PR
+// #293's repaired driver at ITERS_PER_SLOT=200, 1686ms is the pre-#291 driver at
+// ITERS_PER_SLOT=20 -- and that mismatch runs in this finding's favor, not against it.
 //
 // This binary is ONE process for a whole rung: one grpc.ClientConn reused across every Exec,
 // and c goroutines in place of c bash subshells. It writes the same per-slot

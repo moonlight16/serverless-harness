@@ -33,7 +33,11 @@ Every millisecond and every cycle in that table is driver overhead. Three things
    cannot attribute a resource bound to a backend while the load generator is consuming
    the resource.
 3. **The driver's own p95 is ~45% of the published microVM arm's.** 753 ms of the published
-   1686 ms at `c=64` is driver cost, before the backend does anything.
+   1686 ms at `c=64` is driver cost, before the backend does anything. The two figures are
+   not the same instrument twice: 753 ms is PR #293's repaired driver at
+   `ITERS_PER_SLOT=200`; 1686 ms is the pre-#291 driver at `ITERS_PER_SLOT=20`. That
+   mismatch runs in this finding's favor, not against it — the older, costlier driver's
+   share of 1686 ms was probably larger, not smaller.
 
 The cost is one `execve` per Exec. PR #293 removed the ~8 other spawns per Exec (two of
 them Python interpreters); the remaining one is `grpcurl`, and each invocation re-parses

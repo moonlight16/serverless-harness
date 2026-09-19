@@ -87,7 +87,12 @@ func oneExec(ctx context.Context, client pb.SandboxExecClient, p *plan, s slot, 
 		return fail(err.Error())
 	}
 
+	// sawErr is tracked SEPARATELY from inStream's text: an ExecEvent.error with an empty
+	// message is still a failed Exec, and inStream == "" cannot distinguish that from "no
+	// error was ever received". Gating classification on the string alone silently
+	// reclassified an empty-message in-stream error as "ok".
 	var inStream string
+	var sawErr bool
 	for {
 		ev, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -96,12 +101,13 @@ func oneExec(ctx context.Context, client pb.SandboxExecClient, p *plan, s slot, 
 		if err != nil {
 			return fail(err.Error())
 		}
-		if e := ev.GetError(); e != nil && inStream == "" {
+		if e := ev.GetError(); e != nil && !sawErr {
+			sawErr = true
 			inStream = e.GetMessage()
 		}
 	}
 	ms := time.Since(t0).Milliseconds()
-	if inStream != "" {
+	if sawErr {
 		return execOutcome{ms: ms, status: "err", cause: causeFor(inStream), errMsg: inStream}
 	}
 	return execOutcome{ms: ms, status: "ok", cause: "-"}

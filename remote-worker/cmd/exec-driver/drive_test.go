@@ -38,6 +38,11 @@ type fakeExec struct {
 	mu     sync.Mutex
 	seen   []seenExec
 	behave func(reqID uint64) (inStreamErr string, statusErr error)
+	// sendEmptyErr, when true, makes every Exec send an ExecEvent.error carrying an EMPTY
+	// message instead of the usual End. behave's own convention (an empty inStreamErr means
+	// "no error") cannot express this case, and it is exactly the case #294's
+	// empty-message-error classification bug needs the fake to be able to produce.
+	sendEmptyErr bool
 }
 
 func (f *fakeExec) Exec(req *pb.ExecRequest, stream grpc.ServerStreamingServer[pb.ExecEvent]) error {
@@ -45,6 +50,10 @@ func (f *fakeExec) Exec(req *pb.ExecRequest, stream grpc.ServerStreamingServer[p
 	f.mu.Lock()
 	f.seen = append(f.seen, seenExec{reqID: e.GetReqId(), command: e.GetCommand(), workspaceKey: e.GetWorkspaceKey(), timeoutS: e.GetTimeoutS()})
 	f.mu.Unlock()
+
+	if f.sendEmptyErr {
+		return stream.Send(&pb.ExecEvent{Event: &pb.ExecEvent_Error{Error: &pb.ExecError{ReqId: e.GetReqId(), Message: ""}}})
+	}
 
 	if f.behave != nil {
 		inStream, statusErr := f.behave(e.GetReqId())
@@ -245,6 +254,24 @@ func TestDriveClassifiesAnInStreamExecErrorAsFailure(t *testing.T) {
 	}
 	if !strings.Contains(string(errBody), "empty workspace_key") {
 		t.Fatalf("err file %q does not carry the message an operator would read", errBody)
+	}
+}
+
+// A bug found and fixed on this branch (#294): an in-stream ExecEvent.error with an EMPTY
+// message must still classify as a failed Exec. Classification was gated on inStream == "",
+// which cannot distinguish "no error was ever received" from "an error was received with an
+// empty message" -- so an empty-message error silently read back as ok.
+func TestDriveClassifiesAnEmptyMessageInStreamErrorAsFailure(t *testing.T) {
+	f := &fakeExec{sendEmptyErr: true}
+	p := planFor(t, startFake(t, f), 1, 2, 0, []string{"true"})
+	if err := drive(context.Background(), p); err != nil {
+		t.Fatalf("drive must not fail the rung over per-Exec errors: %v", err)
+	}
+	for n, l := range readLines(t, p.Slots[0].TimesFile) {
+		fields := strings.Fields(l)
+		if fields[1] != "err" || fields[2] != "unknown" {
+			t.Fatalf("line %d is %q, want status err and cause unknown: an empty-message ExecEvent.error must still be recorded as failed, not ok", n+1, l)
+		}
 	}
 }
 

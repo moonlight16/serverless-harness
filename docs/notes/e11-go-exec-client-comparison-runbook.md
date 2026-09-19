@@ -42,10 +42,34 @@ mv deploy/microvm/.results deploy/microvm/.results-go
 
 ## Before quoting any number
 
-- **`hostCpuSamples` per rung.** A mean of one or two ticks cannot score a saturation
-  verdict, and the driver warns at run time when a rung produced fewer than five. The
-  reference run's 15–103 is healthy at these settings; a faster client produces _shorter_
-  windows, so the Go run's counts will be lower and may need `ITERS_PER_SLOT` raised.
+- **`hostCpuSamples` per rung, and the right knob to fix a low count.** A mean of one or
+  two ticks cannot score a saturation verdict, and the driver warns at run time when a rung
+  produced fewer than five. The reference run's 15–103 is healthy at these settings. A
+  faster client finishes its window sooner, so the Go run's tick counts will be lower --
+  but what has to change is **sampler cadence, not Exec count**: lower
+  `SH_E11_SAMPLE_INTERVAL_MS` and/or `SH_E11_SAMPLE_MIN_TICK_MS` until the Go run clears at
+  least 10 ticks at the **same** `ITERS_PER_SLOT=200` the reference table used. Raising
+  `ITERS_PER_SLOT` for the Go arm alone is wrong here: it moves the one variable this
+  runbook exists to hold fixed (both arms must issue the same Exec count per slot to stay
+  comparable), and it papers over a cadence problem with more work instead of a faster
+  sampler.
+- **If cadence alone still can't reach 10 ticks**, do not reach for `ITERS_PER_SLOT` as a
+  second attempt. Run **two** Go ladders instead, each labelled by the setting that differs
+  from the reference (for example "go, `SAMPLE_INTERVAL_MS=250`" and "go,
+  `SAMPLE_INTERVAL_MS=<lower>`"), so a reader can tell which numbers came from which cadence
+  and none are silently mixed with the `grpcurl` reference's settings.
+- **Treat "the sampler cannot see the Go client's window" as a finding, not a nuisance to
+  route around.** If even the fastest cadence this driver supports still can't resolve the
+  Go arm's per-rung window at `c` values where `grpcurl` needed 250 ms ticks to see
+  15–103 samples, that gap is itself evidence about how much faster the Go client is --
+  record it in `EXPERIMENTS.md` §E11 beside the ladder, not as a footnote explaining away a
+  thin row.
+- **A rung with zero samples is refused, by name.** `run_density_rung` in
+  `deploy/microvm/e11-density.sh` hard-refuses a rung that "produced ZERO host samples over
+  its timed window" rather than backfilling from an idle post-load snapshot. Hitting that
+  refusal on the Go arm is not a bug to route around -- it is the strongest form of the
+  previous finding, and it means cadence has to come down further before this rung's number
+  exists at all.
 - **`execClient` in every record.** If it says `grpcurl-per-exec` in the `.results-go`
   directory, the env var did not take and the comparison is of one client with itself.
 - **`SH_E11_COLD_LATENCY_MS`.** Irrelevant to this comparison's headline numbers but it feeds
@@ -55,6 +79,14 @@ mv deploy/microvm/.results deploy/microvm/.results-go
 - **`SH_E11_VMM_PROC_PATTERN`.** Not used by this arm (no VMM), but scope it before any
   microvm run: the unscoped `firecracker` pattern matched another user's shell on the metal
   box, and under `sudo` a foreign process's PSS would be summed in.
+- **Sequencing, before this comparison extends past `driver-control`.** The relay's
+  `routeExec`-yields-`ExecEvent.error`-then-returns-OK defect (see `EXPERIMENTS.md` §E11)
+  makes zero difference here: the null-responder only ever sends `End`, so on
+  `driver-control` the two clients are identical by construction and there is nothing for
+  that defect to touch. It is not zero difference on `container`/`microvm` -- fix the relay
+  first, before running either client against a real backend, or a `grpcurl`-vs-`go` delta
+  on those arms could be confounded with a change in what one client silently miscounts as
+  `ok`.
 
 ## What the result means
 
