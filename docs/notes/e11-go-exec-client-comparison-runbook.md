@@ -91,23 +91,56 @@ acceptance criteria name.** No host-CPU measurement was taken, `mix` was reduced
 command `true`, and there is no `hostCpuFraction`, `coresBusy` or `hostCpuSamples` in what
 follows — only wall-clock Exec throughput.
 
-Both arms issued the **same total Exec count** at each concurrency: `itersPerSlot=18000` plus
-`warmupPerSlot=3`, i.e. 18003 Execs per slot. That count was chosen empirically on this
-machine, not copied from the brief's illustrative "200" — 200 Execs against the Go client here
-complete in well under 200 ms, which is dominated by process and connection startup and shows
-nothing. Raising `itersPerSlot` until the `c=1` case (the slowest per-slot rate, since it has
-the least concurrency to amortize dial and goroutine setup) cleared roughly 2 seconds of wall
-time landed on 18000: 15000 measured 1.821 s, 16000 measured 1.894 s, 17000 measured 2.099 s,
-18000 measured 2.169 s. The same 18003-per-slot count was then used, unchanged, for the
-`grpcurl` arm.
+### Calibrating the Go arm, then abandoning that count
 
-MEASUREMENT_PENDING_PLACEHOLDER_TABLE_ROW_DO_NOT_COMMIT
+The Go arm was calibrated upward first, to find an `itersPerSlot` whose wall time escapes
+process-startup noise: 200 Execs against the Go client here complete in well under 200 ms,
+which is dominated by process and connection startup and shows nothing. Raising `itersPerSlot`
+on the `c=1` case (the slowest per-slot rate, since it has the least concurrency to amortize
+dial and goroutine setup) until it cleared roughly 2 seconds of wall time landed on 18000: 15000
+measured 1.821 s, 16000 measured 1.894 s, 17000 measured 2.099 s, 18000 measured 2.169 s.
 
-The Go client is MEASUREMENT_PENDING_PLACEHOLDER_DO_NOT_COMMIT faster per Exec on this
-machine. That gap is expected and is not a substitute for the rig comparison: the
-null-responder here answers over loopback with no relay, no proto re-parse cost paid by
-anything but `grpcurl` itself, and no contention from 72 cores' worth of other work. It shows
-only that the mechanical difference the brief predicts — one persistent connection versus one
-`execve` and one fresh HTTP/2 session per Exec — is real and large on this host. Whether it is
-what moved the published `c=8` knee on the 72-core rig is exactly the open question this
-runbook's rig procedure, above, is for.
+That count — 18000 plus `warmupPerSlot=3`, i.e. 18003 Execs per slot — was then **abandoned**
+for the paired run below, because the constraint that both arms issue identical Exec counts
+makes `grpcurl`, not `go`, the binding cost. At the `grpcurl` rate this run measured (38.4
+Exec/s at c=1, see the table below), 18003 Execs in a single `c=1` slot would need roughly 470
+seconds (18003 / 38.4 ≈ 468.8 s) — well beyond any reasonable per-rung cap, and that is before
+`c=4` and `c=8` are even considered.
+
+This is itself a finding, not a workaround: the reference driver cannot deliver in minutes what
+the Go client delivers in about a second, and the four calibration numbers above quantify that
+gap directly.
+
+### The paired run
+
+Both arms instead issued **2000 Execs per slot on both arms** at every concurrency, against a
+single `null-responder` on loopback — scaled up from the brief's illustrative
+`itersPerSlot=200`, and far below the abandoned 18000 above, so that `grpcurl` could complete
+within a reasonable per-rung cap while both clients still issued identical, comparable counts.
+The per-rung cap was 280 s; no rung hit it, and all rungs exited 0. Times-file line counts were
+verified at 2000 / 8000 / 16000, matching the Exec counts exactly at c=1/4/8.
+
+| c   | grpcurl Exec/s | go Exec/s | go faster by | grpcurl wall | go wall |
+| --- | -------------- | --------- | ------------ | ------------ | ------- |
+| 1   | 38.4           | 2133.6    | 55.6x        | 52.04s       | 0.94s   |
+| 4   | 183.9          | 11289.9   | 61.4x        | 43.51s       | 0.71s   |
+| 8   | 286.5          | 13975.7   | 48.8x        | 55.85s       | 1.14s   |
+
+The Go client is roughly 49x to 61x faster per Exec than `grpcurl` on this machine, depending on
+concurrency (55.6x at c=1, 61.4x at c=4, 48.8x at c=8). That gap is expected and is not a
+substitute for the rig comparison: the null-responder here answers over loopback with no relay,
+no proto re-parse cost paid by anything but `grpcurl` itself, and no contention from 72 cores'
+worth of other work. It shows only that the mechanical difference the brief predicts — one
+persistent connection versus one `execve` and one fresh HTTP/2 session per Exec — is real and
+large on this host. Whether it is what moved the published `c=8` knee on the 72-core rig is
+exactly the open question this runbook's rig procedure, above, is for.
+
+Two caveats on reading this table: the Go arm's low-`c` figure is somewhat understated because
+its process start and single dial are inside its measured wall time; and no concurrency was
+repeated (n=1), so single-trial shapes should not be read as evidence of a specific mechanism.
+In particular, the non-monotonic dip at `c=4` (0.71s, faster wall time than `c=1`'s 0.94s)
+appears in **both** arms — `grpcurl` shows the same shape, 52.04s → 43.51s → 55.85s at
+c=1/4/8 — and `grpcurl` opens a fresh connection for every call, so it has no single fixed dial
+that could produce that pattern. A mechanism that cannot exist in an arm exhibiting the same
+pattern does not explain that pattern; the more parsimonious reading is concurrency amortizing
+serial per-call latency on a lightly loaded machine, or plain noise from a single trial.
