@@ -2812,10 +2812,13 @@ else
   fi
 
   if [ "$seam_rc" -eq 0 ]; then
-    # An ephemeral-ish port well away from the driver's defaults (8444/8445), so a stray relay
-    # or responder from another run cannot answer this test's Execs.
-    seam_port=18447
-    "$seam_dir/null-responder" --listen "127.0.0.1:$seam_port" >"$seam_dir/responder.log" 2>&1 &
+    # Port 0: the kernel picks an unused ephemeral port. A fixed port here (review on #296)
+    # meant two concurrent runs on one host, or a listener left behind by a SIGKILL/OOM kill
+    # (the INT/TERM trap below covers cancellation but not -9), would either collide on bind
+    # or -- worse -- let the STALE responder answer this test's Execs with nothing in the
+    # output hinting the port was the problem. An ephemeral port removes both flake classes
+    # entirely: the bound address is parsed out of the responder's own log line below.
+    "$seam_dir/null-responder" --listen "127.0.0.1:0" >"$seam_dir/responder.log" 2>&1 &
     seam_pid=$!
     # A CI timeout or SIGINT between here and the kill below would otherwise leave a gRPC
     # listener bound to this port for as long as the machine stays up. Split from a single
@@ -2839,6 +2842,13 @@ else
     done
     check "the null-responder came up" "$seam_up" "yes"
 
+    # Parse the bound address out of the same log line the wait loop above matched against,
+    # rather than trusting back the port this script requested (which was "0"). A silent empty
+    # target here would make the driver fail for a confusing reason far from this comment.
+    seam_target="$(sed -n 's/.*serving sandbox\.v1\.SandboxExec on \([^ ]*\).*/\1/p' "$seam_dir/responder.log" | head -n1)"
+    check "a bound address was parsed out of the responder's log" \
+      "$([ -n "$seam_target" ] && echo yes || echo no)" "yes"
+
     # THE REAL write_rung_plan, with slot identity from THE REAL slot_req_base and the mix from
     # THE REAL e11_tool_call_mix. Nothing here is a rewritten substitute.
     seam_plan="$seam_dir/plan.json"
@@ -2853,7 +2863,7 @@ else
       for i in 1 2 3; do
         seam_argv+=("$(slot_req_base "$i")" "" "$seam_dir/slot-$i.times" "$seam_dir/slot-$i.err")
       done
-      write_rung_plan "$seam_plan" "localhost:$seam_port" "e11-driver-control" \
+      write_rung_plan "$seam_plan" "$seam_target" "e11-driver-control" \
         "$seam_iters" "$seam_warmup" 30 45 "$seam_mix_count" "$seam_c" "${seam_argv[@]}"
     ) >"$seam_dir/plan.log" 2>&1
     check "write_rung_plan produced a plan" "$([ -s "$seam_plan" ] && echo yes || echo no)" "yes"

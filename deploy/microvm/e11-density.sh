@@ -531,13 +531,14 @@ preflight() {
   # Before anything that depends on the value: build_exec_driver in main() reads it, and the
   # record writer stamps it.
   validate_exec_client
-  # grpcurl and go are hard requirements for every arm: grpcurl drives every arm's Exec
-  # RPCs, and go builds whichever binary that arm needs (./cmd/worker, ./cmd/microvm-worker,
-  # or ./cmd/null-responder). Everything else in this function is conditional on which arms
+  # grpcurl and go are hard requirements for every arm: grpcurl drives every arm's converge
+  # RPC (and, on the grpcurl EXEC_CLIENT, its timed Exec RPCs too), and go builds whichever
+  # binary that arm needs (./cmd/worker, ./cmd/microvm-worker, or ./cmd/null-responder).
+  # Everything else in this function is conditional on which arms
   # are actually configured (issue #291 item 5): a SH_E11_ARMS=driver-control run touches
   # none of docker, pnpm, or the microVM hardware checks below, so refusing over a missing
   # one would block a run that never needed it.
-  require_tool grpcurl "every arm drives its Exec RPCs through grpcurl; without it every timing would measure a client-side error rather than a sandbox"
+  require_tool grpcurl "converge always drives its warm-pool RPC through grpcurl regardless of SH_E11_EXEC_CLIENT (the Go exec-driver path only replaces the timed Exec loop, not converge); without it every rung would fail before a single Exec is timed"
   require_tool go "the container arm builds ./cmd/worker, the microvm arm builds ./cmd/microvm-worker, and the driver-control arm builds ./cmd/null-responder"
   if arm_in_use container || arm_in_use microvm; then
     require_tool docker "the container and microvm arms both start their own scratch redis in a container; without it the relay has nowhere to publish its presence record"

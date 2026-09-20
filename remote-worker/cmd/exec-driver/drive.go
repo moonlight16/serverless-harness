@@ -125,9 +125,15 @@ func oneExec(ctx context.Context, client pb.SandboxExecClient, p *plan, s slot, 
 // runSlot is one slot's whole timed loop: the goroutine that replaces one bash subshell.
 //
 // Writes are BUFFERED and flushed once at the end. The alternative -- a write syscall per
-// Exec -- is driver cost inside the measured window, which is the thing being removed. A rung
-// killed mid-flight loses its tail, and that is fine: run_density_rung refuses a rung whose
-// child exited non-zero rather than recording a partial one.
+// Exec -- is driver cost inside the measured window, which is the thing being removed. The
+// buffer is sized from the plan (32 bytes per call, comfortably above one "<ms> <status>
+// <cause>\n" line, plus headroom) so the single-flush claim holds regardless of ITERS_PER_SLOT,
+// not only at the documented default -- bufio's plain default (4096B) covers the documented
+// 200-call slot (~2.2KB) but not the 2000-call slot this PR's own local-numbers table used
+// (~22KB), where the default buffer would flush mid-loop and put the write syscall back inside
+// the timed window at a lower rate. A rung killed mid-flight loses its tail, and that is fine:
+// run_density_rung refuses a rung whose child exited non-zero rather than recording a partial
+// one.
 func runSlot(ctx context.Context, client pb.SandboxExecClient, p *plan, s slot) (err error) {
 	times, err := os.OpenFile(s.TimesFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -153,8 +159,8 @@ func runSlot(ctx context.Context, client pb.SandboxExecClient, p *plan, s slot) 
 		}
 	}()
 
-	w := bufio.NewWriter(times)
 	calls := p.callsPerSlot()
+	w := bufio.NewWriterSize(times, 32*calls+4096)
 	for i := 0; i < calls; i++ {
 		// reqBase itself is converge's, so Execs start one past it -- the same arithmetic
 		// run_density_rung does with `req=$req_base` then `req=$((req + 1))` before each call.
@@ -162,8 +168,14 @@ func runSlot(ctx context.Context, client pb.SandboxExecClient, p *plan, s slot) 
 		if _, err := fmt.Fprintln(w, o.line()); err != nil {
 			return fmt.Errorf("writing to times file %s: %w", s.TimesFile, err)
 		}
-		if o.errMsg != "" {
-			// Best effort: losing the diagnostic text must not fail a rung whose timings are fine.
+		if o.status == "err" {
+			// Gated on status, not on errMsg != "": an in-stream ExecEvent.error with an empty
+			// message is still a failing Exec (TestDriveClassifiesAnEmptyMessageInStreamErrorAsFailure),
+			// and gating on the message text alone dropped it from the err file entirely -- exactly the
+			// state plan.validate's errFile refusal warns about, where a failing Exec's message is lost
+			// and execErrorsByCause says unknown with nothing to look at. An empty line under a req id
+			// at least tells the operator the relay sent an error with no message. Best effort: losing
+			// the diagnostic text must not fail a rung whose timings are fine.
 			_, _ = fmt.Fprintf(errFile, "req %d: %s\n", s.ReqBase+1+uint64(i), o.errMsg)
 		}
 	}

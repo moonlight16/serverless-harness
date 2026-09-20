@@ -173,10 +173,13 @@ func TestDriveWritesTheFrozenTimesFileFormat(t *testing.T) {
 // completes in well under a millisecond, so before recording microseconds and formatting three
 // decimal places, int64 whole-millisecond truncation rounded the recorded value to 0 for
 // essentially every call -- collapsing p95/knee/coldAcquireRate on the Go arm to the clock's
-// resolution rather than a real signal. This must fail against the pre-fix code (ms field "0")
-// and pass against the fix (a non-zero fractional value).
+// resolution rather than a real signal. The truncation defect is fully caught by two properties
+// that do not depend on wall-clock luck: the field has three decimal digits (msFieldShape, shared
+// with TestDrive*'s per-line checks above), and it is not truncated to exactly "0.000". Pinning
+// the whole-millisecond part to "0" as well -- i.e. requiring every Exec against the fake to run
+// under 1ms -- would flake on a loaded CI runner, a GC pause, or a scheduler hiccup without
+// exercising anything more of the fix.
 func TestDriveRecordsSubMillisecondLatencyRatherThanZero(t *testing.T) {
-	subMsShape := regexp.MustCompile(`^0\.[0-9]{3}$`)
 	f := &fakeExec{}
 	p := planFor(t, startFake(t, f), 1, 1, 0, []string{"true"})
 	if err := drive(context.Background(), p); err != nil {
@@ -188,8 +191,8 @@ func TestDriveRecordsSubMillisecondLatencyRatherThanZero(t *testing.T) {
 	}
 	fields := strings.Fields(lines[0])
 	msField := fields[0]
-	if !subMsShape.MatchString(msField) {
-		t.Fatalf("ms field %q does not have the sub-millisecond shape 0.XXX", msField)
+	if !msFieldShape.MatchString(msField) {
+		t.Fatalf("ms field %q does not have three decimal digits: pre-fix, int64 whole-millisecond truncation produced a bare integer with no decimal point at all", msField)
 	}
 	if msField == "0.000" {
 		t.Fatalf("ms field is %q: a sub-millisecond Exec against an in-process fake responder recorded as exactly zero, which is the truncation bug this test exists to catch", msField)
@@ -298,16 +301,32 @@ func TestDriveClassifiesAnInStreamExecErrorAsFailure(t *testing.T) {
 // message must still classify as a failed Exec. Classification was gated on inStream == "",
 // which cannot distinguish "no error was ever received" from "an error was received with an
 // empty message" -- so an empty-message error silently read back as ok.
+//
+// This also covers the review fix (#296) that gates the err-file write on status == "err"
+// rather than errMsg != "": before that fix, this exact case -- a failing Exec whose message
+// happens to be empty -- wrote NOTHING to the err file, which is verbatim the state
+// plan.validate's errFile refusal warns about (a failing Exec's message lost and
+// execErrorsByCause saying unknown with nothing to look at).
 func TestDriveClassifiesAnEmptyMessageInStreamErrorAsFailure(t *testing.T) {
 	f := &fakeExec{sendEmptyErr: true}
 	p := planFor(t, startFake(t, f), 1, 2, 0, []string{"true"})
 	if err := drive(context.Background(), p); err != nil {
 		t.Fatalf("drive must not fail the rung over per-Exec errors: %v", err)
 	}
-	for n, l := range readLines(t, p.Slots[0].TimesFile) {
+	timesLines := readLines(t, p.Slots[0].TimesFile)
+	for n, l := range timesLines {
 		fields := strings.Fields(l)
 		if fields[1] != "err" || fields[2] != "unknown" {
 			t.Fatalf("line %d is %q, want status err and cause unknown: an empty-message ExecEvent.error must still be recorded as failed, not ok", n+1, l)
+		}
+	}
+	errLines := readLines(t, p.Slots[0].ErrFile)
+	if len(errLines) != len(timesLines) {
+		t.Fatalf("err file has %d lines, want one per failing Exec (%d): an empty-message error must still get a line in the err file", len(errLines), len(timesLines))
+	}
+	for n, l := range errLines {
+		if !strings.HasPrefix(l, "req ") {
+			t.Fatalf("err file line %d is %q, want it to start with the req id even though the message is empty", n+1, l)
 		}
 	}
 }
