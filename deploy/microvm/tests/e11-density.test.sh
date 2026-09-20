@@ -202,7 +202,7 @@ check "refusal message names SH_MAX_COMMITTED_MB" "$has_msg2" "yes"
 # ---------------------------------------------------------------------------
 echo "== smaps_rollup is used and RSS is not (with non-vacuousness proof)"
 
-pss_body="$(extract_fn pss_bytes_for_pids || true)"
+pss_body="$(extract_fns pid_mm_is_gone pss_bytes_for_pids || true)"
 check "pss_bytes_for_pids helper exists" "$([ -n "$pss_body" ] && echo yes || echo no)" "yes"
 
 if [ -n "$pss_body" ]; then
@@ -272,6 +272,73 @@ if [ -n "$pss_body" ]; then
   check "an already-exited pid contributes 0, is not an unreadable-file failure" "$rc_dead" "0"
   check "an already-exited pid's contribution is exactly 0 bytes" "$out_dead" "0"
 
+  # Cases D-F cover a third state that is neither "healthy" nor "exited": a task
+  # inside do_exit()/exit_mmap() keeps its task_struct, so `kill -0` SUCCEEDS, after
+  # its mm is already torn down -- and smaps_rollup then passes -r and fails to read.
+  # Measured on bare metal during issue #291's re-run: firecracker VMMs in D state,
+  # 4-5 per microvm rung, which took the "live but unreadable" refusal below and, in
+  # the idle-standby-residency poll where that refusal is FATAL, aborted the ladder
+  # at c=4. pss_bytes_for_pids' own exit-race comment already prescribes 0 for this
+  # case; `kill -0` alone cannot distinguish "alive holding memory" from "dying with
+  # none".
+  #
+  # The discriminator is an EMPTY /proc/<pid>/cmdline, not VmRSS: cmdline is read
+  # through the mm, so it is empty exactly when the address space is gone. VmRSS and
+  # /proc/<pid>/status are off limits by the invariant asserted at the end of this
+  # file (spec section 7.3 forbids the RSS fallback), and cmdline needs neither.
+  # Measured separation on metal: 4857/4857 pids whose PSS read succeeded had a
+  # non-empty cmdline; 171/171 whose read failed had an empty one.
+  rm -f "$fake_proc/$live_pid/smaps_rollup"
+
+  # Case D: alive, mm gone (empty cmdline) -> contributes 0, NOT a refusal.
+  : >"$fake_proc/$live_pid/cmdline"
+  rc_nomm=0
+  out_nomm=$(
+    PROC_ROOT="$fake_proc"
+    export PROC_ROOT
+    # shellcheck disable=SC1090
+    . "$pss_snippet"
+    pss_bytes_for_pids "$live_pid"
+  ) || rc_nomm=$?
+  check "a LIVE pid whose mm is gone (empty cmdline) contributes 0, not a refusal" "$rc_nomm" "0"
+  check "its contribution is exactly 0 bytes" "$out_nomm" "0"
+
+  # Case E: the guard is NOT disabled. Same unreadable smaps_rollup, but the task
+  # demonstrably still has an address space (non-empty cmdline) -> still refuses.
+  # This is the hazard the guard exists for: a live, memory-holding process whose
+  # smaps_rollup we cannot read, e.g. another user's under ptrace gating.
+  printf 'firecracker\0--id\0vm-7\0' >"$fake_proc/$live_pid/cmdline"
+  rc_hasmm=0
+  out_hasmm=$(
+    PROC_ROOT="$fake_proc"
+    export PROC_ROOT
+    # shellcheck disable=SC1090
+    . "$pss_snippet"
+    pss_bytes_for_pids "$live_pid" 2>&1
+  ) || rc_hasmm=$?
+  case "$out_hasmm" in *smaps_rollup*) named_hasmm=yes ;; *) named_hasmm=no ;; esac
+  check "a LIVE pid that still has an mm takes the refusal (guard intact)" \
+    "$([ "$rc_hasmm" -ne 0 ] && echo yes || echo no)" "yes"
+  check "that refusal still names smaps_rollup" "$named_hasmm" "yes"
+
+  # Case F: an ABSENT cmdline is ambiguous -- it is not proof of a torn-down mm, it
+  # is proof of nothing -- so it keeps refusing. Treating "cannot tell" as 0 would
+  # silently zero Sigma PSS on a misconfigured SH_E11_PROC_ROOT, which is the
+  # optimistic-direction failure spec section 7.3's boxed warning is about.
+  rm -f "$fake_proc/$live_pid/cmdline"
+  rc_nocmd=0
+  out_nocmd=$(
+    PROC_ROOT="$fake_proc"
+    export PROC_ROOT
+    # shellcheck disable=SC1090
+    . "$pss_snippet"
+    pss_bytes_for_pids "$live_pid" 2>&1
+  ) || rc_nocmd=$?
+  case "$out_nocmd" in *smaps_rollup*) named_nocmd=yes ;; *) named_nocmd=no ;; esac
+  check "an ABSENT cmdline is ambiguous and still refuses, not silently 0" \
+    "$([ "$rc_nocmd" -ne 0 ] && echo yes || echo no)" "yes"
+  check "that ambiguous refusal also names smaps_rollup" "$named_nocmd" "yes"
+
   stop_marker_process "$live_pid"
   rm -rf "$pss_tmpdir"
 fi
@@ -295,7 +362,7 @@ fi
 # ---------------------------------------------------------------------------
 echo "== host signal assembly against a Linux-shaped /proc (final review H2)"
 
-signals_body="$(extract_fns die require_numeric proc_meminfo_available mem_available_bytes discover_pids pss_bytes_for_pids host_cpu_fraction host_signals_snapshot || true)"
+signals_body="$(extract_fns die require_numeric proc_meminfo_available mem_available_bytes discover_pids pid_mm_is_gone pss_bytes_for_pids host_cpu_fraction host_signals_snapshot || true)"
 check "die/require_numeric/mem_available_bytes/host_signals_snapshot all extractable" \
   "$([ -n "$signals_body" ] && echo yes || echo no)" "yes"
 

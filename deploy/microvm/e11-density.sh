@@ -597,13 +597,46 @@ discover_pids() {
 # is ~2 GiB ... in the pessimistic direction, so it would cause us to abandon a
 # design that works"). A pid that has already exited between discovery and
 # sampling contributes 0 (that is a race, not an unreadable file).
+# A pid can be alive by `kill -0` and still have NO address space. A task inside
+# do_exit()/exit_mmap() keeps its task_struct until it is reaped, so `kill -0`
+# succeeds, while its mm -- and with it smaps_rollup's contents -- is already gone.
+# pss_bytes_for_pids' exit-race comment already prescribes 0 for that case; this is
+# what lets it tell that case apart from a live, memory-HOLDING process whose
+# smaps_rollup merely cannot be read, which must still refuse.
+#
+# Measured on bare metal during issue #291's re-run (srv-r16b14s16, 2026-09-20):
+# firecracker VMMs in D state, 4-5 per microvm rung, took the refusal below; in the
+# idle-standby-residency poll, where it is fatal, that aborted the ladder at c=4.
+# Separation was total: 4857/4857 pids whose smaps_rollup read SUCCEEDED had a
+# non-empty cmdline, and 171/171 whose read FAILED had an empty one.
+#
+# The test is an EMPTY /proc/<pid>/cmdline, deliberately NOT VmRSS or
+# /proc/<pid>/status: both are forbidden in code by this file's own invariant
+# because spec section 7.3 forbids the RSS fallback, and this check needs neither --
+# it reads no memory VALUE at all, only whether an address space still exists.
+# cmdline is served from the mm (arg_start/arg_end), so it reads empty exactly when
+# that mm is gone. Note it must be READ, not stat'ed: every procfs file reports
+# st_size 0, so `[ -s ]` here would call every healthy VMM mm-less.
+#
+# Returns 0 ("the mm is gone", so contribute 0) ONLY when cmdline is readable and
+# reads empty. An absent or unreadable cmdline is ambiguous -- proof of nothing --
+# and returns 1 so the caller keeps refusing: treating "cannot tell" as 0 is exactly
+# how Sigma PSS would silently vanish on a misconfigured SH_E11_PROC_ROOT.
+pid_mm_is_gone() {
+  local cmdline="$PROC_ROOT/$1/cmdline" content
+  [ -r "$cmdline" ] || return 1
+  content="$(tr -d '\0' <"$cmdline" 2>/dev/null)" || return 1
+  [ -n "$content" ] && return 1
+  return 0
+}
+
 pss_bytes_for_pids() {
   local total_kb=0 pid smaps
   for pid in "$@"; do
     [ -n "$pid" ] || continue
     smaps="$PROC_ROOT/$pid/smaps_rollup"
     if [ ! -r "$smaps" ]; then
-      if kill -0 "$pid" 2>/dev/null; then
+      if kill -0 "$pid" 2>/dev/null && ! pid_mm_is_gone "$pid"; then
         die "smaps_rollup unreadable for pid $pid ($smaps) - refusing to fall back to RSS (spec section 7.3's boxed warning)"
       fi
       continue # pid exited between discovery and sampling; not an unreadable file
@@ -625,7 +658,7 @@ pss_bytes_for_pids() {
     local pid_kb pid_rc=0
     pid_kb="$(awk '/^Pss:/{sum+=$2} END{print sum+0}' "$smaps" 2>/dev/null)" || pid_rc=$?
     if [ "$pid_rc" -ne 0 ] || [ -z "$pid_kb" ]; then
-      if kill -0 "$pid" 2>/dev/null; then
+      if kill -0 "$pid" 2>/dev/null && ! pid_mm_is_gone "$pid"; then
         die "smaps_rollup for pid $pid ($smaps) passed a readability test and then FAILED to read while the process is still alive - refusing to let it contribute 0 bytes to Sigma PSS (spec section 7.3's boxed warning). Most likely the pid is not ours: check SH_E11_VMM_PROC_PATTERN, which is matched with an unscoped pgrep -f and will pick up any process whose command line contains the pattern, including another user's."
       fi
       continue # exited between the readability test and the read; a race, not a bad file
