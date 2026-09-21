@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -327,6 +328,85 @@ func jitter(d time.Duration) time.Duration {
 	return d + time.Duration(rand.Int64N(int64(d/2)+1))
 }
 
+// diagStats is the wire shape of SH_DIAG_STATS_ADDR's /stats, kept separate from
+// vmpool.Stats on purpose: this is a contract something outside the process parses, and it
+// should not change silently because an internal field was renamed. Field-for-field
+// otherwise, and the two maps are stringified the way vmpoolctl already does it.
+type diagStats struct {
+	InFlight             int    `json:"inFlight"`
+	ActiveRuns           int    `json:"activeRuns"`
+	ParkedRuns           int    `json:"parkedRuns"`
+	StandbysResident     int    `json:"standbysResident"`
+	IdleStandbyResidency int    `json:"idleStandbyResidency"`
+	CommittedBytes       int64  `json:"committedBytes"`
+	WarmAcquires         uint64 `json:"warmAcquires"`
+	// Reported by the worker rather than recorded by the driver from what it believes it
+	// set. Every E11 microVM rung ever recorded swept c to 64 against a 4-slot cap the
+	// driver never set and never wrote down, and at every point measured so far it was
+	// this -- not the pool -- that set throughput (#305). A rung record must not be
+	// readable without its slot count.
+	MaxConcurrent int `json:"maxConcurrent"`
+	// Keyed by cause. "exhausted" is the one that means replenishment is behind the Exec
+	// rate; "first-exec" is a session's unavoidable first restore. A bare total conflates
+	// them, and a density knee can only be attributed to the former.
+	ColdAcquires      map[string]uint64 `json:"coldAcquires"`
+	Refusals          map[string]uint64 `json:"refusals"`
+	Replenishments    uint64            `json:"replenishments"`
+	ReplenishFailures uint64            `json:"replenishFailures"`
+	DestroyFailures   uint64            `json:"destroyFailures"`
+	TimeoutsClamped   uint64            `json:"timeoutsClamped"`
+}
+
+func toDiagStats(st vmpool.Stats, maxConcurrent int) diagStats {
+	out := diagStats{
+		MaxConcurrent:        maxConcurrent,
+		InFlight:             st.InFlight,
+		ActiveRuns:           st.ActiveRuns,
+		ParkedRuns:           st.ParkedRuns,
+		StandbysResident:     st.StandbysResident,
+		IdleStandbyResidency: st.IdleStandbyResidency,
+		CommittedBytes:       st.CommittedBytes,
+		WarmAcquires:         st.WarmAcquires,
+		ColdAcquires:         map[string]uint64{},
+		Refusals:             map[string]uint64{},
+		Replenishments:       st.Replenishments,
+		ReplenishFailures:    st.ReplenishFailures,
+		DestroyFailures:      st.DestroyFailures,
+		TimeoutsClamped:      st.TimeoutsClamped,
+	}
+	for k, v := range st.ColdAcquires {
+		out.ColdAcquires[string(k)] = v
+	}
+	for k, v := range st.Refusals {
+		out.Refusals[string(k)] = v
+	}
+	return out
+}
+
+// diagStatsMux serves the pool's real acquire counters for SH_DIAG_STATS_ADDR.
+//
+// This exists because e11-density.sh's coldAcquireRate is a latency-classification proxy
+// (Execs slower than SH_E11_COLD_LATENCY_MS), which measured 13x off at c=8 and ~250x off
+// at c=16 against the true rate, and cannot be fixed by tuning that threshold: Acquire is
+// 0.3% of an Exec, so no end-to-end latency threshold separates warm from cold. vmpool has
+// always maintained the real figures; until now only vmpoolctl could read them (#306).
+//
+// Deliberately its OWN mux, never http.DefaultServeMux: this package imports
+// _ "net/http/pprof", whose handlers register on the default mux at import time, so
+// serving /stats there would mean enabling counters also exposed heap contents, goroutine
+// dumps and command lines. That exposure is SH_DIAG_PPROF's documented, opt-in bargain
+// (#308) and must not arrive behind a different variable.
+func diagStatsMux(statsFn func() vmpool.Stats, maxConcurrent int) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(toDiagStats(statsFn(), maxConcurrent)); err != nil {
+			log.Printf("microvm-worker: SH_DIAG_STATS_ADDR encode failed: %v", err)
+		}
+	})
+	return mux
+}
+
 func main() {
 	// Opt-in profiling. OFF unless SH_DIAG_PPROF names a bind address, because pprof
 	// serves goroutine dumps, heap contents and command lines to anyone who can reach
@@ -459,6 +539,22 @@ func main() {
 	maxConcurrent := session.DefaultConcurrency
 	if v, e := envInt64(get, "WORKER_MAX_CONCURRENT", int64(session.DefaultConcurrency)); e == nil {
 		maxConcurrent = int(v)
+	}
+
+	// Opt-in, and separate from SH_DIAG_PPROF so obtaining the counters does not require
+	// exposing heap dumps and command lines. Bind loopback and reach it over ssh. Placed
+	// here, after maxConcurrent is resolved, because /stats reports it: the driver should
+	// record the slot count the worker is actually using, not the one it believes it set.
+	if addr := env(get, "SH_DIAG_STATS_ADDR", ""); addr != "" {
+		statsSrv := &http.Server{
+			Addr:              addr,
+			Handler:           diagStatsMux(pool.Stats, maxConcurrent),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			log.Printf("microvm-worker: SH_DIAG_STATS_ADDR listening on %s: %v", addr, statsSrv.ListenAndServe())
+		}()
+		defer func() { _ = statsSrv.Close() }()
 	}
 
 	var creds credentials.TransportCredentials

@@ -214,6 +214,10 @@ MODEL_STUB_CMD="${SH_E11_MODEL_STUB_CMD:-}"
 # Disclosed latency-classification proxy threshold for coldAcquireRate (see header).
 COLD_LATENCY_MS="${SH_E11_COLD_LATENCY_MS:-50}"
 
+# Where microvm-worker serves its real pool counters (#306). Loopback by default and
+# opt-in in the worker: it is a diagnostic surface, not part of the deployment.
+STATS_ADDR="${SH_E11_STATS_ADDR:-127.0.0.1:6061}"
+
 # VMM / virtiofsd host process patterns for PSS sampling (spec section 7.3: "Sigma
 # PSS across VMM + virtiofsd"). Overridable so a test can point these at a fake
 # marker process rather than a real firecracker/virtiofsd binary.
@@ -692,6 +696,49 @@ pss_bytes_for_pids() {
     total_kb=$((total_kb + pid_kb))
   done
   echo $((total_kb * 1024))
+}
+
+# The REAL warm/cold acquire counters, from the worker's own vmpool.Stats (#306).
+#
+# Prints "warm cold maxConcurrent" on success, nothing (nonzero) when the endpoint is not
+# there -- which is the normal case on the container and driver-control arms, where no
+# microvm-worker is running. Fetched with python3 rather than curl: python3 is already a
+# hard dependency of this driver (the rung record is assembled with it) and curl is not.
+vmpool_stats_acquires() {
+  python3 - "$STATS_ADDR" 2>/dev/null <<'PYSTATS'
+import json, sys, urllib.request
+
+try:
+    with urllib.request.urlopen("http://%s/stats" % sys.argv[1], timeout=5) as r:
+        d = json.load(r)
+except Exception:
+    sys.exit(1)
+# Summed across causes for the rate; the per-cause split stays in the worker's own
+# response, where "exhausted" (replenishment behind the Exec rate) can be read apart
+# from "first-exec" (a session's unavoidable first restore).
+print(d.get("warmAcquires", 0), sum(d.get("coldAcquires", {}).values()), d.get("maxConcurrent", 0))
+PYSTATS
+}
+
+# cold_acquire_rate_true WARM_BEFORE COLD_BEFORE WARM_AFTER COLD_AFTER
+#
+# The cold fraction over ONE rung's timed window. A DIFF, because the counters are
+# process-lifetime totals: a rung that read them absolutely would report every earlier
+# rung's acquires as its own.
+#
+# Prints -1, never 0, when the rate cannot be determined -- no acquires in the window, or
+# counters that went backwards because the worker restarted mid-ladder. Zero cold out of
+# zero acquires would read as "replenishment kept up perfectly", which is the
+# optimistic-direction failure this file refuses everywhere else; -1 is outside [0,1] and
+# so can never be mistaken for a rate.
+cold_acquire_rate_true() {
+  awk -v wb="$1" -v cb="$2" -v wa="$3" -v ca="$4" 'BEGIN{
+    dw = wa - wb; dc = ca - cb;
+    if (dw < 0 || dc < 0) { print "-1"; exit }
+    n = dw + dc;
+    if (n <= 0) { print "-1"; exit }
+    printf "%.6f", dc / n
+  }'
 }
 
 # mem_available_bytes prints MemAvailable in bytes, or a single 0 when /proc/meminfo is
@@ -1642,7 +1689,7 @@ start_microvm_stack() {
     SH_SNAPSHOT_DIR="$SNAPSHOT_DIR" SH_SNAPSHOT_IMAGE="${SH_SNAPSHOT_IMAGE:-default}" \
     SH_WORKSPACE_ROOT="$WORKSPACE_ROOT" \
     SANDBOX_ID="e11-microvm-d${d}-ram${ram_mb}" RELAY_ADDR="localhost:${E11_RELAY_PORT}" \
-    SANDBOX_TOKEN="$E11_RELAY_TOKEN" \
+    SANDBOX_TOKEN="$E11_RELAY_TOKEN" SH_DIAG_STATS_ADDR="$STATS_ADDR" \
     "$E11_WORKER_BIN" >"$RESULTS/e11-microvm-worker-d${d}-ram${ram_mb}.log" 2>&1 &
   E11_WORKER_PID="$!"
   wait_for_worker_attached "$RESULTS/e11-microvm-worker-d${d}-ram${ram_mb}.log" "the microvm arm's worker (D=$d guest=${ram_mb}MiB)"
@@ -1835,6 +1882,12 @@ run_density_rung() {
   : >"$sampler_file"
   rm -f "$sampler_stop"
   local wall_t0 wall_t1
+  # The pool's real counters, read either side of the timed window and diffed (#306).
+  # Absent on the container and driver-control arms, where no microvm-worker is running:
+  # the rung then records -1, meaning "not measured here", never 0.
+  local stats_before stats_after warm_b cold_b warm_a cold_a
+  local cold_rate_true=-1 max_concurrent=-1
+  stats_before="$(vmpool_stats_acquires || true)"
   wall_t0="$(date +%s%N)"
   # The sampler brackets EXACTLY this window (issue #291 item 1). It is started after
   # wall_t0 and reaped after wall_t1, and the converge barrier above is what makes that
@@ -1893,6 +1946,12 @@ run_density_rung() {
     wait "$pid" || exec_failures=$((exec_failures + 1))
   done
   wall_t1="$(date +%s%N)"
+  stats_after="$(vmpool_stats_acquires || true)"
+  if [ -n "$stats_before" ] && [ -n "$stats_after" ]; then
+    read -r warm_b cold_b _ <<<"$stats_before"
+    read -r warm_a cold_a max_concurrent <<<"$stats_after"
+    cold_rate_true="$(cold_acquire_rate_true "$warm_b" "$cold_b" "$warm_a" "$cold_a")"
+  fi
   : >"$sampler_stop"
   wait "$E11_SAMPLER_PID" 2>/dev/null || true
   E11_SAMPLER_PID=""
@@ -2125,8 +2184,21 @@ rec = {
   'c': $c,
   'throughput': $throughput,
   'p95Ms': $p95,
+  # coldAcquireRate is the LATENCY-CLASSIFICATION PROXY (see the header): the share of
+  # Execs slower than coldLatencyThresholdMs. It is NOT a pool statistic, and measured
+  # against the counters below on the same runs it was wrong by 13x at c=8 and ~250x at
+  # c=16. It is kept here, beside the real figure, only so the two can be compared on one
+  # run before it is renamed and retired (#306 step 3).
   'coldAcquireRate': $cold_rate,
   'coldLatencyThresholdMs': $COLD_LATENCY_MS,
+  # The real rate, diffed across this rung's timed window from the worker's own
+  # vmpool.Stats. -1 means it could not be determined -- no acquires in the window, the
+  # worker restarted mid-ladder, or an arm with no microvm-worker to ask -- never 0.
+  'coldAcquireRateTrue': $cold_rate_true,
+  # The dispatch slot count the WORKER actually used, reported by it rather than assumed.
+  # No rung record has ever carried this, and at every point measured so far it was this,
+  # not the pool, that set throughput (#305). -1 means the worker could not be asked.
+  'maxConcurrent': $max_concurrent,
   # The four RungSample host signals, now sampled DURING the timed window (#291 item 1).
   # Same names, same place in the contract, under-load values.
   'hostCpuFraction': $cpu_mean,
@@ -2180,8 +2252,8 @@ rec = {
   'staticSettings': json.loads('$(static_settings_json)'),
   'proxyLimitations': {
     'leaseSaturations': 'always 0 - driver bypasses the harness lease layer entirely',
-    'coldAcquireRate': 'latency-classification proxy (>= ${COLD_LATENCY_MS}ms), not the real replenishment signal - no stats endpoint exists',
-    'standbysResident': 'proxy: max(processCount - c, 0) - no pool introspection endpoint exists',
+    'coldAcquireRate': 'latency-classification proxy (>= ${COLD_LATENCY_MS}ms), not the real replenishment signal. A stats endpoint DOES exist now: compare this against coldAcquireRateTrue, diffed from the worker vmpool.Stats counters over this rung. Measured 13x off at c=8 and ~250x off at c=16, and it is retained only for that comparison (#306)',
+    'standbysResident': 'proxy: max(processCount - c, 0). A pool introspection endpoint DOES exist now (SH_DIAG_STATS_ADDR serves Stats.StandbysResident), but this field is still the proxy: #306 wires only the acquire counters through. Do not read it as a pool statistic until it is',
     'pssBytesCadence': 'pssBytes and processCount are sampled every ${SAMPLE_LOW_EVERY}th sampler tick (and always tick 1), not every tick: pgrep plus an N-file smaps_rollup walk at 1 Hz perturbs the density ceiling being measured. crosses(memory) reads memAvailableBytes, which IS every tick, so the bound classification is unaffected; PSS feeds the narrative. See pssSamples and processCountSamples for the actual counts (#291).',
     'driverControlChunkDecode': '$driver_control_note',
     'execErrorStatus': '$exec_error_note',
