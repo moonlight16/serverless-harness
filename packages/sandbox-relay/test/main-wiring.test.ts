@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { status } from '@grpc/grpc-js';
 import { describe, expect, it, vi } from 'vitest';
 import { buildServer } from '../src/main.js';
 import type { RecordStore } from '@sh/harness';
@@ -58,7 +59,19 @@ function fakeAttach() {
   return s;
 }
 
-/** Fake server-streaming call, the shape main.ts's exec handler expects. */
+/**
+ * Fake server-streaming call, the shape main.ts's exec handler expects.
+ *
+ * `streamError` mirrors the listener @grpc/grpc-js registers in ServerWritableStream's own
+ * constructor (`this.on('error', ...)`, which sets pendingStatus and ends the stream). That
+ * listener is the ONLY thing that puts a non-OK code on the wire, so a fake without it both
+ * misreports the handler and makes `emit('error')` throw as an unhandled error event.
+ *
+ * `destroy` is kept only so a regression back to it is visible here rather than silent --
+ * on grpc-js 1.14.4 destroying a ServerWritableStream sends no status at all, because the
+ * status is sent from `_final` and Node's Writable skips `_final` once destroyed. This fake
+ * cannot show that; `main-exec-status.transport.test.ts` pins it over a real transport.
+ */
 function fakeExecCall(request: unknown) {
   const c = new EventEmitter() as EventEmitter & {
     request: unknown;
@@ -68,6 +81,7 @@ function fakeExecCall(request: unknown) {
     written: unknown[];
     ended: boolean;
     destroyed?: Error;
+    streamError?: Error;
   };
   c.request = request;
   c.written = [];
@@ -75,6 +89,9 @@ function fakeExecCall(request: unknown) {
   c.write = (ev) => c.written.push(ev);
   c.end = () => (c.ended = true);
   c.destroy = (err) => (c.destroyed = err);
+  c.on('error', (err: Error) => {
+    c.streamError = err;
+  });
   return c;
 }
 
@@ -136,9 +153,12 @@ describe('relay server exec cancellation wiring (via the real registered handler
     );
     await vi.waitFor(() => expect(call.ended).toBe(true));
     expect(call.destroyed).toBeUndefined();
+    // A cancel is our own abort completing, not a server-side failure, so it must not be
+    // reclassified into a non-OK status.
+    expect(call.streamError).toBeUndefined();
   });
 
-  it('destroys the call when routeExec throws (e.g. absent sandbox)', async () => {
+  it('fails the call with a status when routeExec throws (e.g. absent sandbox)', async () => {
     const { server } = buildServer({ records, validateToken: () => true });
     const exec = getHandler(server, '/sandbox.v1.SandboxExec/Exec');
 
@@ -155,8 +175,80 @@ describe('relay server exec cancellation wiring (via the real registered handler
     });
     exec(call);
 
-    await vi.waitFor(() => expect(call.destroyed).toBeInstanceOf(Error));
-    expect(call.destroyed?.message).toMatch(/no live worker/);
+    // Via the 'error' event, not destroy(): destroying sends no status, so an absent
+    // sandbox would hang the caller instead of answering it.
+    await vi.waitFor(() => expect(call.streamError).toBeInstanceOf(Error));
+    expect(call.streamError?.message).toMatch(/no live worker/);
+    expect(call.destroyed).toBeUndefined();
+  });
+});
+
+describe('relay server exec error status wiring', () => {
+  // #295. The worker reports a failed Exec as an in-stream ExecEvent.error and then
+  // stops. routeExec yields that event and returns NORMALLY (relay.ts sets done on
+  // ev.error), so the handler's `for await` falls out and reaches call.end() -- a gRPC
+  // OK. A client that only reads the terminal status therefore counts a FAILED Exec as
+  // a success: it enters `throughput`, enters the distribution `p95` is taken over, and
+  // never reaches `execErrorsByCause`. That is exactly the inflation the E11 driver
+  // documents on its grpcurl path (e11-density.sh, the `*)` client note). The detail
+  // must still reach the client, so the event is written either way -- only the terminal
+  // status changes.
+  it('ends the call with a non-OK status when the worker reports an in-stream exec error', async () => {
+    const { server } = buildServer({ records, validateToken: () => true });
+    const attach = getHandler(server, '/sandbox.v1.SandboxWorker/Attach');
+    const exec = getHandler(server, '/sandbox.v1.SandboxExec/Exec');
+
+    const worker = fakeAttach();
+    attach(worker);
+    worker.emit('data', {
+      hello: {
+        sandboxId: 'sbx-1',
+        labels: {},
+        capabilities: [],
+        image: '',
+        arch: 'amd64',
+        capacityMax: 1,
+        trust: 'trusted',
+      },
+    });
+
+    const call = fakeExecCall({
+      sandboxId: 'sbx-1',
+      exec: {
+        reqId: 7,
+        command: 'boom',
+        stdin: new Uint8Array(),
+        timeoutS: 0,
+        streaming: true,
+        workspaceKey: '',
+      },
+    });
+    exec(call);
+
+    await vi.waitFor(() =>
+      expect((worker.written.at(-1) as { exec?: { reqId: number } })?.exec?.reqId).toBe(7),
+    );
+
+    worker.emit('data', { error: { reqId: 7, message: 'exec failed: boom' } });
+
+    // The client still receives the error event itself -- the payload is unchanged.
+    await vi.waitFor(() =>
+      expect((call.written.at(-1) as { error?: { message: string } })?.error?.message).toBe(
+        'exec failed: boom',
+      ),
+    );
+
+    // But the stream must NOT terminate OK, and the status must carry the worker's message.
+    // Raised as an 'error' event: that is the only termination grpc-js turns into a status
+    // (destroy() sends none at all), which main-exec-status.transport.test.ts proves on a
+    // real transport.
+    await vi.waitFor(() => expect(call.streamError).toBeInstanceOf(Error));
+    expect(call.streamError?.message).toMatch(/exec failed: boom/);
+    // INTERNAL specifically, not grpc-js's default UNKNOWN for a bare Error: the exec
+    // machinery failed server-side, which is not the caller's fault. A non-zero command
+    // exit is a different thing entirely and arrives as ExecEvent.end{exitCode}.
+    expect((call.streamError as { code?: number } | undefined)?.code).toBe(status.INTERNAL);
+    expect(call.destroyed).toBeUndefined();
     expect(call.ended).toBe(false);
   });
 });

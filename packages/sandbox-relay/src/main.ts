@@ -1,6 +1,7 @@
 import {
   Server,
   ServerCredentials,
+  status,
   type ServerDuplexStream,
   type ServerWritableStream,
   type ServerUnaryCall,
@@ -21,6 +22,44 @@ import {
 } from '@sh/k8s-sandbox';
 import { RedisRecordStore } from '@sh/harness';
 import { createRelay, type RelayDeps, type AttachStream } from './relay.js';
+
+/**
+ * Ends a server-streaming exec call with a non-OK status.
+ *
+ * `call.destroy(err)` does NOT do that, which is the trap this helper exists to name. On
+ * @grpc/grpc-js 1.14.4 a `ServerWritableStream` sends its status from `_final` (which calls
+ * `call.sendStatus`), and Node's `Writable` never reaches `_final` once `destroyed` is set:
+ * `end()` short-circuits with ERR_STREAM_DESTROYED. Destroying therefore sends no trailers
+ * at all -- verified against a real client, which sat for 12s with no status, no `end` and
+ * no `error`. A hang is strictly worse than the wrong-OK of #295, because an OK at least
+ * lets the caller finish its request.
+ *
+ * Emitting 'error' is the supported path: grpc-js registers a listener in the stream's
+ * constructor that runs the error through `serverErrorToStatus` and then ends the stream,
+ * which is what actually puts a code on the wire. `serverErrorToStatus` takes a numeric
+ * `code` and a string `details` when present, and otherwise reports UNKNOWN with `message`
+ * as the details -- so a bare Error still terminates non-OK and still carries its reason.
+ *
+ * `main-exec-status.transport.test.ts` pins all of this over a real transport; a fake call
+ * object cannot, because the status is produced by the transport rather than the handler.
+ */
+function failExecStream(call: ServerWritableStream<ExecRequest, ExecEvent>, err: Error): void {
+  call.emit('error', err);
+}
+
+/**
+ * A worker-reported in-stream exec failure, shaped so grpc-js terminates the stream with
+ * a non-OK status instead of OK. INTERNAL (not UNKNOWN) because the failure is server-side
+ * and not the caller's fault: `ExecEvent.error` means the exec machinery itself failed,
+ * whereas a command that merely exited non-zero comes back as `ExecEvent.end{exitCode}`.
+ * The worker's message travels as the status details so the cause is not lost.
+ */
+function execStreamError(message: string): Error {
+  const err = new Error(message) as Error & { code: number; details: string };
+  err.code = status.INTERNAL;
+  err.details = message;
+  return err;
+}
 
 export function buildServer(deps: RelayDeps): { server: Server } {
   const relay = createRelay(deps);
@@ -58,21 +97,60 @@ export function buildServer(deps: RelayDeps): { server: Server } {
       const req = call.request;
       const e = req.exec;
       if (!e) {
-        call.destroy(new Error('ExecRequest missing exec field'));
+        const err = new Error('ExecRequest missing exec field') as Error & {
+          code: number;
+          details: string;
+        };
+        // The request itself is malformed, so this one IS the caller's fault.
+        err.code = status.INVALID_ARGUMENT;
+        err.details = err.message;
+        failExecStream(call, err);
         return;
       }
       // Registered synchronously (before the loop's first await) so a
       // cancellation that races the very first event is never missed.
-      const onCancelled = () => relay.routeAbort(req.sandboxId, e.reqId);
+      // A client cancel also reaches us as an in-stream ExecEvent.error (the worker's
+      // acknowledgement of our abort), but that is OUR abort completing, not a server-side
+      // exec failure -- so it must not be reclassified as INTERNAL below.
+      let cancelled = false;
+      const onCancelled = () => {
+        cancelled = true;
+        relay.routeAbort(req.sandboxId, e.reqId);
+      };
       call.on('cancelled', onCancelled);
 
       try {
+        // Tracked as a flag, not by testing the message text: an ExecEvent.error with an
+        // EMPTY message is still a failing Exec, and classifying on `message` alone would
+        // silently re-admit it as a success (the Go exec-driver learned the same lesson --
+        // see its sawErr note in cmd/exec-driver/drive.go).
+        let sawExecError = false;
+        let execErrorMessage = '';
         for await (const ev of relay.routeExec(req.sandboxId, e)) {
           call.write(ev);
+          if (ev.error) {
+            sawExecError = true;
+            execErrorMessage = ev.error.message ?? '';
+          }
+        }
+        // A failed Exec must not terminate OK (#295). routeExec returns normally after
+        // yielding an error event, so ending here would report success for a command that
+        // never ran: it would count toward throughput, enter p95, and never be classified
+        // as an error by a client that reads only the terminal status.
+        if (sawExecError && !cancelled) {
+          failExecStream(call, execStreamError(execErrorMessage));
+          return;
         }
         call.end();
       } catch (err) {
-        call.destroy(err as Error);
+        // Reached by every throw out of routeExec -- including `no live worker for sandbox`
+        // (an ordinary state: the worker died, or has not attached yet) and the reqId
+        // in-flight collision. Codes are left to grpc-js rather than classified here: an
+        // arbitrary internal throw becomes UNKNOWN with its message as the details, and a
+        // thrown error that already carries a numeric `code` keeps it. Mapping these onto
+        // specific codes (UNAVAILABLE for a missing worker, say) is a relay-semantics
+        // decision, not part of fixing the termination primitive.
+        failExecStream(call, err as Error);
       } finally {
         call.removeListener('cancelled', onCancelled);
       }
