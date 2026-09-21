@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kagenti/serverless-harness/remote-worker/internal/session"
 	"github.com/kagenti/serverless-harness/remote-worker/internal/vmpool"
 )
 
@@ -276,6 +277,63 @@ func TestDiagStatsMuxDoesNotAlsoExposePprof(t *testing.T) {
 		_ = res.Body.Close()
 		if res.StatusCode != http.StatusNotFound {
 			t.Errorf("GET %s status = %d, want 404 - the stats mux is exposing pprof", path, res.StatusCode)
+		}
+	}
+}
+
+// Issue #305, Task 1.2. session.DefaultConcurrency is 4, and it sizes a FIXED pool of
+// goroutines -- one per concurrency slot -- so a worker left at it serves 4 Execs at once
+// however many are dispatched. 4 is defensible for the container worker, whose
+// worker-deployment.yaml limit is 256Mi and whose per-slot cost is 2 x 8 MiB of stream
+// buffer (internal/exec/runner.go's MEMORY BUDGET note: raising slots to 16 would put the
+// worst case AT that limit, reinstating an OOMKill a relay can trigger at will). It is
+// wrong for this tier: the microVM worker has no pod limit, its memory is gated by the
+// MANDATORY SH_MAX_COMMITTED_MB over 256 MiB guests, and 16 slots measured 172.88 Exec/s
+// against 62.99 at 4 on the same host -- 2.74x.
+//
+// So the default belongs per tier, not in the shared library constant.
+func TestWorkerMaxConcurrentDefaultsToTheMicrovmTierNotTheLibrary(t *testing.T) {
+	got, err := workerMaxConcurrent(envFrom(map[string]string{}))
+	if err != nil {
+		t.Fatalf("workerMaxConcurrent: %v", err)
+	}
+	if got != microvmDefaultConcurrency {
+		t.Fatalf("default slots = %d, want the microVM tier default %d", got, microvmDefaultConcurrency)
+	}
+	// The point of the change: this tier must NOT inherit the container tier's 4.
+	if got == session.DefaultConcurrency {
+		t.Fatalf("default slots = %d, which is still session.DefaultConcurrency -- the tier default is not in force", got)
+	}
+	// 16 is the largest slot count actually MEASURED (172.88 Exec/s). Anything above it is
+	// an extrapolation, and finding where slots stop paying is its own sweep (Task 1.3), so
+	// the default must not wander past the evidence.
+	if microvmDefaultConcurrency != 16 {
+		t.Fatalf("microvmDefaultConcurrency = %d; 16 is the largest measured slot count, so a change needs its own measurement", microvmDefaultConcurrency)
+	}
+}
+
+func TestWorkerMaxConcurrentHonoursTheEnvironment(t *testing.T) {
+	got, err := workerMaxConcurrent(envFrom(map[string]string{"WORKER_MAX_CONCURRENT": "32"}))
+	if err != nil {
+		t.Fatalf("workerMaxConcurrent: %v", err)
+	}
+	if got != 32 {
+		t.Fatalf("slots = %d, want 32", got)
+	}
+}
+
+// The pre-existing inline form was `if v, e := envInt64(...); e == nil { maxConcurrent = int(v) }`,
+// which DISCARDED the error: WORKER_MAX_CONCURRENT=abc silently ran at 4 slots. That is the
+// same silent fallback e11-density.sh now refuses, and it is worse here, because the whole
+// campaign turns on knowing a run's slot count. A malformed value must refuse.
+func TestWorkerMaxConcurrentRefusesAMalformedValueInsteadOfSilentlyUsingTheDefault(t *testing.T) {
+	for _, bad := range []string{"abc", "0", "-1", "4.5", "16 32", " "} {
+		got, err := workerMaxConcurrent(envFrom(map[string]string{"WORKER_MAX_CONCURRENT": bad}))
+		if err == nil {
+			t.Fatalf("WORKER_MAX_CONCURRENT=%q was accepted as %d slots; it must refuse", bad, got)
+		}
+		if !strings.Contains(err.Error(), "WORKER_MAX_CONCURRENT") {
+			t.Fatalf("WORKER_MAX_CONCURRENT=%q: error %q does not name the variable", bad, err)
 		}
 	}
 }
