@@ -20,6 +20,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -327,6 +328,21 @@ func jitter(d time.Duration) time.Duration {
 }
 
 func main() {
+	// Opt-in profiling. OFF unless SH_DIAG_PPROF names a bind address, because pprof
+	// serves goroutine dumps, heap contents and command lines to anyone who can reach
+	// it -- bind loopback (127.0.0.1:6060) and reach it over ssh, never 0.0.0.0.
+	//
+	// It is here because its absence cost a day: the worker's hot path could only be
+	// localised by SIGQUIT-ing it (which kills it) after a block profile turned out to
+	// be unavailable. See #305.
+	if addr := os.Getenv("SH_DIAG_PPROF"); addr != "" {
+		runtime.SetBlockProfileRate(10000) // ~1 sample per 10us blocked
+		runtime.SetMutexProfileFraction(5)
+		go func() {
+			log.Printf("microvm-worker: SH_DIAG_PPROF listening on %s: %v", addr, http.ListenAndServe(addr, nil))
+		}()
+	}
+
 	get := os.Getenv
 	cfg, err := poolConfig(get)
 	if err != nil {

@@ -215,6 +215,11 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 	// UNVERIFIED against real hardware (none is available to this task — see the
 	// task-15 report); this matches Firecracker's jailer documentation, but Task 16
 	// or the first rig run should confirm it before trusting it further.
+	// Restore phase timing, emitted only under SH_DIAG_PHASES (diag.go). The five
+	// time.Now() calls are ~100ns against a restore measured in tens of MILLISECONDS,
+	// so they are unconditional and only the log line is gated.
+	phaseStart := time.Now()
+	var phPrep, phWsImg, phJailer, phSock time.Duration
 	jailRoot := filepath.Join(l.opts.ChrootBase, filepath.Base(l.opts.FirecrackerBin), req.ID, "root")
 	apiSockHost := filepath.Join(jailRoot, apiSockRelPath)
 
@@ -309,10 +314,12 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 	// See this file's package-level comment for the absent-workspace-drive gap this
 	// depends on build-snapshot.sh closing: nothing makes the guest see this file as
 	// /dev/vdb until the golden image is built with that drive already attached.
+	phPrep = time.Since(phaseStart)
 	imgPath := filepath.Join(req.WorkspaceDir, "workspace.img")
 	if err := ensureWorkspaceImage(ctx, imgPath, l.opts.WorkspaceImageBytes); err != nil {
 		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: workspace image: %w", req.ID, err), cleanup())
 	}
+	phWsImg = time.Since(phaseStart) - phPrep
 	workspaceDst := filepath.Join(jailRoot, "workspace.img")
 	_ = os.Remove(workspaceDst)
 	if err := os.Link(imgPath, workspaceDst); err != nil {
@@ -367,10 +374,12 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: start jailer: %w", req.ID, err), cleanup())
 	}
 
+	phJailer = time.Since(phaseStart) - phPrep - phWsImg
 	if err := waitForUnixSocket(ctx, apiSockHost, 5*time.Second); err != nil {
 		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: API socket never appeared: %w", req.ID, err), cleanup())
 	}
 
+	phSock = time.Since(phaseStart) - phPrep - phWsImg - phJailer
 	fc := newFCClient(apiSockHost)
 	// vsock_override redirects the vsock device's host-side socket to a path of OUR
 	// choosing, rather than whatever uds_path build-snapshot.sh's guest_client.go
@@ -384,6 +393,12 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: load snapshot: %w", req.ID, err), cleanup())
 	}
 
+	if phaseLog != nil {
+		phLoad := time.Since(phaseStart) - phPrep - phWsImg - phJailer - phSock
+		phaseLog("vmpool: restore phases id=%s prep_us=%d wsimg_us=%d jailer_us=%d sockwait_us=%d loadsnap_us=%d total_us=%d",
+			req.ID, phPrep.Microseconds(), phWsImg.Microseconds(), phJailer.Microseconds(),
+			phSock.Microseconds(), phLoad.Microseconds(), time.Since(phaseStart).Microseconds())
+	}
 	return &firecrackerVM{
 		id:            req.ID,
 		key:           req.Key,
