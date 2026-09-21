@@ -1653,14 +1653,112 @@ stop_container_stack() {
   return 0
 }
 
+# worker_max_concurrent_for prints the SLOT COUNT the microvm worker must run with, given
+# the ladder's largest active-runs rung ($1).
+#
+# session.DefaultConcurrency is 4 and it sizes a fixed pool of goroutines -- one per
+# concurrency slot, per worker process -- so a worker left at the default serves at most 4
+# Execs at once no matter how many the driver dispatches. start_microvm_stack did not set
+# WORKER_MAX_CONCURRENT at all, so every microVM rung ever recorded measured that 4-slot cap
+# while the ladder swept c to 64, and the surplus c merely queued. The cap predicts the
+# recorded points (c=8 -> 4/62.2ms = 64.3 vs 67.76 measured; c=16 -> 4/61.4ms = 65.1 vs
+# 62.99), and lifting it to 16 measured 172.88 Exec/s where the default measured 62.99 on the
+# same host -- 2.74x, from one environment variable (issue #305).
+#
+# Default: the ladder's largest c, so slots and c move together and no rung is measuring the
+# queue in front of a smaller server. SH_E11_WORKER_MAX_CONCURRENT overrides it, in BOTH
+# directions -- Task 1.3 sweeps the slot count itself against a fixed c, and reproducing the
+# old 4-slot cap on purpose is how a lifted one is compared against it on the same box.
+#
+# An inherited WORKER_MAX_CONCURRENT is honoured as the lower-precedence source, because that
+# is how the 2.74x was measured before this function existed: the worker reads that name
+# itself, and with the driver now setting it EXPLICITLY, an operator passing it on the sudo
+# line (the only way anything reaches the grandchild worker, since sudo resets the
+# environment) would otherwise have it silently overwritten -- the exact class of defect this
+# helper exists to end. The resolved value and its source are logged either way, so a run's
+# slot count can be read off its own log rather than inferred.
+#
+# A malformed override REFUSES rather than falling back: falling back would restore the
+# default 4 silently and re-record the very artifact this exists to prevent, from a typo in
+# the one variable that controls it. Empty means unset, as it does for every other SH_E11_*
+# knob here. Returns non-zero rather than calling die() so the value can be validated by the
+# test suite without taking the process down.
+worker_max_concurrent_for() {
+  local max_c="$1"
+  # Named slot_source, not source: `source` is a bash builtin and shadowing it in a file this
+  # long invites a later edit to break sourcing in a way no test would reach.
+  local want slot_source
+  if [ -n "${SH_E11_WORKER_MAX_CONCURRENT:-}" ]; then
+    want="$SH_E11_WORKER_MAX_CONCURRENT"
+    slot_source="SH_E11_WORKER_MAX_CONCURRENT"
+  elif [ -n "${WORKER_MAX_CONCURRENT:-}" ]; then
+    want="$WORKER_MAX_CONCURRENT"
+    slot_source="an inherited WORKER_MAX_CONCURRENT"
+  else
+    want="$max_c"
+    slot_source="the ladder's largest active-runs rung"
+  fi
+  # A single bare positive integer. Rejects a decimal, a negative, 0 (a worker with no slots
+  # accepts nothing), a word, and a multi-value string.
+  if [ "$(printf '%s\n' "$want" | wc -l | tr -d ' ')" != "1" ] ||
+    [ "$(printf '%s\n' "$want" | grep -cxE '[0-9]+')" != "1" ] ||
+    [ "$want" -lt 1 ]; then
+    log "$slot_source='$want' is not a positive integer - refusing, because falling back to the default would silently re-measure the 4-slot cap of issue #305"
+    return 1
+  fi
+  # Strip leading zeros, so the three consumers of this value cannot disagree about its
+  # base. The validation above and the worker's own strconv.ParseInt(v, 10, 64) both read
+  # "010" as decimal 10, but $((...)) -- which start_microvm_stack uses to size SH_MAX_RUNS
+  # from this result -- reads it as OCTAL 8. Left alone, an override of 010 gives the worker
+  # 10 slots while permitting only 8 runs, and the Exec refusal that follows mid-rung reads
+  # as a VM-tier density ceiling: the artifact this helper exists to prevent, arrived at
+  # silently rather than by a refusal. Normalised here, at the single source, so a later
+  # arithmetic use of the returned value cannot reintroduce it.
+  #
+  # Textually, NOT via $((10#$want)): arithmetic normalisation would also wrap an absurd
+  # value into an acceptable one (99999999999999999999 -> 7766279631452241919, which
+  # ParseInt takes), where today it overflows ParseInt and the worker refuses at startup.
+  # AFTER the validation, because stripping first would turn "000" into the empty string,
+  # and empty is read as "unset" here -- it would resolve to the ladder default instead of
+  # being refused. Conversely it can never empty the string now: a value that passed
+  # `-lt 1` has a non-zero digit in it.
+  want="$(printf '%s' "$want" | sed 's/^0*//')"
+  log "worker slots: $want (from $slot_source)"
+  # Allowed, but never silent. Below the ladder's largest rung, the rungs above $want are
+  # measuring the QUEUE in front of a smaller server, not VM density -- which is exactly how
+  # the published microVM ladders came to record a 4-slot cap as a density ceiling. Say so at
+  # run time; the rung record's own maxConcurrent (read back from the worker) is what proves
+  # it afterwards.
+  if [ "$want" -lt "$max_c" ]; then
+    log "WARNING: worker slots ($want) < the ladder's largest active-runs rung ($max_c) - rungs above c=$want will measure queueing against a $want-slot server, not VM density (issue #305). Deliberate only if you are reproducing a capped ladder."
+  fi
+  printf '%s' "$want"
+}
+
 # start_microvm_stack starts one fresh microvm-worker process per (D, GuestRAMBytes)
 # slice -- both are startup-fixed config (vmpool.Config), so a new slice needs a new
-# process, not a running one reconfigured. SH_MAX_RUNS is sized to the largest
-# active-runs rung so the sweep's own ladder never trips the MaxRuns backstop and
-# gets misread as a VM-tier ceiling (spec section 7.3's lease-saturation metric row
-# makes the analogous point one tier up).
+# process, not a running one reconfigured. SH_MAX_RUNS is sized to whichever is larger of
+# the largest active-runs rung and the worker's slot count, so neither the sweep's own
+# ladder nor the slot pool can trip the MaxRuns backstop and get misread as a VM-tier
+# ceiling (spec section 7.3's lease-saturation metric row makes the analogous point one
+# tier up). WORKER_MAX_CONCURRENT is passed EXPLICITLY: left unset it defaulted to
+# session.DefaultConcurrency (4), which capped every microVM rung ever recorded -- see
+# worker_max_concurrent_for above.
 start_microvm_stack() {
   local d="$1" ram_mb="$2" max_c="$3"
+  # Resolved BEFORE the early return so an unusable override is refused even on a
+  # SH_E11_START_STACK=0 run, where the operator started the worker themselves and the
+  # value would otherwise go unchecked until the records came back at 4 slots.
+  local slots max_runs
+  slots="$(worker_max_concurrent_for "$max_c")" ||
+    die "cannot size the worker's concurrency slots - see the refusal above (issue #305)"
+  # MaxRuns must cover BOTH the ladder's largest rung and the slot count, whichever is
+  # larger: a worker with more slots than permitted runs refuses Execs mid-rung, and that
+  # refusal reads as a VM-tier density ceiling. The two can now diverge in either direction,
+  # because the slot count is independently overridable. $slots is safe bare in $((...))
+  # here only because worker_max_concurrent_for strips leading zeros; a raw "010" would be
+  # read as octal 8 on this line while the worker ran 10 slots.
+  max_runs=$(((slots > max_c ? slots : max_c) + d + 2))
   [ "$E11_START_STACK" = "1" ] || {
     log "microvm stack: SH_E11_START_STACK=0, reusing an already-running stack"
     return 0
@@ -1683,9 +1781,10 @@ start_microvm_stack() {
   (cd "$REMOTE_WORKER_DIR" && go build -o "$E11_WORKER_BIN" ./cmd/microvm-worker) ||
     die "go build ./cmd/microvm-worker failed - the microvm arm has nothing to drive, so every Exec would time a missing binary rather than a density ceiling"
 
-  log "microvm: starting the worker (D=$d guest=${ram_mb}MiB)"
+  log "microvm: starting the worker (D=$d guest=${ram_mb}MiB slots=$slots maxRuns=$max_runs)"
   SH_VMM=firecracker SH_STANDBY_DEPTH="$d" SH_GUEST_RAM_MB="$ram_mb" \
-    SH_MAX_RUNS=$((max_c + d + 2)) SH_MAX_COMMITTED_MB="$MAX_COMMITTED_MB" \
+    SH_MAX_RUNS="$max_runs" SH_MAX_COMMITTED_MB="$MAX_COMMITTED_MB" \
+    WORKER_MAX_CONCURRENT="$slots" \
     SH_SNAPSHOT_DIR="$SNAPSHOT_DIR" SH_SNAPSHOT_IMAGE="${SH_SNAPSHOT_IMAGE:-default}" \
     SH_WORKSPACE_ROOT="$WORKSPACE_ROOT" \
     SANDBOX_ID="e11-microvm-d${d}-ram${ram_mb}" RELAY_ADDR="localhost:${E11_RELAY_PORT}" \

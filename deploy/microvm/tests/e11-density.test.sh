@@ -532,6 +532,186 @@ case "$stack_body" in
 esac
 check "start_microvm_stack passes SH_DIAG_STATS_ADDR to the worker" "$stats_wired" "yes"
 
+# ---------------------------------------------------------------------------
+# 1d. The worker's SLOT COUNT is set by the driver, not left at the default (#305).
+#
+# session.DefaultConcurrency is 4, and it sizes a fixed pool of goroutines -- one per
+# concurrency slot, per worker process. start_microvm_stack never set
+# WORKER_MAX_CONCURRENT, so EVERY microVM rung ever recorded measured a 4-slot cap while
+# the ladder swept c to 64. That cap, not the VM pool, set throughput: it predicts the
+# recorded points to within a few percent (c=1 -> 1/55ms = 18.2 vs 18.18 measured;
+# c=8 -> 4/62.2ms = 64.3 vs 67.76; c=16 -> 4/61.4ms = 65.1 vs 62.99), and raising it to
+# 16 measured 172.88 Exec/s against 62.99 on the same host -- 2.74x from one env var.
+#
+# So a ladder whose slot count is below its largest c is not measuring density at all,
+# and the driver must not be able to start one by omission.
+# ---------------------------------------------------------------------------
+echo "1d. the worker's slot count is set from the ladder, not left at the default"
+
+slots_body="$(extract_fns worker_max_concurrent_for || true)"
+check "worker_max_concurrent_for helper exists" \
+  "$([ -n "$slots_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$slots_body" ]; then
+  slots_snippet="$(mktemp)"
+  # log() is a ONE-LINER in the driver, which extract_fn (opening line + bare closing "}")
+  # cannot delimit, so it is copied in the same way die() is copied for the PSS section
+  # above. Without it the helper's warning call reaches whatever `log` is on PATH -- on
+  # macOS that is /usr/bin/log, the system log tool, whose "Unknown subcommand '...'"
+  # usage text echoes the argument back and so satisfies a naive match on the warning's
+  # words. Every assertion below therefore requires the "e11: " prefix, which only the
+  # driver's own log emits.
+  printf '%s\n' 'log() { echo "e11: $*" >&2; }' >"$slots_snippet"
+  printf '%s\n' "$slots_body" >>"$slots_snippet"
+  # shellcheck disable=SC1090
+  . "$slots_snippet"
+
+  # Non-vacuousness: prove the prefix really is what distinguishes the driver's log from a
+  # PATH `log`, so the two warning assertions below cannot pass on a stranger's output.
+  check "the extracted snippet brings the driver's own log(), not PATH's" \
+    "$(log hello 2>&1 >/dev/null)" "e11: hello"
+
+  # The default is the ladder's largest rung: at slots < c the surplus c just queues, which
+  # is the 4-slot artifact this exists to prevent. Deliberately not "largest c plus
+  # headroom" -- the point of the sweep is that slots and c move together.
+  # Both names are cleared explicitly: an ambient WORKER_MAX_CONCURRENT is a legitimate
+  # lower-precedence source (below), so leaving it to the environment would make these two
+  # pass or fail for a reason that has nothing to do with the default.
+  check "defaults to the ladder's largest c" \
+    "$(SH_E11_WORKER_MAX_CONCURRENT='' WORKER_MAX_CONCURRENT='' worker_max_concurrent_for 16 2>/dev/null)" "16"
+  check "defaults to c=1 for a single-rung ladder" \
+    "$(SH_E11_WORKER_MAX_CONCURRENT='' WORKER_MAX_CONCURRENT='' worker_max_concurrent_for 1 2>/dev/null)" "1"
+
+  # Overridable, because Task 1.3 sweeps the slot count itself against a fixed c.
+  check "an explicit override wins over the ladder default" \
+    "$(SH_E11_WORKER_MAX_CONCURRENT=32 worker_max_concurrent_for 8 2>/dev/null)" "32"
+
+  # An inherited WORKER_MAX_CONCURRENT is how the 2.74x was measured before this helper
+  # existed -- the worker reads that name itself, and sudo resets the environment so the sudo
+  # line is the only way it reaches the grandchild. The driver now sets it explicitly, so
+  # ignoring an inherited one would silently overwrite the operator's value: the same defect
+  # class as never setting it at all.
+  check "an inherited WORKER_MAX_CONCURRENT is honoured over the ladder default" \
+    "$(SH_E11_WORKER_MAX_CONCURRENT='' WORKER_MAX_CONCURRENT=24 worker_max_concurrent_for 8 2>/dev/null)" "24"
+  check "SH_E11_WORKER_MAX_CONCURRENT wins over an inherited WORKER_MAX_CONCURRENT" \
+    "$(SH_E11_WORKER_MAX_CONCURRENT=32 WORKER_MAX_CONCURRENT=24 worker_max_concurrent_for 8 2>/dev/null)" "32"
+
+  # A leading zero must come back NORMALISED, because the value has three consumers that do
+  # not agree on the base. bash's `test -lt` and Go's strconv.ParseInt(v, 10, 64) both read
+  # "010" as decimal 10, but $((...)) reads it as OCTAL 8 -- so start_microvm_stack would
+  # hand the worker 10 slots while sizing SH_MAX_RUNS from 8. That is the one input class
+  # where the guard silently UNDER-sizes instead of refusing, and an under-sized MaxRuns
+  # makes the worker refuse Execs mid-rung -- a refusal that reads as a VM-tier density
+  # ceiling, which is the artifact this whole section exists to prevent (PR #312 review).
+  # Normalised at the source rather than per-consumer, so a later arithmetic use of the
+  # returned value cannot reintroduce it.
+  check "a leading-zero override returns decimal, not octal" \
+    "$(SH_E11_WORKER_MAX_CONCURRENT=010 WORKER_MAX_CONCURRENT='' worker_max_concurrent_for 8 2>/dev/null)" "10"
+  check "...and more than one leading zero is stripped too" \
+    "$(SH_E11_WORKER_MAX_CONCURRENT=0010 WORKER_MAX_CONCURRENT='' worker_max_concurrent_for 8 2>/dev/null)" "10"
+  check "an inherited leading-zero value is normalised on the same footing" \
+    "$(SH_E11_WORKER_MAX_CONCURRENT='' WORKER_MAX_CONCURRENT=007 worker_max_concurrent_for 4 2>/dev/null)" "7"
+  # The consequence, exercised the way start_microvm_stack exercises it: the returned value
+  # is fed straight to $((...)) to size SH_MAX_RUNS. Asserted on the arithmetic rather than
+  # on the string alone, because the string being "10" is only interesting insofar as every
+  # consumer then agrees -- 12 here is the under-sized answer the octal read produces.
+  lz_slots="$(SH_E11_WORKER_MAX_CONCURRENT=010 WORKER_MAX_CONCURRENT='' worker_max_concurrent_for 8 2>/dev/null)"
+  check "the returned value is octal-safe in the SH_MAX_RUNS arithmetic" \
+    "$(((lz_slots > 8 ? lz_slots : 8) + 2 + 2))" "14"
+  # A normalising step must not run BEFORE validation: stripping first turns an all-zeros
+  # value into the empty string, and empty is deliberately read as "unset" two checks above,
+  # which would resolve it to the ladder default instead of refusing it.
+  check "an all-zeros override is still refused, not normalised into unset" \
+    "$(SH_E11_WORKER_MAX_CONCURRENT=000 WORKER_MAX_CONCURRENT='' worker_max_concurrent_for 8 >/dev/null 2>&1; echo $?)" "1"
+
+  # The resolved value AND where it came from are logged, so a run's slot count is readable
+  # off its own log instead of being inferred from the records afterwards.
+  slots_prov="$(SH_E11_WORKER_MAX_CONCURRENT='' WORKER_MAX_CONCURRENT=24 worker_max_concurrent_for 8 2>&1 >/dev/null)"
+  case "$slots_prov" in
+  *"e11: worker slots: 24 (from an inherited WORKER_MAX_CONCURRENT)"*) logged=yes ;;
+  *) logged=no ;;
+  esac
+  check "logs the resolved slot count and its source" "$logged" "yes"
+  # Including BELOW the ladder's max: that is how the 4-slot cap gets reproduced on
+  # purpose, to compare against a lifted one on the same box.
+  # 2>/dev/null only to keep this suite's output clean -- the warning it drops is asserted
+  # on its own two checks below.
+  check "an override below the ladder max is honoured, not clamped up" \
+    "$(SH_E11_WORKER_MAX_CONCURRENT=4 WORKER_MAX_CONCURRENT='' worker_max_concurrent_for 16 2>/dev/null)" "4"
+
+  # Allowed but never silent: a ladder whose slots sit below its largest c is measuring a
+  # queue, and that is precisely how the published microVM ladders recorded a 4-slot cap as
+  # a density ceiling. The warning goes to stderr, so it cannot corrupt the value on stdout.
+  slots_warn="$(SH_E11_WORKER_MAX_CONCURRENT=4 WORKER_MAX_CONCURRENT='' worker_max_concurrent_for 16 2>&1 >/dev/null)"
+  # Not anchored at the start, because the provenance line above is emitted first. The
+  # "e11: " prefix is what keeps it non-vacuous, and the check two lines up proves only the
+  # driver's own log() can produce it.
+  case "$slots_warn" in
+  *"e11: WARNING:"*"(4)"*"(16)"*) warned=yes ;;
+  *) warned=no ;;
+  esac
+  check "warns when the slot count is below the ladder's largest c" "$warned" "yes"
+  # ...and does NOT warn when they match, or the warning becomes noise every run.
+  slots_quiet="$(SH_E11_WORKER_MAX_CONCURRENT='' WORKER_MAX_CONCURRENT='' worker_max_concurrent_for 16 2>&1 >/dev/null)"
+  case "$slots_quiet" in
+  *"e11: WARNING:"*) quiet=no ;;
+  *) quiet=yes ;;
+  esac
+  check "does not warn when slots equal the ladder's largest c" "$quiet" "yes"
+
+  # A malformed override must REFUSE, not fall back. Falling back would silently restore
+  # the default 4 and re-record the artifact -- the failure mode this whole section is
+  # about, reintroduced by a typo in the one variable that controls it.
+  # An EMPTY value is not malformed: it means unset, as it does for every other SH_E11_*
+  # knob in this script (SH_E11_ACTIVE_RUNS and friends all read through `${VAR:-default}`),
+  # and the two default cases above pin that reading.
+  for bad in "abc" "0" "-1" "4.5" "8 16"; do
+    bad_err="$(SH_E11_WORKER_MAX_CONCURRENT="$bad" WORKER_MAX_CONCURRENT='' worker_max_concurrent_for 8 2>&1 >/dev/null)"
+    bad_rc="$?"
+    check "refuses a non-positive-integer override (${bad:-<empty>})" "$bad_rc" "1"
+    # And says so as the driver, naming the variable -- a refusal the operator cannot trace
+    # back to the knob they set is how a capped ladder gets re-run by accident.
+    case "$bad_err" in
+    "e11: SH_E11_WORKER_MAX_CONCURRENT="*) named=yes ;;
+    *) named=no ;;
+    esac
+    check "...and names the variable in its refusal (${bad:-<empty>})" "$named" "yes"
+  done
+
+  # The inherited name is validated on the same footing, and its refusal names THAT source --
+  # an operator who typo'd the sudo line must not be sent to look at SH_E11_WORKER_MAX_CONCURRENT.
+  inh_err="$(SH_E11_WORKER_MAX_CONCURRENT='' WORKER_MAX_CONCURRENT=abc worker_max_concurrent_for 8 2>&1 >/dev/null)"
+  inh_rc="$?"
+  check "a malformed inherited WORKER_MAX_CONCURRENT is refused too" "$inh_rc" "1"
+  case "$inh_err" in
+  "e11: an inherited WORKER_MAX_CONCURRENT="*) inh_named=yes ;;
+  *) inh_named=no ;;
+  esac
+  check "...and the refusal names the inherited source, not the SH_E11_ one" "$inh_named" "yes"
+
+  rm -f "$slots_snippet"
+fi
+
+# The driver must actually PASS it, or the worker silently keeps session.DefaultConcurrency
+# and the ladder measures 4 slots again. Asserted on the env assignment, not the bare name:
+# the name alone also appears in this function's own explanatory comment.
+case "$stack_body" in
+*"WORKER_MAX_CONCURRENT="*) slots_wired=yes ;;
+*) slots_wired=no ;;
+esac
+check "start_microvm_stack passes WORKER_MAX_CONCURRENT to the worker" "$slots_wired" "yes"
+
+# SH_MAX_RUNS is the MaxRuns backstop, and it must stay >= the slot count: a worker with
+# more slots than permitted runs would refuse Execs mid-rung and the refusal would be read
+# as a VM-tier ceiling. Sizing it from max_c alone is no longer sufficient once the slot
+# count can exceed the ladder's largest c via the override.
+case "$stack_body" in
+*'SH_MAX_RUNS=$((max_c + d + 2))'*) runs_sized_from_c=yes ;;
+*) runs_sized_from_c=no ;;
+esac
+check "SH_MAX_RUNS is no longer sized from max_c alone (it must cover the slot count)" \
+  "$runs_sized_from_c" "no"
+
 # Both figures on the same rung, so the proxy can be retired against evidence from one
 # run rather than by assertion. The proxy is deliberately NOT removed yet (#306 step 3).
 # From `rec = {` and not from the 'arm' field: 'arm' appears well AFTER
