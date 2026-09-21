@@ -1,6 +1,7 @@
 import {
   Server,
   ServerCredentials,
+  status,
   type ServerDuplexStream,
   type ServerWritableStream,
   type ServerUnaryCall,
@@ -21,6 +22,20 @@ import {
 } from '@sh/k8s-sandbox';
 import { RedisRecordStore } from '@sh/harness';
 import { createRelay, type RelayDeps, type AttachStream } from './relay.js';
+
+/**
+ * A worker-reported in-stream exec failure, shaped so grpc-js terminates the stream with
+ * a non-OK status instead of OK. INTERNAL (not UNKNOWN) because the failure is server-side
+ * and not the caller's fault: `ExecEvent.error` means the exec machinery itself failed,
+ * whereas a command that merely exited non-zero comes back as `ExecEvent.end{exitCode}`.
+ * The worker's message travels as the status details so the cause is not lost.
+ */
+function execStreamError(message: string): Error {
+  const err = new Error(message) as Error & { code: number; details: string };
+  err.code = status.INTERNAL;
+  err.details = message;
+  return err;
+}
 
 export function buildServer(deps: RelayDeps): { server: Server } {
   const relay = createRelay(deps);
@@ -63,12 +78,37 @@ export function buildServer(deps: RelayDeps): { server: Server } {
       }
       // Registered synchronously (before the loop's first await) so a
       // cancellation that races the very first event is never missed.
-      const onCancelled = () => relay.routeAbort(req.sandboxId, e.reqId);
+      // A client cancel also reaches us as an in-stream ExecEvent.error (the worker's
+      // acknowledgement of our abort), but that is OUR abort completing, not a server-side
+      // exec failure -- so it must not be reclassified as INTERNAL below.
+      let cancelled = false;
+      const onCancelled = () => {
+        cancelled = true;
+        relay.routeAbort(req.sandboxId, e.reqId);
+      };
       call.on('cancelled', onCancelled);
 
       try {
+        // Tracked as a flag, not by testing the message text: an ExecEvent.error with an
+        // EMPTY message is still a failing Exec, and classifying on `message` alone would
+        // silently re-admit it as a success (the Go exec-driver learned the same lesson --
+        // see its sawErr note in cmd/exec-driver/drive.go).
+        let sawExecError = false;
+        let execErrorMessage = '';
         for await (const ev of relay.routeExec(req.sandboxId, e)) {
           call.write(ev);
+          if (ev.error) {
+            sawExecError = true;
+            execErrorMessage = ev.error.message ?? '';
+          }
+        }
+        // A failed Exec must not terminate OK (#295). routeExec returns normally after
+        // yielding an error event, so ending here would report success for a command that
+        // never ran: it would count toward throughput, enter p95, and never be classified
+        // as an error by a client that reads only the terminal status.
+        if (sawExecError && !cancelled) {
+          call.destroy(execStreamError(execErrorMessage));
+          return;
         }
         call.end();
       } catch (err) {
