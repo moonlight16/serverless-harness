@@ -618,16 +618,42 @@ discover_pids() {
 # that mm is gone. Note it must be READ, not stat'ed: every procfs file reports
 # st_size 0, so `[ -s ]` here would call every healthy VMM mm-less.
 #
-# Returns 0 ("the mm is gone", so contribute 0) ONLY when cmdline is readable and
-# reads empty. An absent or unreadable cmdline is ambiguous -- proof of nothing --
-# and returns 1 so the caller keeps refusing: treating "cannot tell" as 0 is exactly
-# how Sigma PSS would silently vanish on a misconfigured SH_E11_PROC_ROOT.
+# Returns 0 ("the mm is gone", so contribute 0) in exactly two cases: cmdline reads
+# EMPTY (the dying-task case above), or the task is no longer there at all. Anything
+# else -- the read failed while the task is still alive -- is ambiguous, proof of
+# nothing, and returns 1 so the caller keeps refusing: treating "cannot tell" as 0 is
+# exactly how Sigma PSS would silently vanish on a misconfigured SH_E11_PROC_ROOT.
+#
+# The second case is issue #302, the gap this originally left. The caller's guard is
+# `kill -0 && ! pid_mm_is_gone`, so the pid was alive a moment ago -- but it can be
+# reaped inside this window, and then the read fails with ENOENT. Classifying that as
+# ambiguous refused on a pid that had simply exited: observed 4 times across 4 runs on
+# srv-r16b14s16, and inside host_signals_snapshot's idle-standby poll that refusal is
+# fatal, so it aborted the ladder. Re-testing `kill -0` is what separates it from a
+# live process we merely cannot read; note that "the proc entry is absent" on its own
+# does NOT, because that is also what a misconfigured SH_E11_PROC_ROOT looks like.
+#
+# There is deliberately no `[ -r ]` pre-test. It bought nothing -- the read is the
+# real test, and the file must be READ rather than stat'ed anyway (every procfs file
+# reports st_size 0) -- while adding a second, differently-handled failure path for
+# the same condition.
+#
+# The stderr redirect wraps the whole GROUP, not just tr. When the redirection itself
+# fails, bash reports that before tr is ever executed, so `tr ... 2>/dev/null` left a
+# bare "line NNN: ...: No such file or directory" in the run logs on every occurrence.
 pid_mm_is_gone() {
   local cmdline="$PROC_ROOT/$1/cmdline" content
-  [ -r "$cmdline" ] || return 1
-  content="$(tr -d '\0' <"$cmdline" 2>/dev/null)" || return 1
-  [ -n "$content" ] && return 1
-  return 0
+  if content="$( { tr -d '\0' <"$cmdline"; } 2>/dev/null )"; then
+    [ -n "$content" ] && return 1
+    return 0
+  fi
+  # `kill -0` distinguishes the two only because this sampler runs as root (which the
+  # VMM /proc probes require anyway): unprivileged, it also fails with EPERM on another
+  # user's live process, which would read here as "reaped". That is not a new exposure --
+  # the caller's own `kill -0` gate would have skipped such a pid before reaching us --
+  # but it is why the root requirement is load-bearing and not just convention.
+  kill -0 "$1" 2>/dev/null || return 0 # reaped mid-call: the exit race, 0 is correct
+  return 1                             # alive and unreadable: ambiguous, keep refusing
 }
 
 pss_bytes_for_pids() {
@@ -659,7 +685,7 @@ pss_bytes_for_pids() {
     pid_kb="$(awk '/^Pss:/{sum+=$2} END{print sum+0}' "$smaps" 2>/dev/null)" || pid_rc=$?
     if [ "$pid_rc" -ne 0 ] || [ -z "$pid_kb" ]; then
       if kill -0 "$pid" 2>/dev/null && ! pid_mm_is_gone "$pid"; then
-        die "smaps_rollup for pid $pid ($smaps) passed a readability test and then FAILED to read while the process is still alive - refusing to let it contribute 0 bytes to Sigma PSS (spec section 7.3's boxed warning). Most likely the pid is not ours: check SH_E11_VMM_PROC_PATTERN, which is matched with an unscoped pgrep -f and will pick up any process whose command line contains the pattern, including another user's."
+        die "smaps_rollup for pid $pid ($smaps) passed a readability test and then FAILED to read while the process is still alive AND still holds an address space - refusing to let it contribute 0 bytes to Sigma PSS (spec section 7.3's boxed warning). The two benign causes are already excused before this point: a task whose mm is torn down (empty cmdline) and one reaped mid-sample (#302). What is left is a live, memory-holding process we genuinely cannot read - most likely ptrace gating on a process we do not own, where the mode bits let -r pass and the open still yields EPERM, or an SH_E11_PROC_ROOT that is not this host's /proc. Note it is NOT evidence that SH_E11_VMM_PROC_PATTERN needs setting: it is meant to stay unset, because the jailer chroots so its install path matches nothing, and any value passed is matched inside sudo's own argv by the unscoped pgrep -f."
       fi
       continue # exited between the readability test and the read; a race, not a bad file
     fi
