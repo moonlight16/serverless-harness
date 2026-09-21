@@ -17,13 +17,18 @@ import (
 type Runner struct{ Pool Pool }
 
 func (r Runner) Run(ctx context.Context, s wexec.Spec, sink wexec.Sink) (int32, error) {
-	res, err := r.Pool.Exec(ctx, s.WorkspaceKey, Exec{
+	// ExecPhased, not Exec: Exec delegates to it with a throwaway Phases, so this costs
+	// nothing extra and makes the relayed path report the same decomposition vmpoolctl
+	// already gets. Without it the worker's hot path was unmeasurable (see diag.go).
+	var ph Phases
+	res, err := r.Pool.ExecPhased(ctx, s.WorkspaceKey, Exec{
 		ReqID:     s.ReqID,
 		Command:   s.Command,
 		Stdin:     s.Stdin,
 		TimeoutS:  s.TimeoutS,
 		Streaming: s.Streaming,
-	}, &sinkAdapter{sink: sink})
+	}, &sinkAdapter{sink: sink}, &ph)
+	logPhases(&ph)
 
 	// Report dropped bytes even on a failure path: an aborted exec still delivered
 	// whatever the guest had already sent, and declaring that untruncated is a false
