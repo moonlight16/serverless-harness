@@ -98,9 +98,46 @@ snapshot. That discriminates snapshot I/O and page-cache contention from every o
 serializer, and it is the difference between "the host cannot go faster" and "the host cannot go
 faster _through one snapshot file_".
 
-Each worker needs its own `SANDBOX_ID`, its own relay port and its own scratch Redis —
-`e11-density.sh`'s `start_microvm_stack` already assigns these per slice; what it has never done
-is start two microVM stacks concurrently, which is the code change this experiment needs.
+### Two concurrent workers need four things separated, and NO driver change
+
+`e11-density.sh` has never started two microVM stacks concurrently, but it does not need to be
+modified to do so: run it **twice**, concurrently, with these separated. Verified on the rig
+rather than assumed.
+
+| separate                       | why                                                                    |
+| ------------------------------ | ---------------------------------------------------------------------- |
+| `RESULTS`                      | rung filenames do not encode the worker; the two runs would overwrite  |
+| `SH_CHROOT_BASE`               | **the `vm-N` collision — see below**                                   |
+| `SH_WORKSPACE_ROOT`            | run keys are per-driver; same root means two workers in one tree       |
+| ports: relay, Redis, responder | `SH_E11_RELAY_PORT`, `SH_E11_REDIS_PORT`, `SH_E11_NULL_RESPONDER_PORT` |
+
+**The `vm-N` collision is the one that will bite.** `pool.nextIDLocked` mints ids as
+`vmIDPrefix + p.seq` where `p.seq` is a **per-process counter starting at zero**, so two worker
+processes both mint `vm-1`, `vm-2`, … and collide on the jail directory and the API socket. The
+launcher refuses exactly that, by design:
+
+```
+firecracker: restore vm-6: a live VMM already holds this VM id's API socket at
+/srv/jail/firecracker/vm-6/root/run/firecracker.socket — refusing to load a snapshot
+into another microVM
+```
+
+Give each worker its own `SH_CHROOT_BASE` (default `/srv/jail`) and the paths are namespaced, so
+the ids may repeat harmlessly. **`SH_CHROOT_BASE` is not in the explicit env list
+`start_microvm_stack` builds for the worker, but it reaches it anyway by inheritance** — bash's
+`VAR=val cmd` prefix adds to the inherited environment rather than replacing it. Verified on this
+rig: `sudo SH_CHROOT_BASE=/srv/jail-w1 driver` → the grandchild worker reads `/srv/jail-w1`. No
+code change is required for this experiment.
+
+Keep every base on the **same filesystem device** as `SH_SNAPSHOT_DIR` — the snapshot build
+hardlinks between them (METAL-RUNBOOK.md §2). On this rig `/srv` is one device, so
+`/srv/jail-w1` and `/srv/jail-w2` are both fine.
+
+**`SANDBOX_ID` is derived** (`e11-microvm-d${d}-ram${ram_mb}`) and is **not** overridable, so both
+workers register under the same id. Each has its own relay, so this is expected to be harmless —
+but confirm it in the smoke pass rather than assuming, because it is the one shared name left and
+a worker attaching to the wrong relay is the "silently wrong data" failure METAL-RUNBOOK.md §3a
+exists for. If it does matter, that is the one change the driver would need.
 
 ## The run
 
