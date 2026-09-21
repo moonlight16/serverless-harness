@@ -477,6 +477,81 @@ if [ -n "$pss_body" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 1c. coldAcquireRate is a PROXY, and the real rate now comes from the worker (#306).
+#
+# The recorded coldAcquireRate counts Execs whose end-to-end latency exceeded
+# SH_E11_COLD_LATENCY_MS. Measured against vmpool.Phases.Cold on the same runs it was
+# wrong by 13x at c=8 (0.76 reported vs 0.056 true) and by ~250x at c=16 (~1.0 vs
+# 0.0039). It cannot be repaired by tuning the threshold: Acquire is 0.3% of an Exec,
+# so no threshold on end-to-end latency separates a warm acquire from a cold one.
+#
+# vmpool has always maintained the real counters; nothing outside vmpoolctl could read
+# them, because the worker never exposed Stats. It now serves them on
+# SH_DIAG_STATS_ADDR, and the rate is computed from a DIFF across the rung's own timed
+# window -- the counters are process-lifetime totals, so a rung that did not diff them
+# would report every earlier rung's acquires too.
+# ---------------------------------------------------------------------------
+echo "1c. the true cold-acquire rate is derived from the worker's own counters"
+
+rate_body="$(extract_fns cold_acquire_rate_true || true)"
+check "cold_acquire_rate_true helper exists" \
+  "$([ -n "$rate_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$rate_body" ]; then
+  rate_snippet="$(mktemp)"
+  printf '%s\n' "$rate_body" >"$rate_snippet"
+  # shellcheck disable=SC1090
+  . "$rate_snippet"
+
+  check "all-warm window is 0, not the proxy's inflated figure" \
+    "$(cold_acquire_rate_true 100 0 200 0)" "0.000000"
+  check "all-cold window is 1" \
+    "$(cold_acquire_rate_true 100 0 100 50)" "1.000000"
+  check "a 900-warm/100-cold window is 0.1, near the measured true figure" \
+    "$(cold_acquire_rate_true 0 0 900 100)" "0.100000"
+
+  # A rung in which nothing was acquired has NO rate, and must not record 0: zero cold
+  # out of zero acquires reads as "replenishment kept up perfectly", which is the
+  # optimistic direction. -1 is outside [0,1] so it can never be mistaken for a rate.
+  check "a window with no acquires reports -1 (undeterminable), not 0" \
+    "$(cold_acquire_rate_true 500 7 500 7)" "-1"
+
+  # Counters are process-lifetime totals, so going backwards means the worker restarted
+  # mid-ladder. The diff is then meaningless and must not be recorded as a rate.
+  check "counters going backwards report -1, not a negative or wrapped rate" \
+    "$(cold_acquire_rate_true 900 100 10 2)" "-1"
+
+  rm -f "$rate_snippet"
+fi
+
+# The driver must actually ask for the endpoint, or every rung silently records -1.
+stack_body="$(extract_fn start_microvm_stack || true)"
+case "$stack_body" in
+*SH_DIAG_STATS_ADDR*) stats_wired=yes ;;
+*) stats_wired=no ;;
+esac
+check "start_microvm_stack passes SH_DIAG_STATS_ADDR to the worker" "$stats_wired" "yes"
+
+# Both figures on the same rung, so the proxy can be retired against evidence from one
+# run rather than by assertion. The proxy is deliberately NOT removed yet (#306 step 3).
+# From `rec = {` and not from the 'arm' field: 'arm' appears well AFTER
+# coldAcquireRate in the template, so a range anchored there reads only the tail --
+# and then matches 'coldAcquireRate' against its proxyLimitations disclosure STRING
+# rather than the field. That is how the first draft of this check passed vacuously.
+rung_record="$(sed -n '/^rec = {/,/^}/p' "$SCRIPT")"
+# Matched with its interpolation, because proxyLimitations carries a disclosure STRING
+# that also contains the field name -- matching the name alone cannot tell them apart.
+case "$rung_record" in *"'coldAcquireRate': \$cold_rate,"*) has_proxy=yes ;; *) has_proxy=no ;; esac
+case "$rung_record" in *"'coldAcquireRateTrue':"*) has_true=yes ;; *) has_true=no ;; esac
+case "$rung_record" in *"'maxConcurrent':"*) has_slots=yes ;; *) has_slots=no ;; esac
+check "the rung record still carries the proxy, for a same-run comparison" "$has_proxy" "yes"
+check "the rung record carries coldAcquireRateTrue beside it" "$has_true" "yes"
+# At every point measured so far it was MaxConcurrent, not the pool, that set
+# throughput -- and no rung record has ever carried it. Reported by the worker itself,
+# so it cannot disagree with the slot count actually in force.
+check "the rung record carries maxConcurrent" "$has_slots" "yes"
+
+# ---------------------------------------------------------------------------
 # 1b. The PSS helper's ONLY integration point: the JSON assembly that consumes it.
 #
 # Final-review H2. mem_available_bytes' awk was
@@ -768,6 +843,10 @@ if [ -n "$writer_body" ] && [ -n "$dim_body" ]; then
       standbys_resident=0 idle_residency=0 reclaim_converge_s=0 converge_p50=7
       errors_json='{}'
       SUBSTRATE=nested-m8i REPO_CACHE_SHAPE=accept-cold-fetch COLD_LATENCY_MS=50
+      # #306's interpolations. -1 is the "could not be determined" sentinel the writer
+      # records when the worker could not be asked, which is the normal case off the
+      # microvm arm; 4 stands in for a slot count the worker reported.
+      cold_rate_true=-1 max_concurrent=4
       E11_RUN_ID=RUN-FIXTURE
       # #294's interpolations. The label is what the checks below assert; the two notes stand
       # in for the long disclosure strings, whose presence (not text) is what matters here.
@@ -822,6 +901,20 @@ missing = [k for k in want if k not in d]
 print("missing:" + ",".join(missing) if missing else "all-present")
 ' "$ok_out" 2>&1)" || new_fields_rc=$?
   check "the record carries every field the #291 schema adds" "$new_fields" "all-present"
+
+  # #306, asserted on the RENDERED record: a field can be present in the template and
+  # still not survive interpolation (an unset variable makes the writer die with a
+  # SyntaxError, which is exactly the failure the section above exists for). -1 must
+  # arrive as a JSON number, not the string "-1", or a consumer averaging it silently
+  # coerces. The proxy must still be there too: retiring it is #306 step 3, after one
+  # run has compared the two.
+  cold_true="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(repr(d.get("coldAcquireRateTrue")), repr(d.get("maxConcurrent")), "coldAcquireRate" in d)
+' "$ok_out" 2>&1)" || true
+  check "the rendered record carries both cold figures and the worker's slot count" \
+    "$cold_true" "-1 4 True"
   check "  ...and json.load accepted it" "$new_fields_rc" "0"
   check "hostCpuFraction in the record is the UNDER-LOAD mean, not the post-load 0.0006" \
     "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hostCpuFraction"])' "$ok_out")" "0.41"

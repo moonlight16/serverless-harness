@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -182,5 +185,97 @@ func TestVerifyInstanceTypeSkipsWhenHostIsUndetectable(t *testing.T) {
 func TestStableHostIdentityNeverReturnsEmpty(t *testing.T) {
 	if got := stableHostIdentity(); got == "" {
 		t.Fatal("stableHostIdentity must always return a non-empty fallback")
+	}
+}
+
+// #306. e11-density.sh's coldAcquireRate is a LATENCY-CLASSIFICATION PROXY: it counts
+// Execs whose end-to-end latency exceeded SH_E11_COLD_LATENCY_MS. Measured against
+// vmpool.Phases.Cold on the same runs it was wrong by 13x at c=8 (0.76 reported vs 0.056
+// true) and by ~250x at c=16. It cannot be repaired by tuning the threshold, because
+// Acquire is 0.3% of an Exec -- no threshold on end-to-end latency separates warm from
+// cold.
+//
+// vmpool already maintains the real counters (Stats.WarmAcquires / .ColdAcquires), but
+// nothing outside vmpoolctl could ever read them: the worker never exposed Stats at all.
+// This is that transport, chosen over parsing SH_DIAG_PHASES log lines because the
+// counters are already authoritative and a log format is not a contract.
+func TestDiagStatsMuxServesTheRealWarmAndColdCounters(t *testing.T) {
+	statsFn := func() vmpool.Stats {
+		return vmpool.Stats{
+			InFlight:         3,
+			StandbysResident: 5,
+			WarmAcquires:     4096,
+			ColdAcquires: map[vmpool.ColdCause]uint64{
+				vmpool.ColdFirstExec: 8,
+				vmpool.ColdExhausted: 16,
+			},
+		}
+	}
+	srv := httptest.NewServer(diagStatsMux(statsFn, 16))
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/stats")
+	if err != nil {
+		t.Fatalf("GET /stats: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /stats status = %d, want 200", res.StatusCode)
+	}
+
+	var got struct {
+		InFlight      int               `json:"inFlight"`
+		WarmAcquires  uint64            `json:"warmAcquires"`
+		ColdAcquires  map[string]uint64 `json:"coldAcquires"`
+		MaxConcurrent int               `json:"maxConcurrent"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.WarmAcquires != 4096 {
+		t.Errorf("warmAcquires = %d, want 4096", got.WarmAcquires)
+	}
+	// Keyed by cause, not just a total: "exhausted" is the one that means replenishment
+	// is behind the Exec rate, and it is the only cold cause a density knee can be
+	// attributed to. first-exec is a session's unavoidable first restore.
+	if got.ColdAcquires["exhausted"] != 16 {
+		t.Errorf("coldAcquires[exhausted] = %d, want 16", got.ColdAcquires["exhausted"])
+	}
+	if got.ColdAcquires["first-exec"] != 8 {
+		t.Errorf("coldAcquires[first-exec] = %d, want 8", got.ColdAcquires["first-exec"])
+	}
+	if got.InFlight != 3 {
+		t.Errorf("inFlight = %d, want 3", got.InFlight)
+	}
+	// #306 step 4. Reported by the WORKER, not recorded by the driver from what it
+	// believes it set. Every E11 microVM rung ever recorded swept c to 64 against a
+	// 4-slot cap the driver never set and never wrote down, and at every point measured
+	// it was MaxConcurrent -- not the pool -- that set throughput. A rung record must
+	// not be readable without its slot count, and the only figure that cannot disagree
+	// with reality is the one the worker itself is using.
+	if got.MaxConcurrent != 16 {
+		t.Errorf("maxConcurrent = %d, want 16", got.MaxConcurrent)
+	}
+}
+
+// The stats listener must NOT be http.DefaultServeMux. This package imports
+// _ "net/http/pprof", which registers its handlers on the default mux at import time, so
+// serving stats there would mean that enabling counters ALSO served goroutine dumps, heap
+// contents and command lines to anyone who can reach the address. #308's reviewer note
+// already flagged that exposure for SH_DIAG_PPROF, which is opt-in and documented for it;
+// the counters must not smuggle it in behind a different variable.
+func TestDiagStatsMuxDoesNotAlsoExposePprof(t *testing.T) {
+	srv := httptest.NewServer(diagStatsMux(func() vmpool.Stats { return vmpool.Stats{} }, 4))
+	defer srv.Close()
+
+	for _, path := range []string{"/debug/pprof/heap", "/debug/pprof/goroutine", "/debug/pprof/cmdline"} {
+		res, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		_ = res.Body.Close()
+		if res.StatusCode != http.StatusNotFound {
+			t.Errorf("GET %s status = %d, want 404 - the stats mux is exposing pprof", path, res.StatusCode)
+		}
 	}
 }
