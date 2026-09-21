@@ -663,7 +663,7 @@ pss_bytes_for_pids() {
     smaps="$PROC_ROOT/$pid/smaps_rollup"
     if [ ! -r "$smaps" ]; then
       if kill -0 "$pid" 2>/dev/null && ! pid_mm_is_gone "$pid"; then
-        die "smaps_rollup unreadable for pid $pid ($smaps) - refusing to fall back to RSS (spec section 7.3's boxed warning)"
+        die "smaps_rollup unreadable for pid $pid ($smaps) while the process is alive and still holds an address space - refusing to fall back to RSS (spec section 7.3's boxed warning). This is the ABSENT case, not the refused-open one below: this sampler runs as root, so the mode bits let -r pass even on a process we do not own, and ptrace gating therefore fails at the open and takes that other refusal instead. The likely cause is an SH_E11_PROC_ROOT that is not this host's /proc, so no pid resolves under it; failing that, a kernel with no smaps_rollup at all (pre-4.14), where it is absent for every pid."
       fi
       continue # pid exited between discovery and sampling; not an unreadable file
     fi
@@ -685,7 +685,7 @@ pss_bytes_for_pids() {
     pid_kb="$(awk '/^Pss:/{sum+=$2} END{print sum+0}' "$smaps" 2>/dev/null)" || pid_rc=$?
     if [ "$pid_rc" -ne 0 ] || [ -z "$pid_kb" ]; then
       if kill -0 "$pid" 2>/dev/null && ! pid_mm_is_gone "$pid"; then
-        die "smaps_rollup for pid $pid ($smaps) passed a readability test and then FAILED to read while the process is still alive AND still holds an address space - refusing to let it contribute 0 bytes to Sigma PSS (spec section 7.3's boxed warning). The two benign causes are already excused before this point: a task whose mm is torn down (empty cmdline) and one reaped mid-sample (#302). What is left is a live, memory-holding process we genuinely cannot read - most likely ptrace gating on a process we do not own, where the mode bits let -r pass and the open still yields EPERM, or an SH_E11_PROC_ROOT that is not this host's /proc. Note it is NOT evidence that SH_E11_VMM_PROC_PATTERN needs setting: it is meant to stay unset, because the jailer chroots so its install path matches nothing, and any value passed is matched inside sudo's own argv by the unscoped pgrep -f."
+        die "smaps_rollup for pid $pid ($smaps) passed a readability test and then FAILED to read while the process is still alive AND still holds an address space - refusing to let it contribute 0 bytes to Sigma PSS (spec section 7.3's boxed warning). The two benign causes are already excused before this point: a task whose mm is torn down (empty cmdline) and one reaped mid-sample (#302). What is left is a live, memory-holding process we genuinely cannot read - most likely ptrace gating on a process we do not own, where the mode bits let -r pass and the open still yields EPERM. A wrong SH_E11_PROC_ROOT is NOT it: that makes the entry absent, which takes the refusal above instead. Note it is also NOT evidence that SH_E11_VMM_PROC_PATTERN needs setting: it is meant to stay unset, because the jailer chroots so its install path matches nothing, and any value passed is matched inside sudo's own argv by the unscoped pgrep -f."
       fi
       continue # exited between the readability test and the read; a race, not a bad file
     fi

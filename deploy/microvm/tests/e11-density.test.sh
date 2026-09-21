@@ -321,7 +321,6 @@ if [ -n "$pss_body" ]; then
     "$([ "$rc_hasmm" -ne 0 ] && echo yes || echo no)" "yes"
   check "that refusal still names smaps_rollup" "$named_hasmm" "yes"
 
-
   # Case F: an ABSENT cmdline is ambiguous -- it is not proof of a torn-down mm, it
   # is proof of nothing -- so it keeps refusing. Treating "cannot tell" as 0 would
   # silently zero Sigma PSS on a misconfigured SH_E11_PROC_ROOT, which is the
@@ -383,8 +382,14 @@ if [ -n "$pss_body" ]; then
   # and only read() fails, so tr's own stderr -- already muzzled -- is all you get,
   # and such a test passes with or without the fix). Source-shape assertions are this
   # file's existing idiom for exactly that situation.
+  #
+  # Anchored to the cmdline read itself rather than to a bare `} 2>/dev/null`, for the
+  # same reason Case J matches on the die LINE instead of the whole body: $pss_body holds
+  # BOTH functions, so any future group redirect anywhere in pss_bytes_for_pids would turn
+  # a body-wide match green whatever this read does. It is unique today; the anchor is what
+  # keeps it that way.
   case "$pss_body" in
-  *'} 2>/dev/null'*) muzzled=yes ;;
+  *'<"$cmdline"; } 2>/dev/null'*) muzzled=yes ;;
   *) muzzled=no ;;
   esac
   check "the cmdline read muzzles the REDIRECTION's own error, not just tr's" "$muzzled" "yes"
@@ -403,7 +408,7 @@ if [ -n "$pss_body" ]; then
   ) || rc_live_unreadable=$?
   check "a LIVE pid whose cmdline cannot be read still refuses (EPERM/EIO hole shut)" \
     "$([ "$rc_live_unreadable" -ne 0 ] && echo refuses || echo "admitted")" "refuses"
-  rmdir "$fake_proc/$live_pid/cmdline" "$fake_proc/$dead_pid/cmdline" 2>/dev/null || true
+  rmdir "$fake_proc/$live_pid/cmdline" 2>/dev/null || true
 
   # Case J: the wording of the SECOND refusal -- the one that fires when smaps_rollup
   # passes -r and then FAILS to read while the task is alive and still holds an address
@@ -438,6 +443,34 @@ if [ -n "$pss_body" ]; then
   case "$second_die" in *ptrace*) names_real_cause=yes ;; *) names_real_cause=no ;; esac
   check "that refusal names a cause that can actually produce it (ptrace gating)" \
     "$names_real_cause" "yes"
+
+  # Case K: and the wrong-root hint belongs on the FIRST refusal -- the one that fires
+  # when smaps_rollup is missing outright -- because that is the only one a wrong root
+  # can reach. A misconfigured SH_E11_PROC_ROOT makes the whole proc entry absent, so
+  # `[ ! -r "$smaps" ]` is true and the first refusal fires; landing on the second would
+  # need a path that passes -r and THEN fails to open (a directory at that name, a broken
+  # mount). Confirmed by execution: an empty PROC_ROOT plus a live pid takes the first.
+  # Offering the root as a likely cause of the SECOND sent a reader whose root is almost
+  # certainly fine off to re-verify it -- a milder form of the misdirection Case J removes.
+  #
+  # Same source-text idiom and the same reason as Cases H and J, and matched on each die
+  # LINE rather than the body: both function bodies discuss PROC_ROOT in comments, so a
+  # body-wide match would pass vacuously either way.
+  first_die="$(printf '%s\n' "$pss_body" | grep -F 'smaps_rollup unreadable for pid' || true)"
+  check "the absent-smaps_rollup refusal is still present to have wording at all" \
+    "$([ -n "$first_die" ] && echo yes || echo no)" "yes"
+  case "$first_die" in *SH_E11_PROC_ROOT*) root_diagnosed=yes ;; *) root_diagnosed=no ;; esac
+  check "the absent-smaps_rollup refusal names the cause that can actually reach it (a wrong root)" \
+    "$root_diagnosed" "yes"
+  # The mirror of Case J's "if it names it at all": the reads-after-r refusal may still
+  # mention the root, but only to RULE IT OUT -- never as something to go and check.
+  case "$second_die" in
+  *SH_E11_PROC_ROOT*'NOT it'*) root_ruled_out=yes ;;
+  *SH_E11_PROC_ROOT*) root_ruled_out=no ;;
+  *) root_ruled_out=yes ;;
+  esac
+  check "the reads-after-r refusal no longer offers a wrong root as a likely cause" \
+    "$root_ruled_out" "yes"
 
   stop_marker_process "$live_pid"
   rm -rf "$pss_tmpdir"
