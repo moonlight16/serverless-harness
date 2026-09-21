@@ -230,56 +230,67 @@ describe('checkMemoryLinks ReDoS resistance', () => {
   // doubled, time doubled. A crafted MEMORY.md in a third-party plugin skill would otherwise
   // hang the promote CLI for minutes.
   //
-  // This asserts that SHAPE rather than a wall-clock budget. The previous form gave each
-  // input 1500 ms, and it failed in CI at 1624 ms -- not because the bound regressed but
-  // because `make test` runs the workspaces in parallel, so this CPU-bound regex test
-  // competes with six other vitest suites on a two-core runner. Locally the slowest input
-  // takes ~128 ms; under that contention it stretched past the budget. A wall-clock
-  // assertion measures the machine and its load, not the code.
+  // It used to assert that shape by TIMING, and both timing forms it has had failed in CI.
+  // First a wall-clock budget of 1500 ms per input, which failed at 1624 ms. Then a RATIO --
+  // time 2x the input, require under 3x the time -- on the reasoning that contention slows
+  // both measurements and so cancels to first order. It does not. `make test` runs seven
+  // workspaces in parallel on a two-core runner, and interference there is additive per unit
+  // of wall clock, so the LONGER measurement absorbs more of it and the ratio is inflated
+  // rather than cancelled. Reproduced under 2x CPU oversubscription: the nested shape's small
+  // input still reached its true 10.6 ms floor in 4 of 9 samples, while its large input never
+  // got below 32.8 ms against a true 20.3 ms -- ratios of 3.09 (min/min) through 8.33 (worst)
+  // against a limit of 3. More samples cannot fix that, because there is no uncontended
+  // window of the longer length to find. Nor can the limit be raised: two consecutive CI runs
+  // of the same commit failed at 3.11 on one shape and 5.64 on another, and 5.64 is ABOVE the
+  // ~4x that marks the quadratic form the limit exists to sit below -- so on that runner the
+  // measurement cannot tell a ReDoS regression from a busy neighbour at any threshold. Idle,
+  // every shape measures 2.00x. The signal is real; a wall clock on a shared two-core runner
+  // is not an instrument that can see it.
   //
-  // A ratio does not. Contention slows both measurements, so it cancels to first order,
-  // while the linear-vs-quadratic signal survives: doubling the input costs ~2x bounded and
-  // ~4x unbounded. The threshold sits between them.
-  const RATIO_LIMIT = 3;
-  // Backstop only, deliberately far above any plausible bounded cost: catches a true hang
-  // (or a regression so severe the ratio is moot) without being the primary assertion.
-  const ABSOLUTE_CEILING_MS = 30_000;
+  // So the property is pinned where it actually comes from: the BOUND on each quantifier.
+  // Unbound any of them to reintroduce the quadratic rescan and these fail immediately, with
+  // no clock involved. The caps mirror src/preflight.ts.
+  const TITLE_CAP = 300;
+  const TARGET_CAP = 500;
+  const dangling = (index: string): number =>
+    checkMemoryLinks(index, ['included.md']).filter((f) => f.code === 'dangling_memory_link')
+      .length;
 
-  const median = (xs: number[]): number => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
-  const timeOnce = (evil: string): number => {
+  it('matches a markdown link whose title and target sit at the cap', () => {
+    // The bound must not be so tight that it stops seeing real links. This is the other
+    // half of the claim: at the cap the link is still found.
+    expect(dangling(`[${'a'.repeat(TITLE_CAP)}](missing.md)`)).toBe(1);
+    expect(dangling(`[T](${'b'.repeat(TARGET_CAP - 3)}.md)`)).toBe(1);
+  });
+
+  it('stops scanning a markdown link past the cap, rather than rescanning from every "["', () => {
+    // Unbounded `[^\]]+` / `[^)]+` match these; `{1,300}` / `{1,500}` cannot. Skipping a
+    // pathological link is the deliberate cost of the fix -- real memory links are far
+    // inside these bounds -- and it is the observable, clock-free signature of the bound.
+    expect(dangling(`[${'a'.repeat(TITLE_CAP + 1)}](missing.md)`)).toBe(0);
+    expect(dangling(`[T](${'b'.repeat(TARGET_CAP + 1)}.md)`)).toBe(0);
+  });
+
+  it('stops scanning a wikilink past the cap', () => {
+    expect(dangling(`[[${'a'.repeat(TITLE_CAP)}]]`)).toBe(1);
+    expect(dangling(`[[${'a'.repeat(TITLE_CAP + 1)}]]`)).toBe(0);
+  });
+
+  it('does not let a link span a newline', () => {
+    // The `\n` exclusion is the second half of the bound: without it a single unterminated
+    // '[' can consume the rest of the file before failing, which is the quadratic input.
+    expect(dangling('[a\nb](missing.md)')).toBe(0);
+    expect(dangling('[[a\nb]]')).toBe(0);
+  });
+
+  it('does not hang on adversarial bracket runs', () => {
+    // The one surviving timing assertion, and deliberately not a measurement: a backstop
+    // against a true hang. 30 s against a real cost of ~130 ms is a 200x margin, so no
+    // plausible amount of runner contention reaches it -- unlike a 3x ratio.
+    const ABSOLUTE_CEILING_MS = 30_000;
+    const adversarial = ['['.repeat(40_000), '[['.repeat(40_000), '[](' + '[(](('.repeat(16_000)];
     const t = performance.now();
-    checkMemoryLinks(evil, ['a.md']);
-    return performance.now() - t;
-  };
-
-  // Interleaved so a drifting machine (thermal throttling, a neighbour waking up) biases
-  // both series together rather than only the second one.
-  const timePair = (build: (reps: number) => string, reps: number) => {
-    const small: number[] = [];
-    const large: number[] = [];
-    for (let i = 0; i < 3; i++) {
-      small.push(timeOnce(build(reps)));
-      large.push(timeOnce(build(reps * 2)));
-    }
-    return { small: median(small), large: median(large) };
-  };
-
-  const shapes: [string, (reps: number) => string, number][] = [
-    ["a run of '['", (n) => '['.repeat(n), 20_000],
-    ["a run of '[['", (n) => '[['.repeat(n), 20_000],
-    ["nested '[(](('", (n) => '[](' + '[(](('.repeat(n), 8_000],
-  ];
-
-  for (const [label, build, reps] of shapes) {
-    it(`scales linearly, not quadratically, on ${label}`, () => {
-      const { small, large } = timePair(build, reps);
-      expect(large).toBeLessThan(ABSOLUTE_CEILING_MS);
-      // Guard the ratio against a denominator so small that noise dominates it. If the
-      // bounded implementation is fast enough that the base case is sub-millisecond, the
-      // ceiling above is the only meaningful claim -- say so rather than asserting on noise.
-      if (small >= 1) {
-        expect(large / small).toBeLessThan(RATIO_LIMIT);
-      }
-    });
-  }
+    for (const evil of adversarial) checkMemoryLinks(evil, ['included.md']);
+    expect(performance.now() - t).toBeLessThan(ABSOLUTE_CEILING_MS);
+  });
 });
