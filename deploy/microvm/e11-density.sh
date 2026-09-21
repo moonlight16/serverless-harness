@@ -1950,6 +1950,7 @@ run_density_rung() {
   if [ -n "$stats_before" ] && [ -n "$stats_after" ]; then
     read -r warm_b cold_b _ <<<"$stats_before"
     read -r warm_a cold_a max_concurrent <<<"$stats_after"
+    max_concurrent="${max_concurrent:--1}"
     cold_rate_true="$(cold_acquire_rate_true "$warm_b" "$cold_b" "$warm_a" "$cold_a")"
   fi
   : >"$sampler_stop"

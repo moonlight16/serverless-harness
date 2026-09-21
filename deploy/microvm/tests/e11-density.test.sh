@@ -502,13 +502,13 @@ check "start_microvm_stack passes SH_DIAG_STATS_ADDR to the worker" "$stats_wire
 # Both figures on the same rung, so the proxy can be retired against evidence from one
 # run rather than by assertion. The proxy is deliberately NOT removed yet (#306 step 3).
 # From `rec = {` and not from the 'arm' field: 'arm' appears well AFTER
-  # coldAcquireRate in the template, so a range anchored there reads only the tail --
-  # and then matches 'coldAcquireRate' against its proxyLimitations disclosure STRING
-  # rather than the field. That is how the first draft of this check passed vacuously.
-  rung_record="$(sed -n '/^rec = {/,/^}/p' "$SCRIPT")"
+# coldAcquireRate in the template, so a range anchored there reads only the tail --
+# and then matches 'coldAcquireRate' against its proxyLimitations disclosure STRING
+# rather than the field. That is how the first draft of this check passed vacuously.
+rung_record="$(sed -n '/^rec = {/,/^}/p' "$SCRIPT")"
 # Matched with its interpolation, because proxyLimitations carries a disclosure STRING
-  # that also contains the field name -- matching the name alone cannot tell them apart.
-  case "$rung_record" in *"'coldAcquireRate': \$cold_rate,"*) has_proxy=yes ;; *) has_proxy=no ;; esac
+# that also contains the field name -- matching the name alone cannot tell them apart.
+case "$rung_record" in *"'coldAcquireRate': \$cold_rate,"*) has_proxy=yes ;; *) has_proxy=no ;; esac
 case "$rung_record" in *"'coldAcquireRateTrue':"*) has_true=yes ;; *) has_true=no ;; esac
 case "$rung_record" in *"'maxConcurrent':"*) has_slots=yes ;; *) has_slots=no ;; esac
 check "the rung record still carries the proxy, for a same-run comparison" "$has_proxy" "yes"
