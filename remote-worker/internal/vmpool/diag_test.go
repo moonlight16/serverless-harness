@@ -68,12 +68,22 @@ func TestRunnerEmitsAllFourPhases(t *testing.T) {
 		t.Fatalf("want exactly one phase line per Exec, got %d: %v", len(*lines), *lines)
 	}
 	got := (*lines)[0]
-	// Every phase must be NAMED. Asserting on values would be a clock test; asserting on
-	// the field set is what catches a dropped phase or a rename, which is the failure that
-	// makes an aggregated run silently miss a term.
+	// Every phase must be NAMED. Asserting on durations would be a clock test -- the fake
+	// clock does not advance, so all four are legitimately 0 even on correct code. What the
+	// field set catches is a dropped phase or a rename, which is the failure that makes an
+	// aggregated run silently miss a term.
 	for _, field := range []string{"acquire_us=", "resume_us=", "run_us=", "destroy_us=", "cold="} {
 		if !strings.Contains(got, field) {
 			t.Errorf("phase line is missing %q: %s", field, got)
 		}
+	}
+	// cold is the one field that discriminates a populated Phases from a zero-valued one,
+	// and so it is what actually pins the ExecPhased wiring: the field NAMES above appear
+	// either way, because logPhases runs unconditionally on whatever it is handed. Only
+	// ExecPhased sets ph.Cold, and this is a fresh pool's first Exec on an unseen key, so
+	// the cause is deterministically first-exec -- no clock involved. Swap ExecPhased back
+	// to Exec and ph stays zero, leaving cold="" here.
+	if want := fmt.Sprintf("cold=%q", string(ColdFirstExec)); !strings.Contains(got, want) {
+		t.Errorf("phase line has no %s -- Phases was not populated (Exec, not ExecPhased): %s", want, got)
 	}
 }
