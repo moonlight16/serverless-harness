@@ -339,6 +339,139 @@ if [ -n "$pss_body" ]; then
     "$([ "$rc_nocmd" -ne 0 ] && echo yes || echo no)" "yes"
   check "that ambiguous refusal also names smaps_rollup" "$named_nocmd" "yes"
 
+  # Cases G-I close the gap #299 left (#302). #299 excuses a dying VMM only when
+  # cmdline is READABLE AND EMPTY. But the pid can be reaped in the window between
+  # `[ -r ]` and the read itself, and then the redirection fails with ENOENT -- which
+  # #299 classifies as "ambiguous" and still refuses. Observed 4 times across 4 runs
+  # on srv-r16b14s16, and inside host_signals_snapshot's idle-standby poll that
+  # refusal is FATAL, so it aborts the ladder.
+  #
+  # These call pid_mm_is_gone DIRECTLY, because pss_bytes_for_pids cannot reach the
+  # case: its guard is `kill -0 && ! pid_mm_is_gone`, so a pid that is already gone
+  # never gets that far. Calling it directly with a reaped pid is exactly the state
+  # the race leaves the function in -- kill -0 succeeded a moment ago, and by the
+  # time the read happens the task is gone.
+  #
+  # The discriminator has to be a RE-TEST of `kill -0`, not merely "the entry is
+  # absent": Case F above pins that a LIVE pid with an absent cmdline must keep
+  # refusing, because that is indistinguishable from a misconfigured
+  # SH_E11_PROC_ROOT, which is the optimistic-direction failure spec section 7.3
+  # forbids. "Absent AND the task is now gone" is the only safe reading.
+
+  # Case G: a reaped pid (absent proc entry, kill -0 fails) -> "gone" (0), not a refusal.
+  rc_reaped=0
+  (
+    PROC_ROOT="$fake_proc"
+    export PROC_ROOT
+    # shellcheck disable=SC1090
+    . "$pss_snippet"
+    pid_mm_is_gone "$dead_pid"
+  ) || rc_reaped=$?
+  check "a REAPED pid's absent cmdline reads as mm-gone, not an ambiguous refusal" \
+    "$rc_reaped" "0"
+
+  # Case H: and it does so SILENTLY. `2>/dev/null` attached to `tr` does NOT cover
+  # this: the failure is in the REDIRECTION, which bash reports itself before tr is
+  # ever executed -- hence the bare "line NNN: ...: No such file or directory" in run
+  # logs, which reads like a driver defect and is not. The stderr redirect must
+  # therefore wrap the whole group.
+  #
+  # Asserted against the SOURCE TEXT rather than by execution, deliberately: the
+  # runtime trigger is a TOCTOU race that cannot be staged deterministically, and the
+  # portable stand-ins do not reproduce it (on macOS, open() on a directory SUCCEEDS
+  # and only read() fails, so tr's own stderr -- already muzzled -- is all you get,
+  # and such a test passes with or without the fix). Source-shape assertions are this
+  # file's existing idiom for exactly that situation.
+  #
+  # Anchored to the cmdline read itself rather than to a bare `} 2>/dev/null`, for the
+  # same reason Case J matches on the die LINE instead of the whole body: $pss_body holds
+  # BOTH functions, so any future group redirect anywhere in pss_bytes_for_pids would turn
+  # a body-wide match green whatever this read does. It is unique today; the anchor is what
+  # keeps it that way.
+  case "$pss_body" in
+  *'<"$cmdline"; } 2>/dev/null'*) muzzled=yes ;;
+  *) muzzled=no ;;
+  esac
+  check "the cmdline read muzzles the REDIRECTION's own error, not just tr's" "$muzzled" "yes"
+
+  # Case I: the hole stays shut. Same unopenable cmdline, but the task is ALIVE --
+  # EPERM/EIO on a live, memory-HOLDING process is the hazard the guard exists for
+  # (spec section 7.3 forbids the RSS fallback), so it must still refuse.
+  mkdir -p "$fake_proc/$live_pid/cmdline"
+  rc_live_unreadable=0
+  (
+    PROC_ROOT="$fake_proc"
+    export PROC_ROOT
+    # shellcheck disable=SC1090
+    . "$pss_snippet"
+    pid_mm_is_gone "$live_pid"
+  ) || rc_live_unreadable=$?
+  check "a LIVE pid whose cmdline cannot be read still refuses (EPERM/EIO hole shut)" \
+    "$([ "$rc_live_unreadable" -ne 0 ] && echo refuses || echo "admitted")" "refuses"
+  rmdir "$fake_proc/$live_pid/cmdline" 2>/dev/null || true
+
+  # Case J: the wording of the SECOND refusal -- the one that fires when smaps_rollup
+  # passes -r and then FAILS to read while the task is alive and still holds an address
+  # space. A different message from Case A's, which fires when smaps_rollup is missing
+  # outright, and the one #302 step 5 is about.
+  #
+  # It used to end "Most likely the pid is not ours: check SH_E11_VMM_PROC_PATTERN".
+  # That is the wrong place to send the reader: in every observed occurrence the
+  # variable was unset at its correct default and the box was idle. It is also meant to
+  # STAY unset -- its absolute install path matches nothing, because the jailer chroots,
+  # and any value passed is matched inside sudo's own argv by the unscoped pgrep -f. So
+  # the message named the one thing that was not the cause, and pushed the reader toward
+  # setting a variable that makes matters worse.
+  #
+  # Asserted on the source text for the same reason as Case H: the trigger is a file
+  # that passes -r and then fails to open, which cannot be staged portably (on macOS awk
+  # opens a directory happily and just reads nothing, so the refusal never fires at all).
+  # Matched on the die LINE, not the whole body -- pss_bytes_for_pids' own comments
+  # already discuss ptrace gating, so a body-wide match would pass vacuously.
+  second_die="$(printf '%s\n' "$pss_body" | grep -F 'passed a readability test' || true)"
+  check "the reads-after-r refusal is still present to have wording at all" \
+    "$([ -n "$second_die" ] && echo yes || echo no)" "yes"
+  # The assertion is about MISDIRECTION, not about the substring: naming the variable in
+  # order to say "this is not it, leave it unset" is more useful than silence, because
+  # the old wording trained the reader to reach for it. What must not survive is the
+  # instruction to go and check it.
+  case "$second_die" in *'check SH_E11_VMM_PROC_PATTERN'*) misdirects=yes ;; *) misdirects=no ;; esac
+  check "that refusal no longer sends the reader to check SH_E11_VMM_PROC_PATTERN" \
+    "$misdirects" "no"
+  case "$second_die" in *'stay unset'*) disclaims=yes ;; *) disclaims=no ;; esac
+  check "and if it names it at all, it says to leave it unset" "$disclaims" "yes"
+  case "$second_die" in *ptrace*) names_real_cause=yes ;; *) names_real_cause=no ;; esac
+  check "that refusal names a cause that can actually produce it (ptrace gating)" \
+    "$names_real_cause" "yes"
+
+  # Case K: and the wrong-root hint belongs on the FIRST refusal -- the one that fires
+  # when smaps_rollup is missing outright -- because that is the only one a wrong root
+  # can reach. A misconfigured SH_E11_PROC_ROOT makes the whole proc entry absent, so
+  # `[ ! -r "$smaps" ]` is true and the first refusal fires; landing on the second would
+  # need a path that passes -r and THEN fails to open (a directory at that name, a broken
+  # mount). Confirmed by execution: an empty PROC_ROOT plus a live pid takes the first.
+  # Offering the root as a likely cause of the SECOND sent a reader whose root is almost
+  # certainly fine off to re-verify it -- a milder form of the misdirection Case J removes.
+  #
+  # Same source-text idiom and the same reason as Cases H and J, and matched on each die
+  # LINE rather than the body: both function bodies discuss PROC_ROOT in comments, so a
+  # body-wide match would pass vacuously either way.
+  first_die="$(printf '%s\n' "$pss_body" | grep -F 'smaps_rollup unreadable for pid' || true)"
+  check "the absent-smaps_rollup refusal is still present to have wording at all" \
+    "$([ -n "$first_die" ] && echo yes || echo no)" "yes"
+  case "$first_die" in *SH_E11_PROC_ROOT*) root_diagnosed=yes ;; *) root_diagnosed=no ;; esac
+  check "the absent-smaps_rollup refusal names the cause that can actually reach it (a wrong root)" \
+    "$root_diagnosed" "yes"
+  # The mirror of Case J's "if it names it at all": the reads-after-r refusal may still
+  # mention the root, but only to RULE IT OUT -- never as something to go and check.
+  case "$second_die" in
+  *SH_E11_PROC_ROOT*'NOT it'*) root_ruled_out=yes ;;
+  *SH_E11_PROC_ROOT*) root_ruled_out=no ;;
+  *) root_ruled_out=yes ;;
+  esac
+  check "the reads-after-r refusal no longer offers a wrong root as a likely cause" \
+    "$root_ruled_out" "yes"
+
   stop_marker_process "$live_pid"
   rm -rf "$pss_tmpdir"
 fi
