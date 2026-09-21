@@ -143,6 +143,19 @@ func (o FirecrackerOptions) validate() error {
 // --parent-cgroup alone only relocates the process into the shared parent). Split out
 // of Restore's argv construction so a test can assert the memory bound agrees with
 // PerVMBytes(cfg) without spawning jailer.
+// vmCgroupDirFor returns the cgroupfs path jailer will create for this VM, or "" when no
+// per-VM cgroup of ours exists. The empty case is load-bearing: with ParentCgroup unset,
+// firecrackerCgroupArgs omits --parent-cgroup entirely, so there is nothing to remove --
+// and returning a path anyway would resolve to Cgroup2Root itself and try to rmdir the
+// cgroup ROOT. Gated on exactly the same condition as firecrackerCgroupArgs so the two
+// cannot disagree about whether a cgroup was created.
+func vmCgroupDirFor(opts FirecrackerOptions, id string) string {
+	if opts.ParentCgroup == "" {
+		return ""
+	}
+	return vmCgroupPath(ParentCgroupPath(opts.ParentCgroup), id)
+}
+
 func firecrackerCgroupArgs(opts FirecrackerOptions) []string {
 	if opts.ParentCgroup == "" {
 		return nil
@@ -404,6 +417,7 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		key:           req.Key,
 		cmd:           cmd,
 		jailRoot:      jailRoot,
+		cgroupDir:     vmCgroupDirFor(l.opts, req.ID),
 		apiSockHost:   apiSockHost,
 		vsockHostPath: filepath.Join(jailRoot, vsockRelPath),
 		vsockPort:     l.opts.VsockPort,
@@ -585,8 +599,13 @@ func waitForUnixSocket(ctx context.Context, path string, timeout time.Duration) 
 type firecrackerVM struct {
 	id, key string
 
-	cmd           *exec.Cmd // the jailer process; execve's into FirecrackerBin, same pid
-	jailRoot      string
+	cmd      *exec.Cmd // the jailer process; execve's into FirecrackerBin, same pid
+	jailRoot string
+	// cgroupDir is the per-VM cgroup jailer was told to create, or "" when ParentCgroup is
+	// unset and jailer's own default placement is used. Recorded at restore so Destroy
+	// removes the SAME path that was created -- deriving it again later would let the two
+	// drift apart, and a removal that targets the wrong path silently does nothing.
+	cgroupDir     string
 	apiSockHost   string
 	vsockHostPath string
 	vsockPort     uint32
@@ -706,6 +725,32 @@ func (v *firecrackerVM) Destroy() error {
 	}
 	if err := os.RemoveAll(v.jailRoot); err != nil {
 		errs = append(errs, fmt.Errorf("remove jail %s: %w", v.jailRoot, err))
+	}
+	// Issue #255. Until this existed, the per-VM cgroup was removed only by SweepOrphans,
+	// which runs at STARTUP -- so one directory leaked per Exec for the whole life of the
+	// worker process and only a restart reclaimed them. That is not hygiene: cgroup
+	// create/destroy is kernel-serialised and degrades with how many exist, so a jailer
+	// cgroup that is slow to set up delays Firecracker binding its API socket, the cost
+	// lands in waitForUnixSocket (~90% of a restore, #304), and restores are how the
+	// standby pool replenishes. Measured at ~41,000 stale directories on one 16-slot
+	// worker: 25.84 Exec/s and a 1008 ms mean sockwait, against 136.51 and 98 ms with the
+	// directories removed and nothing else changed -- 5.3x.
+	//
+	// rmdir, never rm -rf (D5): cgroup directories are kernel-backed pseudo-files.
+	// removeCgroupDir is the same helper SweepOrphans uses, so the two paths cannot
+	// disagree about what removal means.
+	//
+	// The VMM was SIGKILLed and reaped above, so the kernel has already emptied
+	// cgroup.procs; waitForCgroupEmpty is a short bounded guard for the case where it has
+	// not yet, not an expected wait. A failure here is reported like the others -- the
+	// caller logs it and counts destroyFailed rather than failing the Exec, which is the
+	// right weight: a leaked directory must be visible, and must not break a command that
+	// already ran correctly.
+	if v.cgroupDir != "" {
+		waitForCgroupEmpty(v.cgroupDir)
+		if err := removeCgroupDir(v.cgroupDir); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
 }

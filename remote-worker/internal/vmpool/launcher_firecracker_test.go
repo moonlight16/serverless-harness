@@ -272,3 +272,96 @@ func envOr(k, def string) string {
 	}
 	return def
 }
+
+// Issue #255, escalated from hygiene to a measured 5.3x throughput defect.
+//
+// The per-VM cgroup is created by jailer (--cgroup) and, before this, was removed ONLY by
+// SweepOrphans -- which runs at startup. Destroy kills the process group, reaps it and
+// RemoveAll's the jail, but left the cgroup directory behind, so one leaked per Exec for the
+// whole life of the worker process and only a restart reclaimed them.
+//
+// Measured on srv-r16b14s16, one worker at 16 slots, 400 iters/slot, identical config either
+// side: ~41,000 stale directories gave 25.84 Exec/s with a mean restore sockwait of 1008 ms;
+// with the directories removed and nothing else changed, 136.51 Exec/s and 98 ms. Cgroup
+// create/destroy is kernel-serialised and degrades with how many exist, and a jailer cgroup
+// that is slow to set up delays Firecracker binding its API socket -- so the cost lands in
+// waitForUnixSocket, which is already ~90% of a restore (#304), and restores are how the
+// standby pool replenishes.
+//
+// The signature is worth knowing: throughput collapses while the host goes IDLE (88% idle at
+// the worst point), so a CPU-based diagnosis finds nothing.
+func TestDestroyRemovesThePerVMCgroupDirectory(t *testing.T) {
+	// A cgroup v2 tree is a directory with a cgroup.procs file, so this needs no root and
+	// no KVM. Empty pid list: Destroy has already SIGKILLed and reaped the VMM by this
+	// point, so the kernel has removed it from cgroup.procs.
+	slice := fakeSlice(t, map[string][]string{"vm-7": {}})
+	cgroupDir := filepath.Join(slice, "vm-7")
+	jailRoot := filepath.Join(t.TempDir(), "jail", "vm-7", "root")
+	if err := os.MkdirAll(jailRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Non-vacuousness: a test for a removal must first prove the thing is there, or it
+	// passes just as well against a path that never existed.
+	if _, err := os.Stat(cgroupDir); err != nil {
+		t.Fatalf("fixture: cgroup dir must exist before Destroy: %v", err)
+	}
+
+	vm := &firecrackerVM{id: "vm-7", key: "run-1", jailRoot: jailRoot, cgroupDir: cgroupDir}
+	if err := vm.Destroy(); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if _, err := os.Stat(cgroupDir); !os.IsNotExist(err) {
+		t.Fatalf("cgroup dir %s still exists after Destroy (err=%v) -- one leaks per Exec", cgroupDir, err)
+	}
+	// The pre-existing job still has to happen.
+	if _, err := os.Stat(jailRoot); !os.IsNotExist(err) {
+		t.Fatalf("jailRoot %s survived Destroy (err=%v)", jailRoot, err)
+	}
+}
+
+// ParentCgroup empty means jailer's own default placement is used and --parent-cgroup is
+// omitted entirely (firecrackerCgroupArgs returns nil), so there is no per-VM cgroup of ours
+// to remove. Destroy must not invent a path or fail.
+func TestDestroyToleratesNoPerVMCgroup(t *testing.T) {
+	jailRoot := filepath.Join(t.TempDir(), "jail", "vm-8", "root")
+	if err := os.MkdirAll(jailRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	vm := &firecrackerVM{id: "vm-8", key: "run-1", jailRoot: jailRoot, cgroupDir: ""}
+	if err := vm.Destroy(); err != nil {
+		t.Fatalf("Destroy with no cgroup dir: %v", err)
+	}
+}
+
+// Destroy is idempotent (it returns early on the second call), and that must not regress
+// into a second rmdir attempt reporting failure for an already-removed directory.
+func TestDestroyIsStillIdempotentWithCgroupRemoval(t *testing.T) {
+	slice := fakeSlice(t, map[string][]string{"vm-9": {}})
+	jailRoot := filepath.Join(t.TempDir(), "jail", "vm-9", "root")
+	if err := os.MkdirAll(jailRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	vm := &firecrackerVM{id: "vm-9", key: "run-1", jailRoot: jailRoot, cgroupDir: filepath.Join(slice, "vm-9")}
+	if err := vm.Destroy(); err != nil {
+		t.Fatalf("first Destroy: %v", err)
+	}
+	if err := vm.Destroy(); err != nil {
+		t.Fatalf("second Destroy must be a no-op, got: %v", err)
+	}
+}
+
+// The path Destroy removes must be the one jailer was told to create the cgroup under, or
+// the removal silently targets nothing. vmCgroupPath is the single authority on the name.
+func TestRestoreRecordsTheCgroupDirItToldJailerToUse(t *testing.T) {
+	opts := FirecrackerOptions{ParentCgroup: "microvm.slice/microvm-vms.slice"}
+	want := vmCgroupPath(ParentCgroupPath(opts.ParentCgroup), "vm-11")
+	if got := vmCgroupDirFor(opts, "vm-11"); got != want {
+		t.Fatalf("vmCgroupDirFor = %q, want %q", got, want)
+	}
+	// And empty ParentCgroup must yield no path at all, matching firecrackerCgroupArgs's
+	// nil return -- not Cgroup2Root itself, which would rmdir the cgroup ROOT.
+	if got := vmCgroupDirFor(FirecrackerOptions{}, "vm-11"); got != "" {
+		t.Fatalf("vmCgroupDirFor with no ParentCgroup = %q, want empty", got)
+	}
+}
