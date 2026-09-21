@@ -1706,6 +1706,23 @@ worker_max_concurrent_for() {
     log "$slot_source='$want' is not a positive integer - refusing, because falling back to the default would silently re-measure the 4-slot cap of issue #305"
     return 1
   fi
+  # Strip leading zeros, so the three consumers of this value cannot disagree about its
+  # base. The validation above and the worker's own strconv.ParseInt(v, 10, 64) both read
+  # "010" as decimal 10, but $((...)) -- which start_microvm_stack uses to size SH_MAX_RUNS
+  # from this result -- reads it as OCTAL 8. Left alone, an override of 010 gives the worker
+  # 10 slots while permitting only 8 runs, and the Exec refusal that follows mid-rung reads
+  # as a VM-tier density ceiling: the artifact this helper exists to prevent, arrived at
+  # silently rather than by a refusal. Normalised here, at the single source, so a later
+  # arithmetic use of the returned value cannot reintroduce it.
+  #
+  # Textually, NOT via $((10#$want)): arithmetic normalisation would also wrap an absurd
+  # value into an acceptable one (99999999999999999999 -> 7766279631452241919, which
+  # ParseInt takes), where today it overflows ParseInt and the worker refuses at startup.
+  # AFTER the validation, because stripping first would turn "000" into the empty string,
+  # and empty is read as "unset" here -- it would resolve to the ladder default instead of
+  # being refused. Conversely it can never empty the string now: a value that passed
+  # `-lt 1` has a non-zero digit in it.
+  want="$(printf '%s' "$want" | sed 's/^0*//')"
   log "worker slots: $want (from $slot_source)"
   # Allowed, but never silent. Below the ladder's largest rung, the rungs above $want are
   # measuring the QUEUE in front of a smaller server, not VM density -- which is exactly how
@@ -1738,7 +1755,9 @@ start_microvm_stack() {
   # MaxRuns must cover BOTH the ladder's largest rung and the slot count, whichever is
   # larger: a worker with more slots than permitted runs refuses Execs mid-rung, and that
   # refusal reads as a VM-tier density ceiling. The two can now diverge in either direction,
-  # because the slot count is independently overridable.
+  # because the slot count is independently overridable. $slots is safe bare in $((...))
+  # here only because worker_max_concurrent_for strips leading zeros; a raw "010" would be
+  # read as octal 8 on this line while the worker ran 10 slots.
   max_runs=$(((slots > max_c ? slots : max_c) + d + 2))
   [ "$E11_START_STACK" = "1" ] || {
     log "microvm stack: SH_E11_START_STACK=0, reusing an already-running stack"

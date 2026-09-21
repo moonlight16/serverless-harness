@@ -596,6 +596,34 @@ if [ -n "$slots_body" ]; then
   check "SH_E11_WORKER_MAX_CONCURRENT wins over an inherited WORKER_MAX_CONCURRENT" \
     "$(SH_E11_WORKER_MAX_CONCURRENT=32 WORKER_MAX_CONCURRENT=24 worker_max_concurrent_for 8 2>/dev/null)" "32"
 
+  # A leading zero must come back NORMALISED, because the value has three consumers that do
+  # not agree on the base. bash's `test -lt` and Go's strconv.ParseInt(v, 10, 64) both read
+  # "010" as decimal 10, but $((...)) reads it as OCTAL 8 -- so start_microvm_stack would
+  # hand the worker 10 slots while sizing SH_MAX_RUNS from 8. That is the one input class
+  # where the guard silently UNDER-sizes instead of refusing, and an under-sized MaxRuns
+  # makes the worker refuse Execs mid-rung -- a refusal that reads as a VM-tier density
+  # ceiling, which is the artifact this whole section exists to prevent (PR #312 review).
+  # Normalised at the source rather than per-consumer, so a later arithmetic use of the
+  # returned value cannot reintroduce it.
+  check "a leading-zero override returns decimal, not octal" \
+    "$(SH_E11_WORKER_MAX_CONCURRENT=010 WORKER_MAX_CONCURRENT='' worker_max_concurrent_for 8 2>/dev/null)" "10"
+  check "...and more than one leading zero is stripped too" \
+    "$(SH_E11_WORKER_MAX_CONCURRENT=0010 WORKER_MAX_CONCURRENT='' worker_max_concurrent_for 8 2>/dev/null)" "10"
+  check "an inherited leading-zero value is normalised on the same footing" \
+    "$(SH_E11_WORKER_MAX_CONCURRENT='' WORKER_MAX_CONCURRENT=007 worker_max_concurrent_for 4 2>/dev/null)" "7"
+  # The consequence, exercised the way start_microvm_stack exercises it: the returned value
+  # is fed straight to $((...)) to size SH_MAX_RUNS. Asserted on the arithmetic rather than
+  # on the string alone, because the string being "10" is only interesting insofar as every
+  # consumer then agrees -- 12 here is the under-sized answer the octal read produces.
+  lz_slots="$(SH_E11_WORKER_MAX_CONCURRENT=010 WORKER_MAX_CONCURRENT='' worker_max_concurrent_for 8 2>/dev/null)"
+  check "the returned value is octal-safe in the SH_MAX_RUNS arithmetic" \
+    "$(((lz_slots > 8 ? lz_slots : 8) + 2 + 2))" "14"
+  # A normalising step must not run BEFORE validation: stripping first turns an all-zeros
+  # value into the empty string, and empty is deliberately read as "unset" two checks above,
+  # which would resolve it to the ladder default instead of refusing it.
+  check "an all-zeros override is still refused, not normalised into unset" \
+    "$(SH_E11_WORKER_MAX_CONCURRENT=000 WORKER_MAX_CONCURRENT='' worker_max_concurrent_for 8 >/dev/null 2>&1; echo $?)" "1"
+
   # The resolved value AND where it came from are logged, so a run's slot count is readable
   # off its own log instead of being inferred from the records afterwards.
   slots_prov="$(SH_E11_WORKER_MAX_CONCURRENT='' WORKER_MAX_CONCURRENT=24 worker_max_concurrent_for 8 2>&1 >/dev/null)"
