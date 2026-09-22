@@ -604,14 +604,84 @@ func fcJailOccupied(path string) bool {
 	return true
 }
 
-// waitForUnixSocket polls until a listener answers at path, or ctx ends, or timeout
-// elapses. File existence alone is not enough: Firecracker creates the socket file
-// before it is actually accept()ing on it.
+// Retry pacing for waitForUnixSocket (#304), and the RESOLUTION at which it can measure.
+//
+// It replaced a fixed 20 ms sleep, which was a measurement FLOOR: no restore could observe its
+// socket sooner than one quantum, so min was 20.06 ms over 1,625 restores with zero below it
+// (78.2% in [20,40), 21.8% in [40,60)).
+//
+// What removing that floor was worth is now measured, and it is much less than #304 predicted.
+// On srv-r16b14s16 the mean went 24.92 -> 22.24 ms and the restore 27.73 -> 25.09 ms, about
+// 11%. The earlier reasoning -- sockwait is 90% of a restore over 2.80 ms of real work, so the
+// socket must appear in single-digit ms and we are merely sleeping past it -- was an INFERENCE
+// the old data could not support: at 20 ms granularity "appears at 2 ms" and "appears at 19 ms"
+// are the same reading. With fine polling the true distribution is visible and the socket
+// genuinely takes ~10-40 ms to bind on this host, centred near 21 ms. The quantum happened to
+// sit close to the real cost.
+//
+// So sockwait remains ~89% of a restore, and that residue is Firecracker's startup, which no
+// poll change reaches. Do NOT read this constant block as having removed a throughput ceiling.
+//
+// RESIDUAL RESOLUTION, which bounds any attribution drawn from sockwait. The schedule from
+// socketPollMin at socketPollGrowthNum/Den is:
+//
+//	attempt  1 dials at t=0        then sleeps 250us
+//	attempt  5 dials at t=2.03ms   then sleeps 1.27ms
+//	attempt  8 dials at t=8.04ms   then sleeps 4.27ms
+//	attempt  9 dials at t=12.31ms  <- socketPollMax first applies here
+//
+// Eight sleeps total 12.31 ms, so the cap governs everything beyond that. At a 5 ms cap the
+// measured p50 of ~21 ms therefore carried up to 5 ms of our own sleep -- and the "continuous"
+// modes reported at [10,12), [14,16), [20,22), [26,28) were 4-6 ms apart because they WERE that
+// comb, not a continuous distribution. The cap is 1 ms so the comb is finer than the thing being
+// measured: sockwait is now accurate to about +-1 ms rather than +-5 ms, at ~27 probes to reach
+// 25 ms. Raising it again re-inflates every sockwait figure by up to the new cap.
+//
+// Fine-and-growing rather than a flat fast poll: 250 us forever would spend three syscalls per
+// attempt per concurrent restore for the whole wait, including the 5 s timeout path.
+const (
+	socketPollMin       = 250 * time.Microsecond
+	socketPollMax       = 1 * time.Millisecond
+	socketPollGrowthNum = 3
+	socketPollGrowthDen = 2
+)
+
+// socketProbe is how waitForUnixSocket asks whether anything answers. A variable so a test can
+// count attempts and thereby pin the backoff schedule itself -- wall-clock assertions cannot:
+// with 1.5x growth the last sleep is at most ~0.5x the elapsed time, so total elapsed stays
+// within ~1.5x the budget for ANY cap, and deleting the growth and cap outright left every test
+// in socket_wait_unix_test.go green. Same reasoning as phaseLog being a var rather than a bool.
+var socketProbe = func(path string) bool {
+	conn, err := net.DialTimeout("unix", path, 100*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// waitForUnixSocket returns once something ANSWERS at path, or on timeout/cancellation.
+// File existence alone is not enough: Firecracker creates the socket file before it is
+// actually accept()ing on it.
+//
+// It DIALS rather than stats, which is load-bearing in both directions for the FIRECRACKER
+// sockets: a stat would report ready before accept() and race the snapshot PUT, and
+// fcJailOccupied's id-collision guard rests on the same distinction, so a path that exists but
+// answers nothing must not read as ready.
+//
+// That is NOT a universal property of this helper's callers, and the exception is load-bearing
+// in the other direction. launcher_chv.go waits here on virtiofsd's vhost-user socket, and
+// virtiofsdArgv starts it with no flag that survives a dropped connection -- in that mode the
+// rust-vmm backend accepts exactly ONE connection and exits when it drops, so this probe's
+// connect-and-close can consume the accept cloud-hypervisor then needs. That path predates this
+// pacing change and finer polling does not alter how many connections are accepted, but it is
+// recorded here so the dial-not-stat rule is not read as covering every caller. See the
+// vhost-user disconnect launcher_chv.go already documents as unexplained and unfixed.
 func waitForUnixSocket(ctx context.Context, path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	wait := socketPollMin
 	for {
-		if conn, err := net.DialTimeout("unix", path, 100*time.Millisecond); err == nil {
-			_ = conn.Close()
+		if socketProbe(path) {
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -620,7 +690,15 @@ func waitForUnixSocket(ctx context.Context, path string, timeout time.Duration) 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(20 * time.Millisecond):
+		case <-time.After(wait):
+		}
+		// Grown after the sleep, so the FIRST retry is always the fine one -- that is the
+		// case the measured distribution says matters, since every restore's socket appeared
+		// inside the old single quantum.
+		if wait < socketPollMax {
+			if wait = wait * socketPollGrowthNum / socketPollGrowthDen; wait > socketPollMax {
+				wait = socketPollMax
+			}
 		}
 	}
 }
