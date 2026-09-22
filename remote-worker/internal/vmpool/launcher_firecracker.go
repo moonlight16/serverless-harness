@@ -607,8 +607,36 @@ func fcJailOccupied(path string) bool {
 // waitForUnixSocket polls until a listener answers at path, or ctx ends, or timeout
 // elapses. File existence alone is not enough: Firecracker creates the socket file
 // before it is actually accept()ing on it.
+// Retry pacing for waitForUnixSocket (#304). A FIXED 20 ms sleep made every restore pay at
+// least one full quantum however fast Firecracker actually bound its socket, and restores are
+// how the standby pool replenishes -- so the sleep set the replenishment rate, and with it an
+// aggregate throughput ceiling, not merely per-restore latency.
+//
+// Measured over 1,625 restores on an idle srv-r16b14s16: sockwait 24.92 ms of a 27.73 ms
+// restore (89.9%) against 2.80 ms of real work, and quantized with no tail below the quantum
+// at all -- min 20.06 ms, ZERO under 20 ms, 78.2% in [20,40), 21.8% in [40,60).
+//
+// Starts fine and grows, rather than simply polling fast forever: a 250 us fixed poll across
+// many concurrent restores would burn three syscalls per attempt per restore for the whole
+// wait. Growing 1.5x from 250 us reaches the cap in 8 attempts having spent ~5 ms, so a socket
+// that appears in the low milliseconds is caught within a few hundred microseconds of doing
+// so, while a genuinely absent one settles into a 5 ms poll (~200/s) instead of 50/s.
+const (
+	socketPollMin       = 250 * time.Microsecond
+	socketPollMax       = 5 * time.Millisecond
+	socketPollGrowthNum = 3
+	socketPollGrowthDen = 2
+)
+
+// waitForUnixSocket returns once something ANSWERS at path, or on timeout/cancellation.
+//
+// It DIALS rather than stats, and that is load-bearing in both directions: Firecracker
+// creates the socket file before it accept()s, so a stat would report ready too early and the
+// snapshot PUT would race; and fcJailOccupied's id-collision guard rests on the same
+// distinction, so a path that exists but answers nothing must not read as ready.
 func waitForUnixSocket(ctx context.Context, path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	wait := socketPollMin
 	for {
 		if conn, err := net.DialTimeout("unix", path, 100*time.Millisecond); err == nil {
 			_ = conn.Close()
@@ -620,7 +648,15 @@ func waitForUnixSocket(ctx context.Context, path string, timeout time.Duration) 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(20 * time.Millisecond):
+		case <-time.After(wait):
+		}
+		// Grown after the sleep, so the FIRST retry is always the fine one -- that is the
+		// case the measured distribution says matters, since every restore's socket appeared
+		// inside the old single quantum.
+		if wait < socketPollMax {
+			if wait = wait * socketPollGrowthNum / socketPollGrowthDen; wait > socketPollMax {
+				wait = socketPollMax
+			}
 		}
 	}
 }
