@@ -770,8 +770,9 @@ Driver: `deploy/microvm/e10-lifecycle.sh`; cluster-free proof of its structure:
 > conclusion was right; only its evidence was wrong. Both real arms knee at 8 with the Go
 > client on this same host, `driver-control`'s own knee is 4 (Go) or 32 (grpcurl) and never
 > 8, and the Go driver accounts for under 0.4% of the microVM arm's p95 at every rung. So
-> the items above are **resolved, not retracted** — except #295, which stays open and
-> confounded nothing here. Numbers, item by item, in **Issue #291 — the re-run** below.
+> the items above are **resolved, not retracted**, and #295 — open when this ran, closed
+> 2026-09-21 — confounded nothing here. Numbers, item by item, in **Issue #291 — the re-run**
+> below.
 >
 > **2026-09-22 — and the knee's CAUSE is now known: it is the worker's 4-slot cap (#305), not
 > density.** The re-run's position was right and its instrument repairs hold. But every microVM
@@ -1145,9 +1146,13 @@ cleanup recipe, never by a captured PID or a process name), wired into both
 > **This section's own arithmetic is what exposes it.** The replenishment mechanism below is stated
 > as "per-pool warm supply is roughly 4.5 VMs/s whatever `D` is", and the same paragraph reports a
 > flat ~61–62 Exec/s plateau. Those differ by 14x, so they cannot both describe the bound. Four
-> slots at the measured 61.4 ms per Exec predicts **65.1 Exec/s** against a measured **62.99** —
-> within 3%, and it predicts every other rung too: `c=1` 1/55 ms = 18.2 (measured 18.18), `c=8`
-> 4/62.2 ms = 64.3 (measured 67.76). The plateau is the cap.
+> slots at the measured 61.4 ms per Exec predicts **65.1 Exec/s** against the **62.99** measured at
+> `c=16` — within 3.4%, and it predicts the rest of the plateau as well (`c=32` 62.61, `c=64`
+> 62.28, both inside 5%). Below the cap it also holds: one slot at 55 ms predicts 18.2 against
+> **17.56** measured at `c=1`, within 3.5%. **The one rung it does not predict is `c=8`**, where
+> 4/62.2 ms = 64.3 against **80.62** measured — a 20% under-prediction, which is the
+> ~4.9-effective-slots anomaly left open below rather than evidence for the cap. The plateau is the
+> cap; `c=8` is still unexplained.
 >
 > The p95 column is the same story read as latency: 117.79 -> 268.51 -> 522.91 -> 1033.82 ms,
 > doubling per doubling of `c`, which is the textbook signature of queueing against a
@@ -1178,7 +1183,7 @@ cleanup recipe, never by a captured PID or a process name), wired into both
 >   0.4% at every rung, against up to 23.7% had it been grpcurl. This is what licenses reading any
 >   of these numbers as the backend's, and it is unaffected by the cap.
 > - **"No CPU or memory ceiling was reached"** — true, and now explained: `coresBusy` 4.81 of 72
->   because the server would admit only 4 Execs at a time. At 64 slots the same host reaches 47.0.
+>   because the server would admit only 4 Execs at a time. At 64 slots the same host reaches 47.74.
 > - **The container arm.** At ~1940 Exec/s it is nowhere near a 4-slot cap, its `coresBusy`
 >   plateaus flat (6.64 -> 6.67), and its knee was reproduced twice independently. It stands as
 >   measured.
@@ -1342,10 +1347,11 @@ very metric the sweep reads; admission refused nothing (0 refusals at every rung
 - **Sealed prediction 3** — scored **`supported`** on the microVM arm, this time from a threshold
   derived from the same client that produced the ladder. Its shape is the reason: cold-acquire
   stays at 0.00–0.01 before the knee and rises to 0.35 at it, then 1.00.
-- **Issue #295 (relay yields `ExecEvent.error`, returns OK)** — **still open.** It confounded
-  nothing here: both real arms ran the Go client only, which classifies that case correctly, and
-  on `driver-control` the two clients are identical by construction. It remains a blocker for any
-  grpcurl-vs-go comparison on the container or microVM arms.
+- **Issue #295 (relay yields `ExecEvent.error`, returns OK)** — **open when this run was made,
+  closed 2026-09-21** (commit `9eabbef`), which is before this correction was written. It
+  confounded nothing here either way: both real arms ran the Go client only, which classifies that
+  case correctly, and on `driver-control` the two clients are identical by construction. It was a
+  blocker for any grpcurl-vs-go comparison on the container or microVM arms; it no longer is.
 
 `deploy/microvm/predictions.json` was not edited, and its hash pin still passes.
 
