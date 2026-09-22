@@ -65,6 +65,89 @@ func envInt64(get func(string) string, k string, def int64) (int64, error) {
 	return n, nil
 }
 
+// microvmDefaultConcurrency is THIS TIER's default concurrency-slot count, deliberately not
+// session.DefaultConcurrency (4).
+//
+// MaxConcurrent sizes a fixed pool of goroutines, one per slot, so a worker left at 4 serves
+// 4 Execs at once however many are dispatched -- and e11-density.sh never set it, so every
+// microVM rung ever recorded measured a 4-slot cap while its ladder swept concurrency to 64
+// (issue #305).
+//
+// Why the default belongs PER TIER rather than in the shared constant: the per-slot cost that
+// makes slots expensive is 2 x exec.BufferCap (8 MiB) of stream buffer, and it is the
+// container worker that pays it against a hard pod limit. worker-deployment.yaml allows 256Mi
+// for 4 slots' 64 MiB worst case; at 16 slots that worst case IS 256 MiB, which would restore
+// exactly the OOMKill-a-relay-can-trigger the manifest records fixing. This tier has no pod
+// limit, its memory is gated by the mandatory SH_MAX_COMMITTED_MB over 256 MiB guests, and
+// 256 MiB of worst-case buffers is negligible beside that budget.
+//
+// Why 16 and not higher: 16 is the largest slot count actually measured -- 172.88 Exec/s
+// against 62.99 at 4 slots on the same 72-core host, 2.74x. Beyond it is extrapolation, and
+// where slots stop paying is its own sweep. The default must not wander past the evidence.
+const microvmDefaultConcurrency = 16
+
+// slotBudgetWarning returns a warning when the slot count can commit more VM memory than
+// the admission budget allows, or "" when it fits.
+//
+// Raising this tier's default from 4 to 16 multiplies VM commitment, not just the
+// 2 x exec.BufferCap of stream buffer the default's rationale reasons about.
+// committedLocked sums ready+inFlight+warming across run pools and StandbyDepth is per RUN
+// KEY, so N slots carrying distinct workspace_keys commit up to N x (1 + D) VMs: 48 at 16
+// slots and the shipped D=2, ~13.5 GiB at a 256 MiB guest, against 12 VMs / ~3.4 GiB at 4.
+//
+// Overflow does not arrive as back-pressure. admitLocked returns RefuseMemoryBudget, and
+// budget.go records that there is no "busy" frame on the wire, so a refusal "reaches the
+// harness as a failed exec". An operator who sized SH_MAX_COMMITTED_MB for 4 slots by
+// following METAL-RUNBOOK's "size it to this host" would now see hard exec errors under
+// concurrency, with nothing at startup having said why.
+//
+// WARNS rather than refusing, deliberately. The N x (1 + D) figure is a WORST CASE that
+// needs N distinct workspace keys; a single session holds one key and commits 1 x (1 + D)
+// however many slots exist. Failing the unit would stop deployments that work today and
+// whose worst case never materialises. The runtime gate still refuses, so the risk is
+// degraded service rather than silent corruption -- but the operator is told at startup,
+// which is the whole point of #305: a slot count nobody chose must not be invisible.
+func slotBudgetWarning(cfg vmpool.Config, maxConcurrent int) string {
+	// Normalize a COPY: it is what fills VMOverheadBytes, and it runs inside vmpool.New on
+	// New's own copy, so main's cfg can still carry a zero here and PerVMBytes would
+	// understate the commitment.
+	c := cfg
+	if err := c.Normalize(); err != nil {
+		return ""
+	}
+	budget := c.MaxCommittedBytes - c.MemoryReserveBytes
+	if budget <= 0 {
+		return ""
+	}
+	worst := int64(maxConcurrent) * int64(1+c.StandbyDepth) * vmpool.PerVMBytes(c)
+	if worst <= budget {
+		return ""
+	}
+	return fmt.Sprintf(
+		"WARNING: %d concurrency slots at D=%d can commit %d VMs (%d MiB) but the admission budget is %d MiB "+
+			"(SH_MAX_COMMITTED_MB minus SH_MEMORY_RESERVE_MB). That worst case needs %d distinct workspace keys; "+
+			"reaching it returns RefuseMemoryBudget, which arrives at the harness as a FAILED EXEC rather than as "+
+			"back-pressure. Raise SH_MAX_COMMITTED_MB or lower WORKER_MAX_CONCURRENT.",
+		maxConcurrent, c.StandbyDepth, int64(maxConcurrent)*int64(1+c.StandbyDepth),
+		worst>>20, budget>>20, maxConcurrent)
+}
+
+// workerMaxConcurrent resolves the worker's concurrency-slot count.
+//
+// It REFUSES a malformed WORKER_MAX_CONCURRENT rather than falling back to the default. The
+// inline form this replaced discarded the error --
+// `if v, e := envInt64(...); e == nil { maxConcurrent = int(v) }` -- so a typo ran silently at
+// the default slot count, which is the single number that set every throughput figure this
+// project has published. A run whose slots came from a typo must not look like a run that
+// chose them.
+func workerMaxConcurrent(get func(string) string) (int, error) {
+	v, err := envInt64(get, "WORKER_MAX_CONCURRENT", int64(microvmDefaultConcurrency))
+	if err != nil {
+		return 0, err
+	}
+	return int(v), nil
+}
+
 // poolConfig reads vmpool.Config from the environment and refuses rather than
 // guessing. Every required value below is one whose wrong default is a security or
 // capacity bug, so there is no "sensible default" to fall back on: spec §6's posture
@@ -536,9 +619,12 @@ func main() {
 		// wire in cleartext, so the worker refuses to guess.
 		log.Fatalf("microvm-worker: RELAY_TLS=%q is not a boolean", get("RELAY_TLS"))
 	}
-	maxConcurrent := session.DefaultConcurrency
-	if v, e := envInt64(get, "WORKER_MAX_CONCURRENT", int64(session.DefaultConcurrency)); e == nil {
-		maxConcurrent = int(v)
+	maxConcurrent, err := workerMaxConcurrent(get)
+	if err != nil {
+		// Same posture as RELAY_TLS above: a value the operator clearly meant to set, and that
+		// the worker cannot honour, stops the unit rather than being silently replaced by a
+		// default that would misreport the run's slot count.
+		log.Fatalf("microvm-worker: %v", err)
 	}
 
 	// Opt-in, and separate from SH_DIAG_PPROF so obtaining the counters does not require
@@ -589,9 +675,17 @@ func main() {
 		MaxConcurrent: maxConcurrent,
 	}, vmpool.Runner{Pool: pool})
 
-	log.Printf("microvm-worker: relay=%s sandbox_id=%s tls=%v vmm=%s D=%d guest=%dMiB budget=%dMiB",
+	// slots is in the banner because this tier's default is 16 while the shipped unit sets
+	// no WORKER_MAX_CONCURRENT: without it an upgrade moves 4 -> 16 dispatch slots with
+	// nothing in journalctl naming the number, and /stats is gated behind the opt-in
+	// SH_DIAG_STATS_ADDR. cmd/worker logs the same thing as capacity=%d. #305's own thesis
+	// is that a run whose slots came from a typo must not look like a run that chose them.
+	log.Printf("microvm-worker: relay=%s sandbox_id=%s tls=%v vmm=%s D=%d guest=%dMiB budget=%dMiB slots=%d",
 		relayAddr, env(get, "SANDBOX_ID", "sbx-microvm-1"), useTLS, cfg.VMM,
-		cfg.StandbyDepth, cfg.GuestRAMBytes>>20, cfg.MaxCommittedBytes>>20)
+		cfg.StandbyDepth, cfg.GuestRAMBytes>>20, cfg.MaxCommittedBytes>>20, maxConcurrent)
+	if w := slotBudgetWarning(cfg, maxConcurrent); w != "" {
+		log.Printf("microvm-worker: %s", w)
+	}
 
 	backoff := backoffMin
 	for ctx.Err() == nil {
