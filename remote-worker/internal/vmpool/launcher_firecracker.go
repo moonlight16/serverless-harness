@@ -824,16 +824,32 @@ func (v *firecrackerVM) Destroy() error {
 	v.mu.Unlock()
 
 	var errs []error
+	// Sub-phase timing (#258 Task 3.1). Destroy is the largest phase of an Exec -- 36.77 ms
+	// at c=4, 65.06 ms at c=16, 164.27 ms at c=64, growing 4.5x across the sweep while Resume
+	// and Run stay flat -- and it was the only phase with no internal visibility. Behind
+	// SH_DIAG_PHASES like the restore phases, so the cost when off is one nil check.
+	//
+	// Measured with time.Since rather than a running clock so each step is independent: they
+	// are reported separately precisely because the expectation is that ONE of them dominates,
+	// and a running total cannot show which.
+	var phKill, phWait, phRemoveAll, phCgroupWait, phCgroupRmdir time.Duration
+	phaseStart := time.Now()
 	if cmd != nil && cmd.Process != nil {
 		pid := cmd.Process.Pid
+		killStart := time.Now()
 		if err := fcKillProcessGroup(pid); err != nil && !fcProcessNotFound(err) {
 			errs = append(errs, fmt.Errorf("kill -%d: %w", pid, err))
 		}
+		phKill = time.Since(killStart)
+		waitStart := time.Now()
 		_ = cmd.Wait() // reap; "signal: killed" is the expected outcome, not a failure
+		phWait = time.Since(waitStart)
 	}
+	removeAllStart := time.Now()
 	if err := os.RemoveAll(v.jailRoot); err != nil {
 		errs = append(errs, fmt.Errorf("remove jail %s: %w", v.jailRoot, err))
 	}
+	phRemoveAll = time.Since(removeAllStart)
 	// Issue #255. Until this existed, the per-VM cgroup was removed only by SweepOrphans,
 	// which runs at STARTUP -- so one directory leaked per Exec for the whole life of the
 	// worker process and only a restart reclaimed them. That is not hygiene: cgroup
@@ -855,10 +871,24 @@ func (v *firecrackerVM) Destroy() error {
 	// right weight: a leaked directory must be visible, and must not break a command that
 	// already ran correctly.
 	if v.cgroupDir != "" {
+		// Split from the rmdir because waitForCgroupEmpty sleeps a FIXED 10 ms between reads
+		// -- the same pattern #304 removed from waitForUnixSocket. It should never fire here
+		// (cmd.Wait above has reaped the VMM, so cgroup.procs should already be empty), but
+		// that is exactly the assumption that proved wrong for waitForUnixSocket, so it is
+		// measured rather than assumed.
+		cgWaitStart := time.Now()
 		waitForCgroupEmpty(v.cgroupDir)
+		phCgroupWait = time.Since(cgWaitStart)
+		cgRmStart := time.Now()
 		if err := removeCgroupDir(v.cgroupDir); err != nil {
 			errs = append(errs, err)
 		}
+		phCgroupRmdir = time.Since(cgRmStart)
+	}
+	if phaseLog != nil {
+		phaseLog("vmpool: destroy phases id=%s kill_us=%d wait_us=%d removeall_us=%d cgroupwait_us=%d cgrouprmdir_us=%d total_us=%d",
+			v.id, phKill.Microseconds(), phWait.Microseconds(), phRemoveAll.Microseconds(),
+			phCgroupWait.Microseconds(), phCgroupRmdir.Microseconds(), time.Since(phaseStart).Microseconds())
 	}
 	return errors.Join(errs...)
 }
