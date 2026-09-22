@@ -334,9 +334,11 @@ func TestDestroyToleratesNoPerVMCgroup(t *testing.T) {
 	}
 }
 
-// Destroy is idempotent (it returns early on the second call), and that must not regress
-// into a second rmdir attempt reporting failure for an already-removed directory.
-func TestDestroyIsStillIdempotentWithCgroupRemoval(t *testing.T) {
+// Destroy is idempotent. Deliberately NOT presented as a test of ENOENT tolerance: the
+// `destroyed` early-return sits BEFORE the cgroup branch, so a second call never attempts a
+// second rmdir and this could not fail for that reason. TestDestroyToleratesAnAlreadySweptCgroup
+// below covers the ENOENT path, which is the one that actually occurs.
+func TestDestroyIsIdempotent(t *testing.T) {
 	slice := fakeSlice(t, map[string][]string{"vm-9": {}})
 	jailRoot := filepath.Join(t.TempDir(), "jail", "vm-9", "root")
 	if err := os.MkdirAll(jailRoot, 0o755); err != nil {
@@ -348,6 +350,44 @@ func TestDestroyIsStillIdempotentWithCgroupRemoval(t *testing.T) {
 	}
 	if err := vm.Destroy(); err != nil {
 		t.Fatalf("second Destroy must be a no-op, got: %v", err)
+	}
+}
+
+// The REAL ENOENT case, and the one that makes the SweepOrphans / Destroy overlap safe: the
+// cgroup is already gone when Destroy reaches it. A startup sweep, an operator clearing the
+// slice by hand, or Restore's own cleanup() having already removed it all produce this. It
+// must be a no-op, not an error that would be counted as destroyFailed on every VM.
+//
+// This one CAN fail: it routes a genuinely missing directory through Destroy's cgroup branch,
+// where the idempotency test above stops at the early return.
+func TestDestroyToleratesAnAlreadySweptCgroup(t *testing.T) {
+	slice := fakeSlice(t, map[string][]string{"vm-10": {}})
+	cgroupDir := filepath.Join(slice, "vm-10")
+	if err := os.Remove(cgroupDir + "/cgroup.procs"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(cgroupDir); err != nil {
+		t.Fatal(err)
+	}
+	// Non-vacuousness: it must really be absent, or this proves nothing.
+	if _, err := os.Stat(cgroupDir); !os.IsNotExist(err) {
+		t.Fatalf("fixture: cgroup dir must be absent, got err=%v", err)
+	}
+	jailRoot := filepath.Join(t.TempDir(), "jail", "vm-10", "root")
+	if err := os.MkdirAll(jailRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	vm := &firecrackerVM{id: "vm-10", key: "run-1", jailRoot: jailRoot, cgroupDir: cgroupDir}
+	if err := vm.Destroy(); err != nil {
+		t.Fatalf("Destroy over an already-removed cgroup must be a no-op, got: %v", err)
+	}
+}
+
+// removeCgroupDir's ENOENT tolerance, tested directly rather than through Destroy, since it
+// is the property both the startup sweep and the steady-state path rest on.
+func TestRemoveCgroupDirToleratesAMissingDirectory(t *testing.T) {
+	if err := removeCgroupDir(filepath.Join(t.TempDir(), "never-existed")); err != nil {
+		t.Fatalf("removeCgroupDir on a missing path: %v", err)
 	}
 }
 
@@ -363,5 +403,12 @@ func TestRestoreRecordsTheCgroupDirItToldJailerToUse(t *testing.T) {
 	// nil return -- not Cgroup2Root itself, which would rmdir the cgroup ROOT.
 	if got := vmCgroupDirFor(FirecrackerOptions{}, "vm-11"); got != "" {
 		t.Fatalf("vmCgroupDirFor with no ParentCgroup = %q, want empty", got)
+	}
+	// An empty id has the same shape of consequence one level down: it would resolve to the
+	// shared PARENT SLICE, which every jailer --parent-cgroup and the next start's
+	// SweepOrphans depend on. Unreachable from nextIDLocked today; guarded here so it stays
+	// unreachable regardless of the caller.
+	if got := vmCgroupDirFor(opts, ""); got != "" {
+		t.Fatalf("vmCgroupDirFor with an empty id = %q, want empty (that path is the parent slice)", got)
 	}
 }

@@ -79,6 +79,13 @@ type FirecrackerOptions struct {
 	// guess a value Task 17 has not defined yet.
 	ParentCgroup string
 
+	// cgroupRoot overrides where per-VM cgroup paths are rooted. Unexported, so nothing
+	// outside this package can set it: it exists so a test can drive the REAL restore
+	// failure path against a temporary cgroup tree, because Cgroup2Root is a const naming
+	// the host's actual cgroupfs and a test cannot create a cgroup there without root.
+	// Empty means Cgroup2Root, which is every production path.
+	cgroupRoot string
+
 	// CgroupMemoryMaxBytes is the per-VM cgroup memory.max jailer is told to write via
 	// --cgroup (Task 17, hardware-corrections D1). Without --cgroup, jailer only
 	// MOVES the jailed process into --parent-cgroup if that path already exists — it
@@ -135,6 +142,28 @@ func (o FirecrackerOptions) validate() error {
 	return nil
 }
 
+// vmCgroupDirFor returns the cgroupfs path jailer will create for this VM, or "" when there
+// is no per-VM cgroup of ours to remove.
+//
+// Both guards below prevent Destroy from rmdir'ing a directory it does not own, one level
+// apart. With ParentCgroup unset, firecrackerCgroupArgs omits --parent-cgroup entirely, so
+// nothing per-VM was created and a path built anyway would resolve to Cgroup2Root -- the
+// cgroup ROOT. With an empty id, vmCgroupPath resolves to the shared PARENT SLICE, which
+// every jailer --parent-cgroup and the next start's SweepOrphans depend on. The id guard is
+// unreachable today (nextIDLocked is the only id source and never yields ""), but this
+// function exists precisely to be the one place that cannot disagree with
+// firecrackerCgroupArgs about what is safe to remove, so the invariant belongs here rather
+// than resting on a caller in another file.
+func vmCgroupDirFor(opts FirecrackerOptions, id string) string {
+	if opts.ParentCgroup == "" || id == "" {
+		return ""
+	}
+	if opts.cgroupRoot != "" {
+		return vmCgroupPath(filepath.Join(opts.cgroupRoot, opts.ParentCgroup), id)
+	}
+	return vmCgroupPath(ParentCgroupPath(opts.ParentCgroup), id)
+}
+
 // firecrackerCgroupArgs returns the jailer flags that create and bound this VM's own
 // cgroup: --cgroup-version 2 (D2: jailer's own default is version "1", which this
 // cgroup2-only host does not have — always pass 2 explicitly), --parent-cgroup (so the
@@ -143,19 +172,6 @@ func (o FirecrackerOptions) validate() error {
 // --parent-cgroup alone only relocates the process into the shared parent). Split out
 // of Restore's argv construction so a test can assert the memory bound agrees with
 // PerVMBytes(cfg) without spawning jailer.
-// vmCgroupDirFor returns the cgroupfs path jailer will create for this VM, or "" when no
-// per-VM cgroup of ours exists. The empty case is load-bearing: with ParentCgroup unset,
-// firecrackerCgroupArgs omits --parent-cgroup entirely, so there is nothing to remove --
-// and returning a path anyway would resolve to Cgroup2Root itself and try to rmdir the
-// cgroup ROOT. Gated on exactly the same condition as firecrackerCgroupArgs so the two
-// cannot disagree about whether a cgroup was created.
-func vmCgroupDirFor(opts FirecrackerOptions, id string) string {
-	if opts.ParentCgroup == "" {
-		return ""
-	}
-	return vmCgroupPath(ParentCgroupPath(opts.ParentCgroup), id)
-}
-
 func firecrackerCgroupArgs(opts FirecrackerOptions) []string {
 	if opts.ParentCgroup == "" {
 		return nil
@@ -282,6 +298,20 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		}
 		if err := os.RemoveAll(jailRoot); err != nil {
 			errs = append(errs, fmt.Errorf("remove jail %s: %w", jailRoot, err))
+		}
+		// The same per-VM cgroup Destroy removes (#255), on the path that actually
+		// provokes the leak. cleanup() runs after cmd.Start(), so jailer has already
+		// created the cgroup by the time a sockwait timeout or a failed LoadSnapshot
+		// gets here -- and every replenish retry draws a FRESH id from nextIDLocked, so
+		// this leak is unbounded. A host that has started timing out on sockwait is
+		// exactly the host that then accumulates directories fastest, which is the
+		// feedback loop #255 measured at 5.3x. removeCgroupDir returns nil when the
+		// directory was never created, so this is safe on the earlier error paths too.
+		if dir := vmCgroupDirFor(l.opts, req.ID); dir != "" {
+			waitForCgroupEmpty(dir)
+			if err := removeCgroupDir(dir); err != nil {
+				errs = append(errs, err)
+			}
 		}
 		return errors.Join(errs...)
 	}

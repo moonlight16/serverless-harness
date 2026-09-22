@@ -127,7 +127,14 @@ func (p *pool) replenishOne(key string) {
 		return
 	case p.closed:
 		p.mu.Unlock()
-		_ = vm.Destroy()
+		// Logged like the other six Destroy call sites rather than discarded: before
+		// #255, Destroy had nothing to report on this branch, and now it can report a
+		// leaked per-VM cgroup. A leak taken during shutdown must still be visible --
+		// silently dropping it here is how the whole class went unnoticed.
+		if err := vm.Destroy(); err != nil {
+			p.counters.destroyFailed()
+			log.Printf("vmpool: destroy replenished VM for %q on a closed pool: %v", key, err)
+		}
 		return
 	}
 	rp.backoff = 0

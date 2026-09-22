@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // collisionLauncher builds a Firecracker launcher whose JailerBin is a script that
@@ -151,4 +152,69 @@ func TestFirecrackerProceedsPastTheCollisionGuardWhenTheJailIsFree(t *testing.T)
 		t.Errorf("expected a free jail to fail at the hardlink step, past the guard; got: %v", err)
 	}
 	_ = marker
+}
+
+// #255, the failure path. Restore's cleanup() closure must remove the per-VM cgroup, not
+// only Destroy: cleanup() runs after cmd.Start(), so jailer has already created the cgroup
+// by the time a sockwait timeout or a failed LoadSnapshot gets there, and every replenish
+// retry draws a FRESH id from nextIDLocked -- so the leak is unbounded. A host that has
+// begun timing out on sockwait is precisely the host that then accumulates directories
+// fastest, which is the 5.3x feedback loop #255 measured.
+//
+// Driven through the REAL path rather than asserted structurally: the fake jailer exits 0
+// without ever creating the API socket, so Restore reaches waitForUnixSocket, and a
+// cancelled context makes that return in ~20 ms instead of its 5 s timeout. The per-VM
+// cgroup is pre-created because a shell-script jailer cannot make one, and opts.cgroupRoot
+// points the path at a temp tree because Cgroup2Root names the host's real cgroupfs.
+func TestRestoreCleanupRemovesThePerVMCgroupOnAFailedRestore(t *testing.T) {
+	base, err := os.MkdirTemp("/tmp", "fccg")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+
+	jailer := filepath.Join(base, "jailer")
+	if err := os.WriteFile(jailer, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake jailer: %v", err)
+	}
+	cgRoot := filepath.Join(base, "cgroup")
+	const parent = "microvm.slice/microvm-vms.slice"
+	lc, err := NewFirecrackerLauncher(FirecrackerOptions{
+		JailerBin:            jailer,
+		FirecrackerBin:       filepath.Join(base, "firecracker"),
+		ChrootBase:           base,
+		SnapshotDir:          base,
+		ParentCgroup:         parent,
+		CgroupMemoryMaxBytes: 256 << 20,
+		cgroupRoot:           cgRoot,
+	})
+	if err != nil {
+		t.Fatalf("NewFirecrackerLauncher: %v", err)
+	}
+
+	// Stand in for the cgroup jailer creates via --cgroup; a shell script cannot.
+	cgDir := filepath.Join(cgRoot, parent, "vm-42")
+	if err := os.MkdirAll(cgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cgDir, "cgroup.procs"), []byte("\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Non-vacuousness: it must be there before the failed restore, or the assertion below
+	// passes against a path that never existed.
+	if _, err := os.Stat(cgDir); err != nil {
+		t.Fatalf("fixture: cgroup dir must exist before Restore: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+	if _, err := lc.Restore(ctx, RestoreRequest{
+		ID: "vm-42", Key: "run-a", WorkspaceDir: t.TempDir(), GuestRAMBytes: 256 << 20,
+	}); err == nil {
+		t.Fatal("Restore succeeded against a jailer that never creates an API socket")
+	}
+
+	if _, err := os.Stat(cgDir); !os.IsNotExist(err) {
+		t.Fatalf("cleanup() left the per-VM cgroup %s behind (err=%v) -- one leaks per failed restore, with a fresh id each retry", cgDir, err)
+	}
 }
