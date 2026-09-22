@@ -1154,6 +1154,12 @@ cleanup recipe, never by a captured PID or a process name), wired into both
 > ~4.9-effective-slots anomaly left open below rather than evidence for the cap. The plateau is the
 > cap; `c=8` is still unexplained.
 >
+> (An earlier draft of this paragraph quoted `c=8` as 67.76, against which the model looks like a 5%
+> hit. That figure is real but from a **different run** — the one-worker control of #259's
+> two-worker experiment, at `D=2` and `ACTIVE_RUNS="1 8"` rather than this full ladder — so it does
+> not belong in an argument about these rungs. Quoting it here made the cap appear to explain the
+> one rung it does not.)
+>
 > The p95 column is the same story read as latency: 117.79 -> 268.51 -> 522.91 -> 1033.82 ms,
 > doubling per doubling of `c`, which is the textbook signature of queueing against a
 > fixed-capacity server — not of density. So the knee criterion here (the last rung whose p95
