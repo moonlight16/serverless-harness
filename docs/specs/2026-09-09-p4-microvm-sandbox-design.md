@@ -73,7 +73,7 @@ Traced in the tree at `45a218d`, not inferred.
 | `Abort` → SIGKILL the whole process group (`Setpgid`)                                                     | `remote-worker/DESIGN.md` table  |
 | Worker-side `timeout_s` → SIGKILL → `ExecError{"timeout:<n>"}`                                            | `remote-worker/DESIGN.md` table  |
 | `req_id` dedup: bounded LRU (256) guarded by a command+stdin fingerprint                                  | `remote-worker/DESIGN.md` table  |
-| Dispatch pool `WORKER_MAX_CONCURRENT`, default 4                                                          | `remote-worker/DESIGN.md` step 3 |
+| Dispatch pool `WORKER_MAX_CONCURRENT`, default **16 on this tier** (4 on the container worker, #305)      | `remote-worker/DESIGN.md` step 3 |
 | `base64 -d > file` **only terminates at EOF**, so stdin is fed and then closed                            | `remote-worker/DESIGN.md` step 4 |
 
 Consequence: replacing the `bash -c` body with "acquire standby VM → push command over vsock → collect

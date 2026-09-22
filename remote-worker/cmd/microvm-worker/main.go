@@ -86,6 +86,52 @@ func envInt64(get func(string) string, k string, def int64) (int64, error) {
 // where slots stop paying is its own sweep. The default must not wander past the evidence.
 const microvmDefaultConcurrency = 16
 
+// slotBudgetWarning returns a warning when the slot count can commit more VM memory than
+// the admission budget allows, or "" when it fits.
+//
+// Raising this tier's default from 4 to 16 multiplies VM commitment, not just the
+// 2 x exec.BufferCap of stream buffer the default's rationale reasons about.
+// committedLocked sums ready+inFlight+warming across run pools and StandbyDepth is per RUN
+// KEY, so N slots carrying distinct workspace_keys commit up to N x (1 + D) VMs: 48 at 16
+// slots and the shipped D=2, ~13.5 GiB at a 256 MiB guest, against 12 VMs / ~3.4 GiB at 4.
+//
+// Overflow does not arrive as back-pressure. admitLocked returns RefuseMemoryBudget, and
+// budget.go records that there is no "busy" frame on the wire, so a refusal "reaches the
+// harness as a failed exec". An operator who sized SH_MAX_COMMITTED_MB for 4 slots by
+// following METAL-RUNBOOK's "size it to this host" would now see hard exec errors under
+// concurrency, with nothing at startup having said why.
+//
+// WARNS rather than refusing, deliberately. The N x (1 + D) figure is a WORST CASE that
+// needs N distinct workspace keys; a single session holds one key and commits 1 x (1 + D)
+// however many slots exist. Failing the unit would stop deployments that work today and
+// whose worst case never materialises. The runtime gate still refuses, so the risk is
+// degraded service rather than silent corruption -- but the operator is told at startup,
+// which is the whole point of #305: a slot count nobody chose must not be invisible.
+func slotBudgetWarning(cfg vmpool.Config, maxConcurrent int) string {
+	// Normalize a COPY: it is what fills VMOverheadBytes, and it runs inside vmpool.New on
+	// New's own copy, so main's cfg can still carry a zero here and PerVMBytes would
+	// understate the commitment.
+	c := cfg
+	if err := c.Normalize(); err != nil {
+		return ""
+	}
+	budget := c.MaxCommittedBytes - c.MemoryReserveBytes
+	if budget <= 0 {
+		return ""
+	}
+	worst := int64(maxConcurrent) * int64(1+c.StandbyDepth) * vmpool.PerVMBytes(c)
+	if worst <= budget {
+		return ""
+	}
+	return fmt.Sprintf(
+		"WARNING: %d concurrency slots at D=%d can commit %d VMs (%d MiB) but the admission budget is %d MiB "+
+			"(SH_MAX_COMMITTED_MB minus SH_MEMORY_RESERVE_MB). That worst case needs %d distinct workspace keys; "+
+			"reaching it returns RefuseMemoryBudget, which arrives at the harness as a FAILED EXEC rather than as "+
+			"back-pressure. Raise SH_MAX_COMMITTED_MB or lower WORKER_MAX_CONCURRENT.",
+		maxConcurrent, c.StandbyDepth, int64(maxConcurrent)*int64(1+c.StandbyDepth),
+		worst>>20, budget>>20, maxConcurrent)
+}
+
 // workerMaxConcurrent resolves the worker's concurrency-slot count.
 //
 // It REFUSES a malformed WORKER_MAX_CONCURRENT rather than falling back to the default. The
@@ -629,9 +675,17 @@ func main() {
 		MaxConcurrent: maxConcurrent,
 	}, vmpool.Runner{Pool: pool})
 
-	log.Printf("microvm-worker: relay=%s sandbox_id=%s tls=%v vmm=%s D=%d guest=%dMiB budget=%dMiB",
+	// slots is in the banner because this tier's default is 16 while the shipped unit sets
+	// no WORKER_MAX_CONCURRENT: without it an upgrade moves 4 -> 16 dispatch slots with
+	// nothing in journalctl naming the number, and /stats is gated behind the opt-in
+	// SH_DIAG_STATS_ADDR. cmd/worker logs the same thing as capacity=%d. #305's own thesis
+	// is that a run whose slots came from a typo must not look like a run that chose them.
+	log.Printf("microvm-worker: relay=%s sandbox_id=%s tls=%v vmm=%s D=%d guest=%dMiB budget=%dMiB slots=%d",
 		relayAddr, env(get, "SANDBOX_ID", "sbx-microvm-1"), useTLS, cfg.VMM,
-		cfg.StandbyDepth, cfg.GuestRAMBytes>>20, cfg.MaxCommittedBytes>>20)
+		cfg.StandbyDepth, cfg.GuestRAMBytes>>20, cfg.MaxCommittedBytes>>20, maxConcurrent)
+	if w := slotBudgetWarning(cfg, maxConcurrent); w != "" {
+		log.Printf("microvm-worker: %s", w)
+	}
 
 	backoff := backoffMin
 	for ctx.Err() == nil {

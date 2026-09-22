@@ -300,9 +300,18 @@ func TestWorkerMaxConcurrentDefaultsToTheMicrovmTierNotTheLibrary(t *testing.T) 
 	if got != microvmDefaultConcurrency {
 		t.Fatalf("default slots = %d, want the microVM tier default %d", got, microvmDefaultConcurrency)
 	}
-	// The point of the change: this tier must NOT inherit the container tier's 4.
-	if got == session.DefaultConcurrency {
-		t.Fatalf("default slots = %d, which is still session.DefaultConcurrency -- the tier default is not in force", got)
+	// The point of the change is that this tier does not inherit the container tier's value.
+	// Asserted as the container constant's own value, NOT as `got != session.DefaultConcurrency`:
+	// `got` is already pinned to microvmDefaultConcurrency above and that to 16 below, so an
+	// inequality check could only ever fire when the CONTAINER constant changes -- and it would
+	// then report "the tier default is not in force", which would be false. A future PR raising
+	// session.DefaultConcurrency to 16 (this PR's body sketches the precondition: raising
+	// worker-deployment.yaml's memory limit) would make the two numerically equal while the
+	// per-tier default is still perfectly in force.
+	if session.DefaultConcurrency != 4 {
+		t.Fatalf("session.DefaultConcurrency = %d, want 4: the container tier's default moved, so this "+
+			"test's premise (the two tiers differ, and 256Mi funds only 4 slots' stream buffers) needs re-deriving",
+			session.DefaultConcurrency)
 	}
 	// 16 is the largest slot count actually MEASURED (172.88 Exec/s). Anything above it is
 	// an extrapolation, and finding where slots stop paying is its own sweep (Task 1.3), so
@@ -335,5 +344,58 @@ func TestWorkerMaxConcurrentRefusesAMalformedValueInsteadOfSilentlyUsingTheDefau
 		if !strings.Contains(err.Error(), "WORKER_MAX_CONCURRENT") {
 			t.Fatalf("WORKER_MAX_CONCURRENT=%q: error %q does not name the variable", bad, err)
 		}
+	}
+}
+
+// #313 review. Raising the slot count multiplies VM commitment, not just stream buffers:
+// committedLocked sums ready+inFlight+warming across run pools and StandbyDepth is per RUN
+// KEY, so N slots with distinct workspace keys commit up to N x (1 + D) VMs. Overflow
+// returns RefuseMemoryBudget, which budget.go records as reaching the harness "as a failed
+// exec rather than as back-pressure" -- so an operator who sized SH_MAX_COMMITTED_MB for 4
+// slots must be told at startup, not discover it as exec errors under load.
+func TestSlotBudgetWarningFiresOnlyWhenTheSlotCountOutrunsTheBudget(t *testing.T) {
+	// 256 MiB guest + 32 MiB overhead = 288 MiB per VM; D=2 so each slot can hold 3.
+	base := vmpool.Config{
+		VMM: vmpool.Firecracker, SnapshotDir: "/srv/snapshots", WorkspaceRoot: "/srv/workspaces",
+		GuestRAMBytes: 256 << 20, StandbyDepth: 2, MaxRuns: 64,
+	}
+
+	// The shipped unit's 24576 MiB funds 85 VMs; 16 slots need 48. Silent.
+	fits := base
+	fits.MaxCommittedBytes = 24576 << 20
+	if w := slotBudgetWarning(fits, 16); w != "" {
+		t.Fatalf("16 slots inside the shipped budget must not warn, got: %s", w)
+	}
+
+	// An operator-sized dev box: 2048 MiB funds 7 VMs, and 16 slots can want 48.
+	tight := base
+	tight.MaxCommittedBytes = 2048 << 20
+	w := slotBudgetWarning(tight, 16)
+	if w == "" {
+		t.Fatal("16 slots against a 2048 MiB budget must warn: the overflow arrives as failed Execs")
+	}
+	// The numbers an operator needs to act are the point of the message, not the wording.
+	for _, want := range []string{"16 concurrency slots", "48 VMs", "13824 MiB", "2048 MiB", "WORKER_MAX_CONCURRENT"} {
+		if !strings.Contains(w, want) {
+			t.Errorf("warning omits %q, so it cannot be acted on: %s", want, w)
+		}
+	}
+
+	// Non-vacuousness for the budget arithmetic: the SAME tight budget is fine at 4 slots
+	// (12 VMs, 3456 MiB)... still over 2048, so use a budget that funds 4 but not 16.
+	mid := base
+	mid.MaxCommittedBytes = 4096 << 20 // 14 VMs: covers 4 slots (12), not 16 (48)
+	if w := slotBudgetWarning(mid, 4); w != "" {
+		t.Fatalf("4 slots inside a 4096 MiB budget must not warn, got: %s", w)
+	}
+	if slotBudgetWarning(mid, 16) == "" {
+		t.Fatal("16 slots against the same 4096 MiB budget must warn -- that IS the default change")
+	}
+
+	// MemoryReserveBytes is part of the budget, not beside it.
+	reserved := fits
+	reserved.MemoryReserveBytes = 24000 << 20
+	if slotBudgetWarning(reserved, 16) == "" {
+		t.Fatal("the reserve must be subtracted from the budget before comparing")
 	}
 }
