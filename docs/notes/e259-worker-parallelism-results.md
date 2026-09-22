@@ -1,8 +1,60 @@
 # Results: is the ~62 Exec/s ceiling per-process or host-wide? (issue #259)
 
-**Answer: it is a property of the WORKER PROCESS, not the host.** Two workers delivered
-1.82x one worker's throughput, on a host that was still ~90% idle at the higher figure.
-The decision rule's first row fires: **scale out.**
+> **CORRECTION, 2026-09-22 — read this before acting on the recommendation below.**
+>
+> The measurements in this document stand and reproduce. **The recommendation does not: do not
+> scale out.**
+>
+> The per-process component was a hard-coded constant, `session.DefaultConcurrency = 4` — a fixed
+> pool of 4 goroutines draining the Exec queue in each worker. `e11-density.sh` never set
+> `WORKER_MAX_CONCURRENT`, so this experiment's two workers were **8 slots against 4**, not two
+> hosts' worth of capacity. Scale-out "worked" by multiplying the constant, and the 1.82x is what
+> 8 slots over 4 slots looks like once per-worker throughput drops the measured 8.8%.
+>
+> Two later measurements on this same host settle it:
+>
+> | configuration                         | Exec/s     | vs 1 worker at the default |
+> | ------------------------------------- | ---------- | -------------------------- |
+> | 1 worker, `MaxConcurrent=4` (default) | 62.99      | 1.00x                      |
+> | **2 workers, 4 each — this document** | **123.57** | **1.96x**                  |
+> | **1 worker, `MaxConcurrent=16`**      | **172.88** | **2.74x**                  |
+> | 1 worker, 64 slots                    | 577.55     | 9.2x                       |
+>
+> Raising one environment variable on a single worker **beat this entire two-worker result by
+> 1.40x**, at +3.6% p95 and without any of the separations two workers need.
+>
+> And once the cap is lifted, scale-out is worth nothing at all. Holding total slots constant and
+> varying only the process count (2026-09-22, same host):
+>
+> | arm                | total slots | aggregate Exec/s | host CPU |
+> | ------------------ | ----------- | ---------------- | -------- |
+> | 1 x 64             | 64          | **580.60**       | 65.3%    |
+> | **2 x 32**         | **64**      | **580.58**       | 68.2%    |
+> | 1 x 64 (drift rpt) | 64          | 563.66           | 67.2%    |
+>
+> A 0.02 Exec/s difference against 2.9% session drift, for +2.9 points of host CPU. Host CPU never
+> leaves 65–73% across one or two processes and 64/128/256 slots, so **the idle third of the host
+> is not reachable by adding workers** — what serialises is host-wide, in the restore path.
+>
+> **Revised guidance: one worker process per host, with `WORKER_MAX_CONCURRENT` raised.** Fewer
+> ports, relays, Redises, admission budgets and supervision paths, and none of the seven
+> separations to get wrong in production. Raise per-host throughput by needing fewer restores per
+> Exec (#274), not by adding processes. Add hosts to add capacity.
+>
+> **What this document establishes and keeps:** that two workers genuinely overlap (and _how_ to
+> prove it — the "`coresBusy` must not be summed" corollary below is what later made the two-worker
+> comparison auditable at all), the foreign-load sampling discipline, the instrument defects, and
+> the per-session `execGate` ceiling. The experiment was sound; only its frame was incomplete.
+>
+> **The lesson:** an interpretation inherits every configuration it ran under. This result was
+> reproducible and correctly reported, and still meant the opposite of what it said, because
+> `MaxConcurrent=4` was not in the frame. Record the configuration next to the number.
+>
+> Refs: #305 (the cap), #306 (`coldAcquireRate`), #274 (the remaining lever).
+
+**Answer as originally written — superseded above:** it is a property of the WORKER PROCESS, not
+the host. Two workers delivered 1.82x one worker's throughput, on a host that was still ~90% idle
+at the higher figure. The decision rule's first row fires: **scale out.**
 
 Run on `srv-r16b14s16` (bare metal, 72 cpu, 754 GiB, `systemd-detect-virt`=none, governor
 performance, swap off, cgroup2), 2026-09-21, `SH_SUBSTRATE=metal`.
@@ -75,8 +127,11 @@ the whole host. The host total at T2 is ~7.57 cores, not 15.14.
 
 ## What the number does and does not say
 
-- **Scale-out works, and is the answer to the throughput goal.** The serializer that held one
-  worker to ~1.4-way effective restore concurrency is per-process.
+- ~~**Scale-out works, and is the answer to the throughput goal.**~~ **SUPERSEDED — see the
+  correction at the top.** The per-process component was `session.DefaultConcurrency = 4`, so this
+  compared 8 slots with 4. Raising that one value on a single worker returns 2.74x and beats this
+  result by 1.40x; with it raised, a second worker returns 1.00x. There is no per-process
+  serializer once the cap is lifted.
 - **It is not perfectly linear, and the ratio is close to the boundary.** 1.824 is only 1.3%
   above the rule's 1.8 line. Per-worker throughput fell from 67.76 solo to ~61.8 paired,
   **-8.8%**, so a small shared component exists. Reported as measured rather than rounded to
@@ -84,6 +139,10 @@ the whole host. The host total at T2 is ~7.57 cores, not 15.14.
 - **Headroom remains large.** At T2 the host used 7.57 of 72 cores (**10.5%**); Sigma PSS was
   ~40 MB per worker against 754 GiB. Nothing physical is near saturation at two workers, so N
   should be found by extending this experiment, not by assuming linearity continues.
+  **This instruction was followed, and the answer was N = 1.** The experiment was extended in both
+  directions: raising the slot cap on one worker reaches 577.55 Exec/s at 66% CPU, and a second
+  worker at the same total slot count adds nothing. The headroom was real; processes are not what
+  spends it.
 - **Unchanged:** the per-session `runPool.execGate` ceiling of ~20 Exec/s per user
   (Firecracker `SerializesExecsPerRun()`=true). Nothing here raises a single user's rate.
 - **The isolated-snapshot variant was not run**, correctly: the plan gates it on the shared
