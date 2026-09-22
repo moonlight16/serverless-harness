@@ -765,6 +765,25 @@ Driver: `deploy/microvm/e10-lifecycle.sh`; cluster-free proof of its structure:
 > Until both clients have run against the null-responder on the host that produced the table
 > above, **this section's conclusions stay under repair**: a sweep run now would measure the
 > driver's knee again. The runbook is `docs/notes/e11-go-exec-client-comparison-runbook.md`.
+>
+> **2026-09-21 — the re-run has happened, and the knee HOLDS at `c=8`.** This section's
+> conclusion was right; only its evidence was wrong. Both real arms knee at 8 with the Go
+> client on this same host, `driver-control`'s own knee is 4 (Go) or 32 (grpcurl) and never
+> 8, and the Go driver accounts for under 0.4% of the microVM arm's p95 at every rung. So
+> the items above are **resolved, not retracted**, and #295 — open when this ran, closed
+> 2026-09-21 — confounded nothing here. Numbers, item by item, in **Issue #291 — the re-run**
+> below.
+>
+> **2026-09-22 — and the knee's CAUSE is now known: it is the worker's 4-slot cap (#305), not
+> density.** The re-run's position was right and its instrument repairs hold. But every microVM
+> ladder in this section swept `c` while the worker admitted only 4 concurrent Execs, so slots and
+> `c` are confounded throughout. With slots raised to match `c`, this same host reaches **580.60
+> Exec/s at 64 slots** against 62.28 at `c=64` here. Read the corrected preamble in that section
+> before quoting any microVM number from it.
+>
+> Two things in this section must still not be restated as published. The container arm's
+> `bound` is `attributeBound`'s fallback, not a crossing. And the `driver-control` table in
+> the note above does not reproduce past `c=1`. Both are detailed in that section.
 
 **RUN ON BARE METAL, 14 rungs, exit 0.** `SH_E11_ACTIVE_RUNS="1 2 4 8 16 32 64"`,
 `ITERS_PER_SLOT=20`, `SH_E11_COLD_LATENCY_MS=145`, same host and snapshot as E10.
@@ -1110,6 +1129,279 @@ discarded for this reason and the run repeated after the fix. Fixed with
 cleanup recipe, never by a captured PID or a process name), wired into both
 `stop_container_stack` and `stop_microvm_stack`, with five new regression checks in
 `deploy/microvm/tests/e11-density.test.sh` pinning the fix.
+
+### Issue #291 — the re-run: the knee holds at `c=8`, and it is the 4-slot cap
+
+> **2026-09-22 — CORRECTED BEFORE MERGE. The knee reproduces, and it is the worker's 4-slot
+> concurrency cap (#305), not a density property.** Every number below stands and none is removed;
+> what changes is what the ladder was measuring.
+>
+> This ladder sweeps offered concurrency `c` from 1 to 64 while the worker held
+> `session.DefaultConcurrency = 4` — a fixed pool of 4 goroutines draining the Exec queue.
+> `e11-density.sh` never set `WORKER_MAX_CONCURRENT`, so **every** microVM rung ever run before
+> #312 was capped at 4 concurrent Execs whatever `c` the driver drove. Slots and `c` are therefore
+> confounded across this whole section, and no conclusion drawn from behaviour at `c > 4` can
+> separate a property of the design from a property of that constant.
+>
+> **This section's own arithmetic is what exposes it.** The replenishment mechanism below is stated
+> as "per-pool warm supply is roughly 4.5 VMs/s whatever `D` is", and the same paragraph reports a
+> flat ~61–62 Exec/s plateau. Those differ by 14x, so they cannot both describe the bound. Four
+> slots at the measured 61.4 ms per Exec predicts **65.1 Exec/s** against the **62.99** measured at
+> `c=16` — within 3.4%, and it predicts the rest of the plateau as well (`c=32` 62.61, `c=64`
+> 62.28, both inside 5%). Below the cap it also holds: one slot at 55 ms predicts 18.2 against
+> **17.56** measured at `c=1`, within 3.5%. **The one rung it does not predict is `c=8`**, where
+> 4/62.2 ms = 64.3 against **80.62** measured — a 20% under-prediction, which is the
+> ~4.9-effective-slots anomaly left open below rather than evidence for the cap. The plateau is the
+> cap; `c=8` is still unexplained.
+>
+> (An earlier draft of this paragraph quoted `c=8` as 67.76, against which the model looks like a 5%
+> hit. That figure is real but from a **different run** — the one-worker control of #259's
+> two-worker experiment, at `D=2` and `ACTIVE_RUNS="1 8"` rather than this full ladder — so it does
+> not belong in an argument about these rungs. Quoting it here made the cap appear to explain the
+> one rung it does not.)
+>
+> The p95 column is the same story read as latency: 117.79 -> 268.51 -> 522.91 -> 1033.82 ms,
+> doubling per doubling of `c`, which is the textbook signature of queueing against a
+> fixed-capacity server — not of density. So the knee criterion here (the last rung whose p95
+> stays under twice the `c=1` p95) locates the slot count, and it moves when the slot count moves.
+>
+> **Measured on this same host with slots = `c` instead of 4** (merged `main`, descending sweep,
+> cheapest rung repeated last):
+>
+> | slots = c | Exec/s     | p95 ms | coresBusy /72 |
+> | --------- | ---------- | ------ | ------------- |
+> | 64        | **577.55** | 145    | 47.74         |
+> | 128       | 524.66     | 457    | 50.37         |
+> | 256       | 417.24     | 1244   | 49.20         |
+>
+> One worker, one descending sweep, cheapest rung repeated last; a separate session's 64-slot
+> anchor read 580.60. Against `c=64` below — 62.28 Exec/s, p95 1033.82, coresBusy 4.81 — that
+> is **9.3x the throughput at one seventh the p95**. The peak is 64 slots, not 8, and CPU is flat
+> 66–70% from 64 to 256 slots, so the host was never the limit at `c=8`.
+>
+> ### What survives, and what does not
+>
+> **Survives, and is why this run was worth doing:**
+>
+> - **The instrument repairs** (#293's sampling, #296's persistent-connection Go client). Every
+>   later number in the campaign rests on them.
+> - **"It is not the driver's knee."** The Go driver's share of the microVM arm's p95 is under
+>   0.4% at every rung, against up to 23.7% had it been grpcurl. This is what licenses reading any
+>   of these numbers as the backend's, and it is unaffected by the cap.
+> - **"No CPU or memory ceiling was reached"** — true, and now explained: `coresBusy` 4.81 of 72
+>   because the server would admit only 4 Execs at a time. At 64 slots the same host reaches 47.74.
+> - **The container arm.** At ~1940 Exec/s it is nowhere near a 4-slot cap, its `coresBusy`
+>   plateaus flat (6.64 -> 6.67), and its knee was reproduced twice independently. It stands as
+>   measured.
+>
+> **Does not survive:**
+>
+> - **The `coldAcquireRate` argument.** #306 shows that metric is wrong by 13x at `c=8` and ~250x
+>   at `c >= 16` (true cold rates 0.056 and 0.0039). The `0.01 -> 0.35` crossing of
+>   `NEAR_ZERO_COLD_ACQUIRE` is read below as localising the bound at exactly the knee; a metric
+>   that wrong cannot carry that weight, and the true rates do not cross there at all.
+> - **The `D` sweep as evidence.** Its conclusion — rate, not depth — is independently correct
+>   and was re-confirmed at 64 slots, where `Acquire` goes 4.30 -> 281.20 ms and the true cold rate
+>   0.142 -> 0.698 past the peak. But the sweep **as run could not have discriminated**: with only
+>   4 Execs in flight, no value of `D` could change the outcome, so "quadrupling `D` does not move
+>   the knee" is what a slot-capped ladder must produce whether or not depth matters. Right answer,
+>   inert experiment.
+> - **`bound = replenishment` at `c=8` as a genuine crossing.** It rests on the two items above.
+>
+> **The open question this leaves** is the one the section already notices without explaining:
+> `c=8` peaks at **80.62 Exec/s**, which is ~4.9 effective slots, and a 4-slot cap cannot produce
+> it. That is unresolved. It is why the peak-throughput reading (`c=8`) was quoted as more robust
+> than the p95 criterion, and it needs its own explanation rather than smoothing over.
+>
+> **The methodological lesson, which cost this campaign twice:** a measurement's interpretation
+> inherits every configuration it ran under. This ladder and #259's two-worker result were both
+> reproducible, correctly reported, and meant something other than what they said, because
+> `MaxConcurrent=4` was not in the frame. Record the configuration next to the number.
+
+**RUN ON BARE METAL, `srv-r16b14s16`** (72 cpu / 754 GiB, `virt: none`, governor `performance`,
+Xeon Gold 6150 @ 2.70GHz, kernel 6.8.0-1061-nvidia, cgroup2, swap off) — the same host and
+golden snapshot as the E10 and E11 tables above. Driver: PR #293's repaired sampling plus PR
+#296's persistent-connection Go Exec client. This is the run the 2026-09-17 caveat asked for,
+and it answers that caveat's falsifiable question: **the knee stays at `c=8`.**
+
+Every rung below carries `execClient=go-persistent-conn`, `samplingMode=in-rung-1hz-mean` and
+`coldLatencyThresholdMs=94`, and the fields that make a rung auditable — `hostCpuSamples`,
+`pssRefusedTicks` — are reported beside each number rather than summarised away. Records from
+this run are **not** comparable with the tables above on `hostCpuFraction`, `memAvailableBytes`,
+`pssBytes` or `processCount`: those carry no `samplingMode`.
+
+`SH_E11_COLD_LATENCY_MS=94` follows METAL-RUNBOOK.md §5's formula but takes the warm floor from
+the **Go** client rather than the grpcurl era: the go-client microVM `c=1` p95 (82.0 ms) plus
+half E10 rung 3's pinned restore p50 (23.06 / 2 = 11.5). Using the published 124–133 ms would
+have imported roughly 42 ms of grpcurl cost the Go client never pays, and put the classifier's
+floor above the arm's actual warm latency.
+
+#### The knee, on both real arms
+
+microVM arm, `SH_E11_ACTIVE_RUNS="1 2 4 8 16 32 64"`, `ITERS_PER_SLOT=80`, sampler 250/100/200 ms:
+
+| c   | tput/s | p95 ms  | coldAcquireRate | coresBusy /72 | hostCpuSamples | Σ PSS GB | pssRefusedTicks |
+| --- | ------ | ------- | --------------- | ------------- | -------------- | -------- | --------------- |
+| 1   | 17.56  | 69.67   | 0.01            | 1.31          | 20             | 0.001    | 0               |
+| 2   | 34.38  | 69.97   | 0.00            | 1.27          | 20             | 0.008    | 0               |
+| 4   | 65.79  | 71.93   | 0.01            | 2.35          | 20             | 0.015    | 0               |
+| 8   | 80.62  | 117.79  | 0.35            | 4.05          | 32             | 0.023    | 0               |
+| 16  | 62.99  | 268.51  | 1.00            | 4.26          | 81             | 0.056    | 0               |
+| 32  | 62.61  | 522.91  | 1.00            | 4.39          | 154            | 0.143    | 4               |
+| 64  | 62.28  | 1033.82 | 1.00            | 4.81          | 272            | 0.323    | 6               |
+
+container arm, same ladder at `ITERS_PER_SLOT=2000` (sized so its own windows clear ten sampler
+ticks; at the microVM arm's 80 its windows are ~0.24 s and its CPU figures are not quotable):
+
+| c   | tput/s  | p95 ms | coresBusy /72 | hostCpuSamples |
+| --- | ------- | ------ | ------------- | -------------- |
+| 1   | 395.24  | 3.75   | 1.56          | 21             |
+| 2   | 776.01  | 3.81   | 2.80          | 22             |
+| 4   | 1541.81 | 3.77   | 5.26          | 22             |
+| 8   | 1897.94 | 5.86   | 6.64          | 35             |
+| 16  | 1935.41 | 10.14  | 6.72          | 70             |
+| 32  | 1948.30 | 20.19  | 6.69          | 140            |
+| 64  | 1945.84 | 42.85  | 6.67          | 284            |
+
+**`knee = 8` on both arms**, by the same criterion this section used for its published knee (the
+last rung whose p95 stays under twice the `c=1` p95: 139.33 ms microVM, 7.49 ms container). The
+microVM knee is now sharper than published: throughput **peaks** at `c=8` and declines, where
+the published ladder peaked at `c=16`. The container knee was reproduced twice independently, at
+`ITERS_PER_SLOT=80` and 2000.
+
+#### It is not the driver's knee
+
+Three `driver-control` ladders on the same host, each labelled by what differs from the
+reference, since the two clients are not comparable except deliberately:
+
+| ladder                                        | knee | tput @c=64 | p95 @c=64 | coresBusy @c=64 | hostCpuSamples |
+| --------------------------------------------- | ---- | ---------- | --------- | --------------- | -------------- |
+| grpcurl, `ITERS_PER_SLOT=200`, sampler 250 ms | 32   | 1 910.8    | 39.26 ms  | 68.04           | 14–26          |
+| go, `ITERS_PER_SLOT=200`, sampler 20/10/10 ms | —    | 41 748.2   | 2.36 ms   | 9.75            | **1–5**        |
+| go, `ITERS_PER_SLOT=30000`, sampler 250 ms    | 4    | 65 910.3   | 1.77 ms   | 8.22            | 15–130         |
+
+Neither client's `driver-control` arm knees at 8. And the Go driver's share of the real arms' p95
+is negligible, which is what licenses reading the knee as the backend's:
+
+| c   | microVM p95 | driver p95 (go) | driver share | driver share had it been grpcurl |
+| --- | ----------- | --------------- | ------------ | -------------------------------- |
+| 1   | 69.67       | 0.141           | 0.20%        | 23.69%                           |
+| 8   | 117.79      | 0.428           | 0.36%        | 15.44%                           |
+| 64  | 1033.82     | 1.774           | 0.17%        | 3.80%                            |
+
+That last column is the confound the 2026-09-18 note suspected, now quantified: on the grpcurl
+path the driver was up to **23.7%** of the microVM arm's p95 at low `c`. The subtraction remains a
+strict lower bound on driver cost — the null-responder emits no `Chunk` event, so it under-counts
+driver work and over-attributes the remainder to the backend (`driverControlChunkDecode` in
+`proxyLimitations`).
+
+**Issue #294's own question is answered by the same three ladders**: `grpcurl`'s per-call `execve`
+was the driver's cost. At `c=64` the Go client sustains 34.5x the throughput on 12% of the CPU at
+22x lower p95. The matched-Exec-count ladder is reported despite being unusable for a CPU verdict
+because its unusability is the finding: even at 20/10/10 ms — five times past the documented
+100 ms `SAMPLE_SLICE_MS` floor — it records 1–5 `hostCpuSamples`, so the sampler cannot resolve
+the Go client's windows at a matched Exec count. The matched-wall-clock ladder needed no cadence
+change at all and lands on the reference's own tick counts.
+
+#### The bound is a replenishment RATE, not pool capacity
+
+> **CORRECTED — right conclusion, inert experiment.** "Rate, not depth" is independently correct
+> and was re-confirmed at 64 slots. But with only 4 Execs in flight no value of `D` could have
+> changed the outcome, so the `D` sweep below is what a slot-capped ladder must produce whether or
+> not depth matters. The ~4.5 VMs/s supply figure it derives is also 14x below the ~62 Exec/s
+> plateau it is offered to explain; 4 slots at 61.4 ms predicts that plateau to within 3%.
+
+`bound` is `replenishment` on the microVM arm and it is a **genuine crossing**, not a fallback:
+`coldAcquireRate` goes 0.01 → 0.35 at `c=8`, crossing `NEAR_ZERO_COLD_ACQUIRE` (0.05) at exactly
+the knee. A standby-depth sweep then localises the mechanism — `SH_E11_D_VALUES="2 4 8"`, microVM
+arm, 21/21 rungs, exit 0, everything else held:
+
+| D   | knee | cold crossing | tput peak | peak tput | plateau tput | standbys @c=64 | Σ PSS @c=64 |
+| --- | ---- | ------------- | --------- | --------- | ------------ | -------------- | ----------- |
+| 2   | 8    | 8             | 8         | 81.0      | 62.0         | 52             | 0.324 GB    |
+| 4   | 8    | 8             | 8         | 85.0      | 61.5         | 179            | 0.653 GB    |
+| 8   | 8    | 8             | 8         | 83.7      | 60.7         | 439            | 1.443 GB    |
+
+**Quadrupling `D` does not move the knee**, and `D` was demonstrably in effect: resident standbys
+went 52 → 439 and Σ PSS 0.324 → 1.443 GB. `D` helps _below_ the knee and nowhere else — `c=1` p95
+improves 73.0 → 55.8 ms (−24%), `c=8` only −5%, `c=16` −0.1%, and `c=64` is 3% **worse** while
+costing 4.5x the memory. That is a buffer-versus-rate signature. `replenish.go` caps supply
+structurally: refills are one-at-a-time by design ("One timer per slot rather than a burst, so a
+finished Exec does not create D VMs in the same instant") behind a 200 ms `ReplenishDelay`, so
+per-pool warm supply is roughly 4.5 VMs/s whatever `D` is, and buffering cannot fix a rate
+deficit. The flat ~61–62 Exec/s plateau at every `D` says the same.
+
+**So standby-depth sizing is not the lever for this knee.** `ReplenishDelay` and the
+one-timer-per-slot serialization are. `SH_MAX_COMMITTED_MB` was raised to 409600 for the sweep
+because a refused refill converts into a cold acquire by design, which would have corrupted the
+very metric the sweep reads; admission refused nothing (0 refusals at every rung).
+
+#### The items the caveat listed, resolved
+
+> **CORRECTED.** These resolutions concern #291's question (is the knee the driver's?) and that
+> answer stands. They do not establish that the knee is a density property — see the preamble.
+
+- **The knee position, `c=8`** — **holds**, on both arms, with the driver's share under 0.4%.
+  No retraction.
+- **`bound` = replenishment** — **holds on the microVM arm as a genuine crossing**, at the same
+  `c` as the knee, and the `D` sweep names the mechanism. It does **not** hold as stated "on both
+  arms": see the correction below.
+- **"Nothing resembling a CPU or memory ceiling was reached"** — **now a real finding rather than
+  a restatement of the sampling bug.** `crosses('cpu')` needs `hostCpuFraction >= 0.9`; the true
+  under-load means are 0.067 (microVM) and 0.093 (container), from 20–284 ticks per rung instead
+  of a post-load 0.0006. Σ PSS reaches 1.443 GB of 754 GiB at `D=8`, `c=64`.
+- **Sealed prediction 3** — scored **`supported`** on the microVM arm, this time from a threshold
+  derived from the same client that produced the ladder. Its shape is the reason: cold-acquire
+  stays at 0.00–0.01 before the knee and rises to 0.35 at it, then 1.00.
+- **Issue #295 (relay yields `ExecEvent.error`, returns OK)** — **open when this run was made,
+  closed 2026-09-21** (commit `9eabbef`), which is before this correction was written. It
+  confounded nothing here either way: both real arms ran the Go client only, which classifies that
+  case correctly, and on `driver-control` the two clients are identical by construction. It was a
+  blocker for any grpcurl-vs-go comparison on the container or microVM arms; it no longer is.
+
+`deploy/microvm/predictions.json` was not edited, and its hash pin still passes.
+
+#### Two corrections to this section as published
+
+- **The container arm's `bound: "cpu"` is not a CPU ceiling.** No signal crossed its threshold
+  anywhere on that arm, so `attributeBound` fell through to its documented fallback — "whichever
+  moved most, relatively, at the last rung … so the report always names a candidate rather than
+  throwing" — and `cpu` won with a delta of about 0.07, i.e. 7% of one machine. The arm's peak
+  `hostCpuFraction` is 0.093 against a 0.9 threshold. Read it as "nothing bound", not as CPU.
+- **The `driver-control` table in the 2026-09-18 note does not reproduce past `c=1`.** Same host,
+  same client, same `ITERS_PER_SLOT=200` and 250 ms cadence, and the current driver rises
+  monotonically to 1 910.8 Exec/s at p95 39.26 ms at `c=64`, where that note recorded 231.6 Exec/s
+  at p95 753 ms on the same ~64 busy cores. `c=1` agrees closely (63.41 vs 56.8; coresBusy 1.54 vs
+  1.47). The divergence grows with `c` and is unexplained; it cannot be resolved retroactively.
+  Foreign load during every measurement reported here was at most 8.8% of a single core, recorded
+  per phase. The published table's own numbers are self-consistent only if its sampler was starved
+  to roughly 537 ms per tick, which is what a contended host looks like — but that is inference,
+  not evidence, and it is recorded here as an open discrepancy rather than a diagnosis.
+
+#### Three instrument defects this run found
+
+- **A dying VMM aborted the microVM ladder.** `pss_bytes_for_pids` refused on a pid that `kill -0`
+  reports alive but whose address space is already gone; in `host_signals_snapshot`'s
+  idle-standby-residency poll, where a failed snapshot is fatal, that killed the run at `c=4`.
+  4–5 such pids per microVM rung, and two of four short runs died on it. Fixed in PR #299 by
+  treating an empty `/proc/<pid>/cmdline` as proof the mm is gone; ambiguity still refuses.
+- **`SH_E11_VMM_PROC_PATTERN` cannot usefully be scoped, and must be left unset.** The jailer
+  chroots, so the VMM's argv is `/firecracker --id vm-N` and the absolute install path matches
+  **nothing** — which correctly refuses every microVM rung. Worse, METAL-RUNBOOK.md §1 requires
+  every `SH_*` be passed on the `sudo` command line, and `discover_pids` is a bare `pgrep -f`
+  that excludes its own pid but not its ancestors, so any value passed is matched inside `sudo`'s
+  own argv and that process's PSS is summed in. The driver's default is correct and, being a
+  default, cannot self-match.
+- **The in-rung sampler has no zero-PSS refusal.** `require_vmm` — the parameter that makes a zero
+  Σ PSS a refusal rather than a value — is passed only by the post-load snapshot call sites. The
+  in-rung sampler calls `pss_bytes_for_pids` directly, so a microVM rung can record `pssBytes: 0`
+  with `pssRefusedTicks: 0` and exit 0. Observed twice at low `ITERS_PER_SLOT`, where a rung has
+  only one to three PSS ticks. Not fixed; it is the same shape as issue #291's own item 1, a guard
+  that covers the snapshot but not the window.
+
+Σ PSS itself is sound: read directly, a jailed Firecracker reports 3150 kB of PSS on 20 of 20
+samples, which at 128 resident VMs is about 0.40 GB against this section's published 0.41 GB. The
+value is small because guest RAM is a shared memfile mapping, which PSS divides away.
 
 ### E12 — guest-initiated vsock on a second port survives snapshot restore
 
