@@ -86,16 +86,6 @@ import (
 // restart. Cleaning stale jail directories is a candidate for a separate, explicitly
 // time-based reaper, not this crash-recovery sweep.
 
-// vmCgroupPath returns the cgroup directory for one VM under the given parent slice.
-// Firecracker's jailer is configured with the identical parent via --parent-cgroup
-// (firecrackerCgroupArgs), and the Cloud Hypervisor launcher's systemd-run --scope is
-// placed under the same slice — spec §5.3: "they must be configured consistently... or
-// the two mechanisms fight and the leak we are preventing returns." A path outside the
-// parent would escape systemd's KillMode=control-group on the unit.
-func vmCgroupPath(parent, id string) string {
-	return filepath.Join(parent, id)
-}
-
 // The three names below are the single authority on what a VM's cgroup DIRECTORY is
 // called under the parent slice. They live together, in the file that has to recognise
 // them, because H1 was a false premise about exactly this — and they are consumed rather
@@ -325,16 +315,16 @@ func unsafeToSignal(pid int) (reason string, unsafe bool) {
 	return "", false
 }
 
-// writeMemoryMax bounds one VM's cgroup to bytes. Spec §6's third mitigation: a
-// ballooning command is killed inside its OWN cgroup — one failed Exec, attributable —
-// instead of a host-level OOM lottery whose size-ranked favourites include
-// microvm-worker itself. cgroup v2's memory.max accepts a bare byte count (no unit
-// suffix), which is what gets written here.
 // mkdirAllCgroup creates a cgroup directory. Separated so cgroupPool reads as intent rather than
 // as a bare MkdirAll: on real cgroupfs the kernel materialises the control files, and creating a
 // nested path is how a child cgroup comes into being at all.
 func mkdirAllCgroup(dir string) error { return os.MkdirAll(dir, 0o755) }
 
+// writeMemoryMax bounds one VM's cgroup to bytes. Spec §6's third mitigation: a
+// ballooning command is killed inside its OWN cgroup — one failed Exec, attributable —
+// instead of a host-level OOM lottery whose size-ranked favourites include
+// microvm-worker itself. cgroup v2's memory.max accepts a bare byte count (no unit
+// suffix), which is what gets written here.
 func writeMemoryMax(dir string, bytes int64) error {
 	if bytes <= 0 {
 		return fmt.Errorf("vmpool: writeMemoryMax: bytes must be > 0, got %d", bytes)

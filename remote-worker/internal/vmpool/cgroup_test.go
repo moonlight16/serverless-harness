@@ -386,21 +386,6 @@ func TestWriteMemoryMaxBoundsOneVM(t *testing.T) {
 	}
 }
 
-func TestVMCgroupPathIsUnderTheParentSlice(t *testing.T) {
-	got := vmCgroupPath("/sys/fs/cgroup/microvm-vms.slice", "vm-7")
-	want := "/sys/fs/cgroup/microvm-vms.slice/vm-7"
-	if got != want {
-		t.Fatalf("vmCgroupPath = %q, want %q", got, want)
-	}
-	// The jailer is told the SAME parent (spec §5.3: "Firecracker's jailer has its own
-	// --cgroup arguments. They must be configured consistently with the systemd slice §6
-	// relies on for cleanup, or the two mechanisms fight and the leak we are preventing
-	// returns"), so a path that did not sit under the parent would split the tree in two.
-	if !strings.HasPrefix(got, "/sys/fs/cgroup/microvm-vms.slice/") {
-		t.Fatal("a VM cgroup outside the parent slice would escape systemd's KillMode")
-	}
-}
-
 // D1 (hardware-corrections): "two numbers that can drift is the bug." vmCgroupPath's
 // own test above only checks the PATH is inside the slice; this checks the VALUE the
 // Firecracker launcher configures into --cgroup memory.max= agrees with the same figure

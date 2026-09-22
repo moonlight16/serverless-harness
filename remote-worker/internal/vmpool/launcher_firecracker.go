@@ -86,17 +86,17 @@ type FirecrackerOptions struct {
 	// production path.
 	cgroupRoot string
 
-	// CgroupMemoryMaxBytes is the per-VM cgroup memory.max jailer is told to write via
-	// --cgroup (Task 17, hardware-corrections D1). Without --cgroup, jailer only
-	// MOVES the jailed process into --parent-cgroup if that path already exists — it
-	// does NOT create a new cgroup, so on its own ParentCgroup produces no per-VM
-	// memory.max at all and spec §6's mitigation #3 ("a ballooning command is killed
-	// inside its own cgroup") is unimplemented; this was confirmed directly against
-	// real jailer output, confirmed on the rig rather than inferred. This value MUST equal
-	// vmpool.PerVMBytes(cfg) — the same figure admission control charges per VM — set
-	// by the caller (cmd/microvm-worker/main.go's launcherFor), never a fresh
-	// constant, or the two numbers drift apart (spec §5.3). Only meaningful, and only
-	// applied, when ParentCgroup is also set.
+	// CgroupMemoryMaxBytes is the per-VM cgroup's memory.max, and since #258 it is written by
+	// cgroupPool rather than by jailer. jailer is no longer told to create a per-VM cgroup at all:
+	// --cgroup was the flag that did that, and creating one per VM cost 195.52 ms of a 253 ms
+	// Destroy at 64 concurrency slots plus an unbounded dying-cgroup population. The pool creates
+	// the cgroup, writes this bound, and jailer is given only --parent-cgroup, which relocates the
+	// jailed process into a cgroup that already exists.
+	//
+	// The FIGURE is unchanged: PerVMBytes(cfg), the same one admission control charges (D1), so the
+	// kernel-enforced ceiling and the software gate still agree. It matters MORE than before, not
+	// less: writeMemoryMax rejects <= 0, so a zero here now fails every restore rather than
+	// silently omitting a flag. validate() refuses that combination at construction.
 	CgroupMemoryMaxBytes int64
 
 	// WorkspaceImageBytes sizes the lazily-created workspace.img ext4 filesystem
@@ -132,12 +132,14 @@ func (o FirecrackerOptions) validate() error {
 		return errors.New("firecracker: ChrootBase is required")
 	case o.ParentCgroup != "" && o.CgroupMemoryMaxBytes <= 0:
 		// D1: a ParentCgroup with no memory bound is exactly the half-wired state the
-		// hardware corrections found in committed code — jailer moves the process into
-		// the slice but creates no per-VM cgroup and sets no memory.max. Fail loudly at
-		// construction rather than silently omitting --cgroup at Restore time.
+		// hardware corrections found in committed code. The check is unchanged and matters MORE
+		// since #258 moved the write out of jailer: cgroupPool calls writeMemoryMax, which
+		// rejects <= 0, so a zero here fails every restore rather than silently omitting a flag.
+		// Fail loudly at construction instead.
 		return errors.New("firecracker: ParentCgroup is set but CgroupMemoryMaxBytes is <= 0 " +
-			"— jailer would move the VM into the slice without creating a per-VM cgroup or " +
-			"memory.max (spec §6 mitigation #3 would be unimplemented); set it from vmpool.PerVMBytes(cfg)")
+			"— the cgroup pool could not write a memory.max for the VMs it creates, so every " +
+			"restore would fail (spec §6 mitigation #3 would be unimplemented); set it from " +
+			"vmpool.PerVMBytes(cfg)")
 	}
 	return nil
 }

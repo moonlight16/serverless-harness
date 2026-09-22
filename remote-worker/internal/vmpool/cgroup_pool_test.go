@@ -221,3 +221,99 @@ func TestCgroupPoolDropsAVanishedCgroupInsteadOfReusingIt(t *testing.T) {
 		t.Fatalf("acquire handed out a non-existent cgroup %q: %v", next, err)
 	}
 }
+
+// #319 review, must-fix. acquire used to roll `minted` back when mkdir failed, which is correct
+// single-threaded and hands the same pool-<n> to two live VMs concurrently:
+//
+//	A: seq=5, minted -> 6
+//	B: seq=6, minted -> 7, mkdir pool-6 OK      <- B holds pool-6
+//	A: mkdir pool-5 FAILS -> minted-- -> 6
+//	C: seq=6 -> mkdirAllCgroup(pool-6) returns NIL (it exists, and is a dir) -> C holds pool-6 too
+//
+// That is D1 inverted: admission control charged 2 x PerVMBytes while the kernel enforces one
+// bound over both VMMs, so a ballooning command in one can OOM the other's VMM. The fallout is
+// mis-recorded too -- whichever destroys first spins in waitForCgroupEmpty on the other's pid and
+// counts a leak, then the second pushes the SAME rel back onto free, so it ends up both
+// leak-counted and reusable.
+//
+// The collision itself needs concurrency to stage. What is deterministic, and what prevents it, is
+// that a name is never reclaimed after a failure -- so that is what this pins.
+func TestCgroupPoolNeverReclaimsANameAfterAFailedMint(t *testing.T) {
+	p, root := newTestPool(t)
+	// A FILE where pool-0's directory would go, so MkdirAll on it fails.
+	if err := os.WriteFile(filepath.Join(root, "microvm.slice/microvm-vms.slice", "pool-0"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := p.acquire(); err == nil {
+		t.Fatal("acquire succeeded despite a file blocking the cgroup directory")
+	}
+	// With the rollback this returns pool-0 again and fails identically; without it, pool-1.
+	rel, err := p.acquire()
+	if err != nil {
+		t.Fatalf("second acquire must mint a FRESH name, got error: %v -- the failed name was reclaimed", err)
+	}
+	if got := filepath.Base(rel); got != "pool-1" {
+		t.Fatalf("second acquire returned %q, want pool-1: a name used by a failed mint must never "+
+			"be handed out again, or a concurrent failure can alias a live holder", got)
+	}
+}
+
+// #319 review. release is careful that the directory must still be there; acquire was not, so a
+// cgroup that vanished while idle on the free list would be handed out and fail the restore that
+// drew it. Idle entries are the MOST exposed: an idle pooled cgroup is empty so rmdir succeeds,
+// while a live VM's is EBUSY and survives -- so an operator clearing the slice by hand (metal
+// runbook step 3a) removes precisely what is in `free`. cgroup.go also claims acquire "re-creates
+// on miss", which was not true before this.
+func TestCgroupPoolRecreatesAPoppedCgroupThatVanished(t *testing.T) {
+	p, root := newTestPool(t)
+	rel, err := p.acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.release(rel)
+	if p.idle() != 1 {
+		t.Fatalf("fixture: expected one idle entry, got %d", p.idle())
+	}
+	// Vanishes while idle, which is exactly what clearing the slice does.
+	if err := os.RemoveAll(filepath.Join(root, rel)); err != nil {
+		t.Fatal(err)
+	}
+
+	again, err := p.acquire()
+	if err != nil {
+		t.Fatalf("acquire after the idle entry vanished: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, again)); err != nil {
+		t.Fatalf("acquire handed out %q which does not exist: %v", again, err)
+	}
+	// And it is bounded again -- a recreated cgroup with no memory.max would be unbounded.
+	if b, err := os.ReadFile(filepath.Join(root, again, "memory.max")); err != nil ||
+		strings.TrimSpace(string(b)) != strconv.FormatInt(testPerVM, 10) {
+		t.Fatalf("recreated cgroup is not bounded: %q err=%v", b, err)
+	}
+}
+
+// #319 review. If mkdir succeeds and writeMemoryMax fails, the directory exists, is UNBOUNDED,
+// never reaches the free list and is never removed. That is the silent accumulation this whole
+// change exists to remove, reappearing on the error path -- and it sat oddly beside release, which
+// is meticulous that "a leak is counted so it cannot be silent".
+func TestCgroupPoolCountsALeakWhenTheBoundCannotBeWritten(t *testing.T) {
+	p, root := newTestPool(t)
+	// memory.max as a DIRECTORY: MkdirAll for the cgroup succeeds, the write into it cannot.
+	dir := filepath.Join(root, "microvm.slice/microvm-vms.slice", "pool-0")
+	if err := os.MkdirAll(filepath.Join(dir, "memory.max"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := p.acquire(); err == nil {
+		t.Fatal("acquire succeeded without writing the bound")
+	}
+	if p.leaks() != 1 {
+		t.Fatalf("leaks=%d, want 1: an unbounded cgroup nobody will reuse must be counted, since "+
+			"it is exactly the accumulation this change removes", p.leaks())
+	}
+	if p.idle() != 0 {
+		t.Fatalf("an unbounded cgroup must not reach the free list (idle=%d)", p.idle())
+	}
+}

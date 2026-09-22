@@ -48,9 +48,17 @@ type cgroupPool struct {
 	parent string // slice-relative, e.g. "microvm.slice/microvm-vms.slice"
 	memMax int64
 
-	mu     sync.Mutex
-	free   []string // slice-relative paths of idle cgroups
-	minted int
+	mu   sync.Mutex
+	free []string // slice-relative paths of idle cgroups
+	// issued is a NAME ALLOCATOR, not a count of live cgroups, and it never goes backwards.
+	// It used to be rolled back when mkdir failed, which is correct single-threaded and hands the
+	// same pool-<n> to two live VMs concurrently: A takes seq=5, B takes 6 and creates pool-6, A's
+	// mkdir fails and rolls back to 6, C then takes 6 and mkdirAllCgroup returns NIL because the
+	// directory already exists. Two VMMs would share one memory.max -- D1 inverted, since admission
+	// control charged twice for one enforced bound. An int is free; a name is not. Making the
+	// rollback safe would mean holding mu across the mkdir, serialising the syscall this change
+	// exists to keep off the critical path.
+	issued int
 	leaked atomic.Int64
 }
 
@@ -72,27 +80,49 @@ func (p *cgroupPool) abs(rel string) string { return filepath.Join(p.fsRoot(), r
 // when there is one. Relative because jailer refuses an absolute --parent-cgroup outright.
 func (p *cgroupPool) acquire() (string, error) {
 	p.mu.Lock()
+	var rel string
 	if n := len(p.free); n > 0 {
-		rel := p.free[n-1]
+		rel = p.free[n-1]
 		p.free = p.free[:n-1]
 		p.mu.Unlock()
-		return rel, nil
+		// An idle entry can have vanished while it sat here, and idle entries are the MOST
+		// exposed to it: an idle pooled cgroup is empty so rmdir succeeds, while a live VM's is
+		// EBUSY and survives -- so an operator clearing the slice by hand (metal runbook step
+		// 3a) removes precisely what is in `free`. Handing the stale rel out costs one failed
+		// restore per entry, and at 64 slots `free` can hold ~100. A stat is microseconds
+		// against a 60 ms Destroy, and it is what makes isPoolVMCgroupDirName's claim that
+		// acquire "re-creates on miss" actually true.
+		if _, err := os.Stat(p.abs(rel)); err == nil {
+			return rel, nil
+		}
+		// Fall through and rebuild it under the SAME name: nothing else can hold it, because it
+		// was on the free list.
+		return p.create(rel)
 	}
-	seq := p.minted
-	p.minted++
+	seq := p.issued
+	p.issued++
 	p.mu.Unlock()
+	return p.create(filepath.Join(p.parent, pooledCgroupPrefix+strconv.Itoa(seq)))
+}
 
-	rel := filepath.Join(p.parent, pooledCgroupPrefix+strconv.Itoa(seq))
+// create materialises rel and writes its bound. Shared by the mint path and the
+// vanished-while-idle path so both produce a cgroup that is bounded, never one that is merely
+// present.
+func (p *cgroupPool) create(rel string) (string, error) {
 	dir := p.abs(rel)
 	if err := mkdirAllCgroup(dir); err != nil {
-		p.mu.Lock()
-		p.minted-- // not created, so do not claim the name
-		p.mu.Unlock()
+		// The name is NOT reclaimed -- see issued.
 		return "", fmt.Errorf("vmpool: cgroup pool: create %s: %w", dir, err)
 	}
 	// The bound jailer's --cgroup used to write. Kept here so D1's figure still applies to every
 	// VM (design note §4): the same PerVMBytes admission control charges.
 	if err := writeMemoryMax(dir, p.memMax); err != nil {
+		// The directory exists and is UNBOUNDED, and nothing will reuse it -- it never reaches
+		// the free list. Counted and logged rather than left silent, matching release's posture:
+		// an unbounded stray is exactly the accumulation this pool exists to remove, and this is
+		// the one path that can produce one.
+		p.leaked.Add(1)
+		log.Printf("vmpool: cgroup pool: leaking %s, created but could not write memory.max: %v", rel, err)
 		return "", err
 	}
 	return rel, nil
@@ -144,10 +174,12 @@ func (p *cgroupPool) idle() int {
 	return len(p.free)
 }
 
+// mintedCount reports how many NAMES have been allocated, which after a failed mint exceeds the
+// number of cgroups that exist. That is deliberate: see issued.
 func (p *cgroupPool) mintedCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.minted
+	return p.issued
 }
 
 func (p *cgroupPool) leaks() int64 { return p.leaked.Load() }
