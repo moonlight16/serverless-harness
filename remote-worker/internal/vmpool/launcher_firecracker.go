@@ -400,10 +400,12 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		"--gid", strconv.Itoa(l.opts.GID),
 		"--chroot-base-dir", l.opts.ChrootBase,
 	}
-	// firecrackerCgroupArgs appends --cgroup-version/--parent-cgroup/--cgroup: the last
-	// of the three is load-bearing, not decorative — without it jailer relocates this
-	// process into the shared parent cgroup but creates no cgroup of its own, so no
-	// per-VM memory.max is ever set (Task 17, hardware-corrections D1).
+	// firecrackerCgroupArgs appends --cgroup-version and --parent-cgroup, and deliberately
+	// NOT --cgroup: see its own doc comment. An earlier version of this comment claimed
+	// --cgroup was the load-bearing one of three, which was true until #258/#319 removed it
+	// — creating a cgroup per VM cost 195.52 ms of a 253 ms Destroy at 64 slots. D1's bound
+	// still holds because cgroupPool writes memory.max = PerVMBytes on the pooled cgroup this
+	// relocates into, rather than jailer writing it on a fresh one.
 	args = append(args, firecrackerCgroupArgs(cgroupRel)...)
 	// Coordinator finding #5: this launcher never issues PUT /network-interfaces —
 	// standbys are headless by construction, not by omission. Nothing below adds one.
