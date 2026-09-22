@@ -5,52 +5,51 @@
 > The measurements in this document stand and reproduce. **The recommendation does not: do not
 > scale out.**
 >
-> The per-process component was a hard-coded constant, `session.DefaultConcurrency = 4` — a fixed
-> pool of 4 goroutines draining the Exec queue in each worker. `e11-density.sh` never set
-> `WORKER_MAX_CONCURRENT`, so this experiment's two workers were **8 slots against 4**, not two
-> hosts' worth of capacity. Scale-out "worked" by multiplying the constant, and the 1.82x is what
-> 8 slots over 4 slots looks like once per-worker throughput drops the measured 8.8%.
+> **`docs/notes/2026-09-22-exec-throughput-campaign-results.md` is canonical** for the corrected
+> picture — the slot-controlled measurements, the guidance, and the reasoning behind both. It has a
+> section, "A second worker does not help (issue #259 revisited)", written specifically to correct
+> this experiment's interpretation. This block states only what a reader of _this_ document must
+> know before acting on it, and does not restate that one.
 >
-> Two later measurements on this same host settle it:
+> **What was wrong:** the per-process component was a hard-coded constant,
+> `session.DefaultConcurrency = 4` — a fixed pool of 4 goroutines draining the Exec queue in each
+> worker. `e11-density.sh` never set `WORKER_MAX_CONCURRENT`, so this experiment's two workers were
+> **8 slots against 4**, not two hosts' worth of capacity. Scale-out "worked" by multiplying the
+> constant, and the 1.82x is what 8 slots over 4 slots looks like once per-worker throughput drops
+> the measured 8.8%.
 >
-> | configuration                         | Exec/s     | vs 1 worker at the default |
-> | ------------------------------------- | ---------- | -------------------------- |
-> | 1 worker, `MaxConcurrent=4` (default) | 62.99      | 1.00x                      |
-> | **2 workers, 4 each — this document** | **123.57** | **1.96x**                  |
-> | **1 worker, `MaxConcurrent=16`**      | **172.88** | **2.74x**                  |
-> | 1 worker, 64 slots                    | 577.55     | 9.2x                       |
+> **What settles it**, both on this same host and both in the canonical doc: raising that one
+> variable on a **single** worker gave 172.88 Exec/s against the default's 62.99 — **2.74x**, which
+> beats this document's two-worker **123.57** by 1.40x with none of the separations. And with the
+> cap lifted, holding total slots fixed at 64 and varying only the process count gave **580.60 for
+> 1 × 64 against 580.58 for 2 × 32** — 0.02 Exec/s apart, against 2.9% within-session drift, for
+> +2.9 points of host CPU. Scale-out is worth 1.00x.
 >
-> Raising one environment variable on a single worker **beat this entire two-worker result by
-> 1.40x**, at +3.6% p95 and without any of the separations two workers need.
+> **Revised guidance: one worker process per host, with `WORKER_MAX_CONCURRENT` raised.** Add hosts
+> to add capacity; raise the per-host number by needing fewer restores per Exec (#274), not by
+> adding processes. Note the shipped default is no longer 4 either: since #313 this tier defaults to
+> `microvmDefaultConcurrency = 16` (`remote-worker/cmd/microvm-worker/main.go`), deliberately 4x
+> below the measured peak, and `main_test.go` pins `session.DefaultConcurrency != 4` as a tripwire
+> so this framing cannot silently rot. Reaching 64 still requires setting the variable explicitly.
 >
-> And once the cap is lifted, scale-out is worth nothing at all. Holding total slots constant and
-> varying only the process count (2026-09-22, same host):
->
-> | arm                | total slots | aggregate Exec/s | host CPU |
-> | ------------------ | ----------- | ---------------- | -------- |
-> | 1 x 64             | 64          | **580.60**       | 65.3%    |
-> | **2 x 32**         | **64**      | **580.58**       | 68.2%    |
-> | 1 x 64 (drift rpt) | 64          | 563.66           | 67.2%    |
->
-> A 0.02 Exec/s difference against 2.9% session drift, for +2.9 points of host CPU. Host CPU never
-> leaves 65–73% across one or two processes and 64/128/256 slots, so **the idle third of the host
-> is not reachable by adding workers** — what serialises is host-wide, in the restore path.
->
-> **Revised guidance: one worker process per host, with `WORKER_MAX_CONCURRENT` raised.** Fewer
-> ports, relays, Redises, admission budgets and supervision paths, and none of the seven
-> separations to get wrong in production. Raise per-host throughput by needing fewer restores per
-> Exec (#274), not by adding processes. Add hosts to add capacity.
->
-> **What this document establishes and keeps:** that two workers genuinely overlap (and _how_ to
-> prove it — the "`coresBusy` must not be summed" corollary below is what later made the two-worker
-> comparison auditable at all), the foreign-load sampling discipline, the instrument defects, and
-> the per-session `execGate` ceiling. The experiment was sound; only its frame was incomplete.
+> **What this document keeps, and the campaign used downstream:** the _evidence_ that two workers
+> genuinely overlapped — `processCount` 24 against the control's 12, `hostCpuFraction` 0.105, and an
+> independent 3 s `/proc/stat` sampler at 1.91x, all below — which is a different measurement from
+> the canonical doc's (matching per-worker `coresBusy` inside the 2 × 32 arm) and corroborates the
+> same corollary: **`coresBusy` must not be summed across workers.** That corollary is what made the
+> later two-worker comparison auditable at all. Also kept: the foreign-load sampling discipline, the
+> instrument defects, and the per-session `execGate` ceiling (~20 Exec/s per user), which nothing in
+> the campaign has raised.
 >
 > **The lesson:** an interpretation inherits every configuration it ran under. This result was
 > reproducible and correctly reported, and still meant the opposite of what it said, because
-> `MaxConcurrent=4` was not in the frame. Record the configuration next to the number.
+> `MaxConcurrent=4` was not in the frame. **It applies to this correction too** — the 1.82x here and
+> the 2.74x above each inherited a configuration, and the 2.74x is 16 slots against 4 on one host,
+> not a property of the worker. The canonical doc turns the same lesson on its own headline table,
+> for the same reason. Record the configuration next to the number.
 >
-> Refs: #305 (the cap), #306 (`coldAcquireRate`), #274 (the remaining lever).
+> Refs: #305 (the cap), #306 (`coldAcquireRate`), #313 (the per-tier default), #274 (the remaining
+> lever).
 
 **Answer as originally written — superseded above:** it is a property of the WORKER PROCESS, not
 the host. Two workers delivered 1.82x one worker's throughput, on a host that was still ~90% idle
@@ -175,7 +174,9 @@ uncontended.
    `pssRefusedTicks`, so the ladder survived. It should not be relied on to.
 2. **Trap 6 reconfirmed**: `pssBytes: 0` with `pssRefusedTicks: 0` and exit 0, on
    `.results-control3-w1` c=1 and `.results-smoke-w2` c=1. Still unfixed; treat as suspect.
-3. **A fifth separation the runbook's four omit: `SH_PARENT_CGROUP`.** Both workers share
+3. **A separation the runbook omitted: `SH_PARENT_CGROUP`.** Added to the runbook's table in
+   response to this finding; the table now carries nine variables, and the campaign doc's count of
+   seven is the same list drawn at the worker-facing boundary. Both workers share
    `microvm.slice/microvm-vms.slice`, and `microvm-worker` runs a startup orphan sweep over
    it - w2 logged "swept 692 VM cgroup(s) from a previous incarnation". Harmless here only
    because both workers start simultaneously, before either has VMs. **A worker starting
@@ -189,7 +190,10 @@ uncontended.
 
 ## Notes for whoever repeats this
 
-- The four separations hold exactly as the runbook says. Verified, not assumed: both workers
+- The separations the runbook listed at the time of this run — `RESULTS`, `SH_CHROOT_BASE`,
+  `SH_WORKSPACE_ROOT` and the three ports — hold exactly as it says. (`SH_PARENT_CGROUP` and
+  `SH_E11_STATS_ADDR` were added to that table afterwards; see the defect list above and the
+  campaign doc.) Verified, not assumed: both workers
   registered the identical derived `SANDBOX_ID` (`e11-microvm-d2-ram256`) yet attached to
   their own relays (`localhost:8444` / `localhost:8454`), and both jail bases minted the same
   ids (`vm-6`, `vm-9`, `vm-15`) with no collision refusal.
