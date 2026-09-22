@@ -245,7 +245,7 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 	// time.Now() calls are ~100ns against a restore measured in tens of MILLISECONDS,
 	// so they are unconditional and only the log line is gated.
 	phaseStart := time.Now()
-	var phPrep, phWsImg, phJailer, phSock time.Duration
+	var phPrep, phWsImg, phSpawn, phSock time.Duration
 	jailRoot := filepath.Join(l.opts.ChrootBase, filepath.Base(l.opts.FirecrackerBin), req.ID, "root")
 	apiSockHost := filepath.Join(jailRoot, apiSockRelPath)
 
@@ -425,12 +425,27 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: start jailer: %w", req.ID, err), cleanup())
 	}
 
-	phJailer = time.Since(phaseStart) - phPrep - phWsImg
-	if err := waitForUnixSocket(ctx, apiSockHost, 5*time.Second); err != nil {
+	// phSpawn times cmd.Start() RETURNING, which is all it ever measured -- it used to be
+	// logged as jailer_us and read as the jailer's work (#328). The jailer's actual chroot
+	// construction happens after this and is now measured as jailersetup_us below.
+	phSpawn = time.Since(phaseStart) - phPrep - phWsImg
+
+	// The boundary observer is built only when diagnostics are on. Unlike the phase clocks --
+	// five time.Now() calls at ~100 ns against a restore measured in tens of milliseconds -- this
+	// one costs a procfs read per poll iteration, so the production path must not pay it.
+	var boundary *fcExecBoundary
+	if phaseLog != nil && cmd.Process != nil {
+		boundary = newFCExecBoundary(cmd.Process.Pid, l.opts.FirecrackerBin, time.Now())
+	}
+	var observe func()
+	if boundary != nil {
+		observe = boundary.observe
+	}
+	if err := waitForUnixSocketObserved(ctx, apiSockHost, 5*time.Second, observe); err != nil {
 		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: API socket never appeared: %w", req.ID, err), cleanup())
 	}
 
-	phSock = time.Since(phaseStart) - phPrep - phWsImg - phJailer
+	phSock = time.Since(phaseStart) - phPrep - phWsImg - phSpawn
 	fc := newFCClient(apiSockHost)
 	// vsock_override redirects the vsock device's host-side socket to a path of OUR
 	// choosing, rather than whatever uds_path build-snapshot.sh's guest_client.go
@@ -445,10 +460,15 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 	}
 
 	if phaseLog != nil {
-		phLoad := time.Since(phaseStart) - phPrep - phWsImg - phJailer - phSock
-		phaseLog("vmpool: restore phases id=%s prep_us=%d wsimg_us=%d jailer_us=%d sockwait_us=%d loadsnap_us=%d total_us=%d",
-			req.ID, phPrep.Microseconds(), phWsImg.Microseconds(), phJailer.Microseconds(),
-			phSock.Microseconds(), phLoad.Microseconds(), time.Since(phaseStart).Microseconds())
+		phLoad := time.Since(phaseStart) - phPrep - phWsImg - phSpawn - phSock
+		// jailerSetup is measured from the instant the sockwait window opened, so it and fcBind
+		// partition phSock exactly rather than approximately.
+		setup, seen := boundary.elapsed()
+		logRestorePhases(req.ID, restorePhases{
+			prep: phPrep, wsimg: phWsImg, spawn: phSpawn,
+			jailerSetup: setup, fcBind: phSock - setup, boundaryObserved: seen,
+			sock: phSock, load: phLoad, total: time.Since(phaseStart),
+		})
 	}
 	return &firecrackerVM{
 		id:            req.ID,
@@ -687,9 +707,23 @@ var socketProbe = func(path string) bool {
 // recorded here so the dial-not-stat rule is not read as covering every caller. See the
 // vhost-user disconnect launcher_chv.go already documents as unexplained and unfixed.
 func waitForUnixSocket(ctx context.Context, path string, timeout time.Duration) error {
+	return waitForUnixSocketObserved(ctx, path, timeout, nil)
+}
+
+// waitForUnixSocketObserved is waitForUnixSocket with a per-poll hook, used to split the
+// pre-socket window at the jailed execve (#328, fcExecBoundary).
+//
+// One loop and one schedule, deliberately: the constant block above is the RESOLUTION at which
+// anything inside this wait can be measured, so a second loop with its own pacing would make
+// jailer_setup and fc_bind accurate to different quanta and their sum no longer sockwait. observe
+// is nil on the production path, which leaves this exactly the old loop.
+func waitForUnixSocketObserved(ctx context.Context, path string, timeout time.Duration, observe func()) error {
 	deadline := time.Now().Add(timeout)
 	wait := socketPollMin
 	for {
+		if observe != nil {
+			observe()
+		}
 		if socketProbe(path) {
 			return nil
 		}
