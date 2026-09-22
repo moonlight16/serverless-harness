@@ -382,8 +382,13 @@ func chvCgroupSliceName(parentCgroup string) string {
 // Firecracker's jailer --parent-cgroup targets (spec §5.3), and
 // -p MemoryMax=<bytes> — the value that must equal vmpool.PerVMBytes(cfg), never a
 // second constant (D1's argument, mirrored here). Split out of Restore's argv
-// construction, like firecrackerCgroupArgs, so a test can assert the memory bound
-// agrees with PerVMBytes(cfg) without spawning systemd-run.
+// construction so a test can assert the memory bound agrees with PerVMBytes(cfg)
+// without spawning systemd-run.
+//
+// The arms are NOT symmetric about that bound any more, so do not read one off the
+// other: since #319 firecrackerCgroupArgs carries no bound at all — cgroupPool writes
+// memory.max and jailer gets only --parent-cgroup — whereas this argv still carries
+// its own, because systemd-run creates the scope's cgroup and nothing pools it.
 //
 // UNVERIFIED END TO END (see this file's package comment, D4 disposition): this task
 // has no host with systemd + KVM to run this argv for real. What IS verified is the

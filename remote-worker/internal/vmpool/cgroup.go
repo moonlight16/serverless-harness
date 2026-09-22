@@ -16,15 +16,16 @@ import (
 // group. On start, sweep the slice for orphans from a previous incarnation."
 //
 // ARM-AGNOSTIC BY DESIGN (hardware-corrections D3): the cgroup-CREATION mechanism is
-// per-arm — Firecracker's jailer makes one via --cgroup/--parent-cgroup/--cgroup-version
-// (see firecrackerCgroupArgs in launcher_firecracker.go); Cloud Hypervisor has no jailer
-// equivalent, so its launcher places the VMM in a `systemd-run --scope` instead (see
-// launcher_chv.go). But SweepOrphans and vmCgroupPath below only ever walk directories
-// and read/write the two files (cgroup.procs, memory.max) that both mechanisms produce
-// under the SAME parent slice (spec §5.3). Neither function contains one line that knows
-// which VMM made a given subdirectory — that is the whole point: one sweep, at worker
-// start, covers whatever either arm left behind, including a mix of both across restarts
-// where SH_VMM was changed.
+// per-arm — on the Firecracker arm cgroupPool creates the cgroup and jailer is merely
+// relocated into it by --parent-cgroup (see cgroup_pool.go, and firecrackerCgroupArgs in
+// launcher_firecracker.go; jailer's own --cgroup created one per VM until #319); Cloud
+// Hypervisor has no jailer equivalent, so its launcher places the VMM in a `systemd-run
+// --scope` instead (see launcher_chv.go). But SweepOrphans and vmCgroupPath below only ever
+// walk directories and read/write the two files (cgroup.procs, memory.max) that both
+// mechanisms produce under the SAME parent slice (spec §5.3). Neither function contains one
+// line that knows which VMM made a given subdirectory — that is the whole point: one sweep,
+// at worker start, covers whatever either arm left behind, including a mix of both across
+// restarts where SH_VMM was changed.
 //
 // D8 (comm-truncation trap): this sweep kills by reading pids out of cgroup.procs, never
 // by matching a process name. That is not just simpler — it is the only form of this that
@@ -41,7 +42,8 @@ import (
 //
 //	/sys/fs/cgroup/microvm-vms.slice/
 //	├── microvm-worker.service/   <-- cgroup.procs holds the SWEEPING PROCESS's own pid
-//	├── vm-9/                     <-- Firecracker: jailer --id/--parent-cgroup/--cgroup
+//	├── pool-9/                   <-- Firecracker: cgroupPool's, jailer relocated in
+//	├── vm-9/                     <-- Firecracker pre-#319: jailer --id + its own --cgroup
 //	└── vm-vm-9.scope/            <-- Cloud Hypervisor: systemd-run --scope --slice=
 //
 // The original sweep's only filter was entry.IsDir(), so it read its own pid out of
@@ -97,11 +99,15 @@ import (
 // returning 0 swept while VMs leaked.
 const (
 	// vmIDPrefix prefixes every pool-generated VM id ("vm-" + a decimal sequence
-	// number). The Firecracker arm's cgroup directory IS that id: jailer, given
+	// number). That id is jailer's --id, so it names the VM's JAIL directory.
+	//
+	// It named the Firecracker arm's CGROUP directory too, until #319: jailer, given
 	// --cgroup, "will create a new cgroup named <id> for the microvm in the
-	// <cgroup_base>/<parent_cgroup> subfolder" (firecracker docs/jailer.md), so
-	// --parent-cgroup replaces the exec-file-name default entirely and the VM cgroup is
-	// an immediate child of the slice.
+	// <cgroup_base>/<parent_cgroup> subfolder" (firecracker docs/jailer.md), which made the
+	// VM cgroup an immediate child of the slice. That flag is gone, so a live VM now sits in
+	// a pooledCgroupPrefix directory (below) and a vm-<n> cgroup can only be an orphan left
+	// by an incarnation that predates #319. The name stays in this list for exactly that
+	// reason — the sweep must still recognise one.
 	vmIDPrefix = "vm-"
 
 	// chvScopeUnitPrefix prefixes the Cloud Hypervisor arm's `systemd-run --scope
