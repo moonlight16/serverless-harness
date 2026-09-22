@@ -19,14 +19,13 @@ import (
 // per-arm — on the Firecracker arm cgroupPool creates the cgroup and jailer is merely
 // relocated into it by --parent-cgroup (see cgroup_pool.go, and firecrackerCgroupArgs in
 // launcher_firecracker.go; jailer's own --cgroup created one per VM until #319); Cloud
-// Hypervisor has no jailer equivalent, so its launcher places the VMM in a
-// `systemd-run --scope` instead (see launcher_chv.go). But SweepOrphans and vmCgroupPath
-// below only ever walk directories and read/write the two files (cgroup.procs, memory.max)
-// that both mechanisms produce
-// under the SAME parent slice (spec §5.3). Neither function contains one line that knows
-// which VMM made a given subdirectory — that is the whole point: one sweep, at worker
-// start, covers whatever either arm left behind, including a mix of both across restarts
-// where SH_VMM was changed.
+// Hypervisor has no jailer equivalent, so its launcher places the VMM in a `systemd-run
+// --scope` instead (see launcher_chv.go). But SweepOrphans and vmCgroupPath below only ever
+// walk directories and read/write the two files (cgroup.procs, memory.max) that both
+// mechanisms produce under the SAME parent slice (spec §5.3). Neither function contains one
+// line that knows which VMM made a given subdirectory — that is the whole point: one sweep,
+// at worker start, covers whatever either arm left behind, including a mix of both across
+// restarts where SH_VMM was changed.
 //
 // D8 (comm-truncation trap): this sweep kills by reading pids out of cgroup.procs, never
 // by matching a process name. That is not just simpler — it is the only form of this that
