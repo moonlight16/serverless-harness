@@ -773,6 +773,13 @@ Driver: `deploy/microvm/e10-lifecycle.sh`; cluster-free proof of its structure:
 > the items above are **resolved, not retracted** — except #295, which stays open and
 > confounded nothing here. Numbers, item by item, in **Issue #291 — the re-run** below.
 >
+> **2026-09-22 — and the knee's CAUSE is now known: it is the worker's 4-slot cap (#305), not
+> density.** The re-run's position was right and its instrument repairs hold. But every microVM
+> ladder in this section swept `c` while the worker admitted only 4 concurrent Execs, so slots and
+> `c` are confounded throughout. With slots raised to match `c`, this same host reaches **580.60
+> Exec/s at 64 slots** against 62.28 at `c=64` here. Read the corrected preamble in that section
+> before quoting any microVM number from it.
+>
 > Two things in this section must still not be restated as published. The container arm's
 > `bound` is `attributeBound`'s fallback, not a crossing. And the `driver-control` table in
 > the note above does not reproduce past `c=1`. Both are detailed in that section.
@@ -1122,7 +1129,83 @@ cleanup recipe, never by a captured PID or a process name), wired into both
 `stop_container_stack` and `stop_microvm_stack`, with five new regression checks in
 `deploy/microvm/tests/e11-density.test.sh` pinning the fix.
 
-### Issue #291 — the re-run: the knee holds at `c=8`
+### Issue #291 — the re-run: the knee holds at `c=8`, and it is the 4-slot cap
+
+> **2026-09-22 — CORRECTED BEFORE MERGE. The knee reproduces, and it is the worker's 4-slot
+> concurrency cap (#305), not a density property.** Every number below stands and none is removed;
+> what changes is what the ladder was measuring.
+>
+> This ladder sweeps offered concurrency `c` from 1 to 64 while the worker held
+> `session.DefaultConcurrency = 4` — a fixed pool of 4 goroutines draining the Exec queue.
+> `e11-density.sh` never set `WORKER_MAX_CONCURRENT`, so **every** microVM rung ever run before
+> #312 was capped at 4 concurrent Execs whatever `c` the driver drove. Slots and `c` are therefore
+> confounded across this whole section, and no conclusion drawn from behaviour at `c > 4` can
+> separate a property of the design from a property of that constant.
+>
+> **This section's own arithmetic is what exposes it.** The replenishment mechanism below is stated
+> as "per-pool warm supply is roughly 4.5 VMs/s whatever `D` is", and the same paragraph reports a
+> flat ~61–62 Exec/s plateau. Those differ by 14x, so they cannot both describe the bound. Four
+> slots at the measured 61.4 ms per Exec predicts **65.1 Exec/s** against a measured **62.99** —
+> within 3%, and it predicts every other rung too: `c=1` 1/55 ms = 18.2 (measured 18.18), `c=8`
+> 4/62.2 ms = 64.3 (measured 67.76). The plateau is the cap.
+>
+> The p95 column is the same story read as latency: 117.79 -> 268.51 -> 522.91 -> 1033.82 ms,
+> doubling per doubling of `c`, which is the textbook signature of queueing against a
+> fixed-capacity server — not of density. So the knee criterion here (the last rung whose p95
+> stays under twice the `c=1` p95) locates the slot count, and it moves when the slot count moves.
+>
+> **Measured on this same host with slots = `c` instead of 4** (merged `main`, descending sweep,
+> cheapest rung repeated last):
+>
+> | slots = c | Exec/s     | p95 ms | coresBusy /72 |
+> | --------- | ---------- | ------ | ------------- |
+> | 64        | **577.55** | 145    | 47.74         |
+> | 128       | 524.66     | 457    | 50.37         |
+> | 256       | 417.24     | 1244   | 49.20         |
+>
+> One worker, one descending sweep, cheapest rung repeated last; a separate session's 64-slot
+> anchor read 580.60. Against `c=64` below — 62.28 Exec/s, p95 1033.82, coresBusy 4.81 — that
+> is **9.3x the throughput at one seventh the p95**. The peak is 64 slots, not 8, and CPU is flat
+> 66–70% from 64 to 256 slots, so the host was never the limit at `c=8`.
+>
+> ### What survives, and what does not
+>
+> **Survives, and is why this run was worth doing:**
+>
+> - **The instrument repairs** (#293's sampling, #296's persistent-connection Go client). Every
+>   later number in the campaign rests on them.
+> - **"It is not the driver's knee."** The Go driver's share of the microVM arm's p95 is under
+>   0.4% at every rung, against up to 23.7% had it been grpcurl. This is what licenses reading any
+>   of these numbers as the backend's, and it is unaffected by the cap.
+> - **"No CPU or memory ceiling was reached"** — true, and now explained: `coresBusy` 4.81 of 72
+>   because the server would admit only 4 Execs at a time. At 64 slots the same host reaches 47.0.
+> - **The container arm.** At ~1940 Exec/s it is nowhere near a 4-slot cap, its `coresBusy`
+>   plateaus flat (6.64 -> 6.67), and its knee was reproduced twice independently. It stands as
+>   measured.
+>
+> **Does not survive:**
+>
+> - **The `coldAcquireRate` argument.** #306 shows that metric is wrong by 13x at `c=8` and ~250x
+>   at `c >= 16` (true cold rates 0.056 and 0.0039). The `0.01 -> 0.35` crossing of
+>   `NEAR_ZERO_COLD_ACQUIRE` is read below as localising the bound at exactly the knee; a metric
+>   that wrong cannot carry that weight, and the true rates do not cross there at all.
+> - **The `D` sweep as evidence.** Its conclusion — rate, not depth — is independently correct
+>   and was re-confirmed at 64 slots, where `Acquire` goes 4.30 -> 281.20 ms and the true cold rate
+>   0.142 -> 0.698 past the peak. But the sweep **as run could not have discriminated**: with only
+>   4 Execs in flight, no value of `D` could change the outcome, so "quadrupling `D` does not move
+>   the knee" is what a slot-capped ladder must produce whether or not depth matters. Right answer,
+>   inert experiment.
+> - **`bound = replenishment` at `c=8` as a genuine crossing.** It rests on the two items above.
+>
+> **The open question this leaves** is the one the section already notices without explaining:
+> `c=8` peaks at **80.62 Exec/s**, which is ~4.9 effective slots, and a 4-slot cap cannot produce
+> it. That is unresolved. It is why the peak-throughput reading (`c=8`) was quoted as more robust
+> than the p95 criterion, and it needs its own explanation rather than smoothing over.
+>
+> **The methodological lesson, which cost this campaign twice:** a measurement's interpretation
+> inherits every configuration it ran under. This ladder and #259's two-worker result were both
+> reproducible, correctly reported, and meant something other than what they said, because
+> `MaxConcurrent=4` was not in the frame. Record the configuration next to the number.
 
 **RUN ON BARE METAL, `srv-r16b14s16`** (72 cpu / 754 GiB, `virt: none`, governor `performance`,
 Xeon Gold 6150 @ 2.70GHz, kernel 6.8.0-1061-nvidia, cgroup2, swap off) — the same host and
@@ -1211,6 +1294,12 @@ change at all and lands on the reference's own tick counts.
 
 #### The bound is a replenishment RATE, not pool capacity
 
+> **CORRECTED — right conclusion, inert experiment.** "Rate, not depth" is independently correct
+> and was re-confirmed at 64 slots. But with only 4 Execs in flight no value of `D` could have
+> changed the outcome, so the `D` sweep below is what a slot-capped ladder must produce whether or
+> not depth matters. The ~4.5 VMs/s supply figure it derives is also 14x below the ~62 Exec/s
+> plateau it is offered to explain; 4 slots at 61.4 ms predicts that plateau to within 3%.
+
 `bound` is `replenishment` on the microVM arm and it is a **genuine crossing**, not a fallback:
 `coldAcquireRate` goes 0.01 → 0.35 at `c=8`, crossing `NEAR_ZERO_COLD_ACQUIRE` (0.05) at exactly
 the knee. A standby-depth sweep then localises the mechanism — `SH_E11_D_VALUES="2 4 8"`, microVM
@@ -1237,6 +1326,9 @@ because a refused refill converts into a cold acquire by design, which would hav
 very metric the sweep reads; admission refused nothing (0 refusals at every rung).
 
 #### The items the caveat listed, resolved
+
+> **CORRECTED.** These resolutions concern #291's question (is the knee the driver's?) and that
+> answer stands. They do not establish that the knee is a density property — see the preamble.
 
 - **The knee position, `c=8`** — **holds**, on both arms, with the driver's share under 0.4%.
   No retraction.
