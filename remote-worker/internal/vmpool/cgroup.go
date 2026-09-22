@@ -86,11 +86,12 @@ import (
 // restart. Cleaning stale jail directories is a candidate for a separate, explicitly
 // time-based reaper, not this crash-recovery sweep.
 
-// The three names below are the single authority on what a VM's cgroup DIRECTORY is
+// The four names below are the single authority on what a VM's cgroup DIRECTORY is
 // called under the parent slice. They live together, in the file that has to recognise
 // them, because H1 was a false premise about exactly this — and they are consumed rather
-// than duplicated: pool.nextIDLocked builds every VM id from vmIDPrefix, and
-// launcher_chv.go's Restore names its systemd scope with chvScopeUnitName. Spec §5.3's
+// than duplicated: pool.nextIDLocked builds every VM id from vmIDPrefix,
+// launcher_chv.go's Restore names its systemd scope with chvScopeUnitName, and
+// cgroupPool allocates from pooledCgroupPrefix. Spec §5.3's
 // "two numbers that can drift is the bug" applies to a name just as much as to a byte
 // count, and the drift here is silent in the worst direction: the sweep would keep
 // returning 0 swept while VMs leaked.
@@ -110,6 +111,21 @@ const (
 
 	// chvScopeDirSuffix is the suffix systemd gives a scope unit's cgroup directory.
 	chvScopeDirSuffix = ".scope"
+
+	// pooledCgroupPrefix names cgroupPool's REUSABLE cgroups (#258), which are directories
+	// under this same parent slice and therefore belong in this list.
+	//
+	// It is deliberately NOT vmIDPrefix, and the reason belongs here rather than beside the
+	// pool: jailer's --id must stay monotonic, because a live VMM holding a jail id is what
+	// the collision guard refuses on. A pooled cgroup is reused, so if it were named vm-<n>
+	// the directory vm-3 would stop corresponding to VM vm-3 and the two namespaces would
+	// drift silently — which is exactly the failure mode this block exists to prevent, in a
+	// form that would read as correct.
+	//
+	// Note this INVERTS the invariant the other names carry: a vm-<n> cgroup present at
+	// startup is an orphan to be swept, whereas a pool-<n> one is normal. What must not
+	// survive a restart is a PROCESS inside one, not the directory.
+	pooledCgroupPrefix = "pool-"
 
 	// Cgroup2Root is where the unified hierarchy is mounted. SH_PARENT_CGROUP is
 	// SLICE-RELATIVE (see DefaultParentCgroup), so this is what turns it into a
@@ -199,6 +215,22 @@ func isPoolVMID(s string) bool {
 // sweep covers both, including a mix of the two across restarts where SH_VMM changed).
 // Everything else — the worker's own unit cgroup above all, but equally init.scope, a
 // nested slice, or any unit an operator later places in the same slice — is not swept.
+// isPooledCgroupDirName reports whether name is one of cgroupPool's directories. Beside the
+// other two recognisers on purpose: the name and the code that recognises it are the pair H1
+// got wrong, so splitting them across files is what this block exists to prevent.
+func isPooledCgroupDirName(name string) bool {
+	rest, ok := strings.CutPrefix(name, pooledCgroupPrefix)
+	if !ok || rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func isPoolVMCgroupDirName(name string) bool {
 	if isPoolVMID(name) {
 		return true // Firecracker: the jailer's --id, verbatim

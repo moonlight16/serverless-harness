@@ -6,16 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 )
-
-// pooledCgroupPrefix names the reusable cgroups. Deliberately NOT vm-<n>: jailer's --id must stay
-// monotonic (a live VMM holding a jail id is what the collision guard refuses on), so a pooled
-// cgroup named vm-3 would not correspond to VM vm-3 and the two namespaces would silently diverge.
-// isPoolVMCgroupDirName recognises this form so SweepOrphans still sees a dead VMM inside one.
-const pooledCgroupPrefix = "pool-"
 
 // cgroupPool hands out reusable per-VM cgroups instead of creating and destroying one per VM.
 //
@@ -183,19 +176,3 @@ func (p *cgroupPool) mintedCount() int {
 }
 
 func (p *cgroupPool) leaks() int64 { return p.leaked.Load() }
-
-// isPooledCgroupDirName reports whether name is one of this pool's directories. Kept beside
-// isPoolVMID and isPoolVMCgroupDirName, which that file documents as "the single authority on what
-// a VM's cgroup DIRECTORY is called".
-func isPooledCgroupDirName(name string) bool {
-	rest, ok := strings.CutPrefix(name, pooledCgroupPrefix)
-	if !ok || rest == "" {
-		return false
-	}
-	for _, r := range rest {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
-}
