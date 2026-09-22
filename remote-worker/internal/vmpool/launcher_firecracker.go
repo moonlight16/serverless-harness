@@ -144,14 +144,19 @@ func (o FirecrackerOptions) validate() error {
 	return nil
 }
 
-// firecrackerCgroupArgs returns the jailer flags that create and bound this VM's own
-// cgroup: --cgroup-version 2 (D2: jailer's own default is version "1", which this
-// cgroup2-only host does not have — always pass 2 explicitly), --parent-cgroup (so the
-// VM's cgroup lands under Task 17's systemd slice, spec §5.3), and --cgroup
-// memory.max=<bytes> (D1: the flag that actually creates the per-VM cgroup at all;
-// --parent-cgroup alone only relocates the process into the shared parent). Split out
-// of Restore's argv construction so a test can assert the memory bound agrees with
-// PerVMBytes(cfg) without spawning jailer.
+// firecrackerCgroupArgs returns the jailer cgroup flags: --cgroup-version 2 (D2: jailer's
+// own default is version "1", which this cgroup2-only host does not have — always pass 2
+// explicitly) and --parent-cgroup, which relocates the jailed process into the pooled
+// cgroup cgroupPool already created under Task 17's systemd slice (spec §5.3).
+//
+// It creates nothing and bounds nothing itself, and deliberately returns no --cgroup — #319
+// removed that flag, and the body says why. D1's per-VM memory.max is not lost, only moved:
+// cgroupPool writes it on that pooled cgroup, from the same PerVMBytes admission control
+// charges.
+//
+// Split out of Restore's argv construction so a test can assert those flags — and the
+// absence of --cgroup — without spawning jailer. The bound itself is asserted off the pool,
+// in the same test (cgroup_test.go).
 func firecrackerCgroupArgs(parentRel string) []string {
 	if parentRel == "" {
 		return nil
@@ -401,11 +406,7 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		"--chroot-base-dir", l.opts.ChrootBase,
 	}
 	// firecrackerCgroupArgs appends --cgroup-version and --parent-cgroup, and deliberately
-	// NOT --cgroup: see its own doc comment. An earlier version of this comment claimed
-	// --cgroup was the load-bearing one of three, which was true until #258/#319 removed it
-	// — creating a cgroup per VM cost 195.52 ms of a 253 ms Destroy at 64 slots. D1's bound
-	// still holds because cgroupPool writes memory.max = PerVMBytes on the pooled cgroup this
-	// relocates into, rather than jailer writing it on a fresh one.
+	// not --cgroup: see its doc comment.
 	args = append(args, firecrackerCgroupArgs(cgroupRel)...)
 	// Coordinator finding #5: this launcher never issues PUT /network-interfaces —
 	// standbys are headless by construction, not by omission. Nothing below adds one.
