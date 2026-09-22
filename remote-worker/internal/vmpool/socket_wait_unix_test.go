@@ -33,27 +33,43 @@ func sockBase(t *testing.T) string {
 // 0.39 + loadsnap 2.14). The distribution was quantized with no tail below the quantum:
 // min 20.06 ms, ZERO of 1,625 under 20 ms, 78.2% in [20,40), 21.8% in [40,60).
 //
-// Restores are how the standby pool replenishes, so this sets the replenishment rate and
-// therefore an aggregate throughput ceiling -- it is not merely per-restore latency.
+// The quantum was a measurement FLOOR, and removing it was worth ~11% on the mean (24.92 ->
+// 22.24 ms), NOT the ~5x #304 predicted: the socket genuinely takes ~10-40 ms to bind on that
+// host, so most of sockwait was never our sleep. This test pins that the floor is gone, which
+// is a real and separate property -- it must not be read as having removed a throughput ceiling.
 func TestWaitForUnixSocketReturnsWellInsideOneOldQuantum(t *testing.T) {
 	path := filepath.Join(sockBase(t), "fc.sock")
 
 	// Stands in for Firecracker binding its API socket a couple of ms after the jailer
-	// execs it -- which is what the 2.80 ms of real work above actually is.
+	// execs it. The bind error comes BACK rather than being swallowed: a failed bind (an
+	// unwritable /tmp, a sun_path overflow -- the hazard sockBase exists to avoid) would
+	// otherwise surface as a 5 s timeout and read as "the production poll is broken", which
+	// is exactly the wrong diagnosis. Close happens inside this goroutine too: t.Cleanup
+	// registered from a non-test goroutine races the test's return, and waitForUnixSocket can
+	// return the instant the bind is visible, so a cleanup registered after tRunner drained
+	// the list never runs and the listener fd leaks for the life of the test binary.
+	bindErr := make(chan error, 1)
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
 		time.Sleep(2 * time.Millisecond)
 		l, err := net.Listen("unix", path)
-		if err != nil {
-			return
+		bindErr <- err
+		if err == nil {
+			defer func() { _ = l.Close() }()
+			<-done
 		}
-		t.Cleanup(func() { _ = l.Close() })
 	}()
 
 	start := time.Now()
-	if err := waitForUnixSocket(context.Background(), path, 5*time.Second); err != nil {
+	err := waitForUnixSocket(context.Background(), path, 5*time.Second)
+	elapsed := time.Since(start)
+	if be := <-bindErr; be != nil {
+		t.Fatalf("FIXTURE failed to bind %s: %v (not a failure of waitForUnixSocket)", path, be)
+	}
+	if err != nil {
 		t.Fatalf("waitForUnixSocket: %v", err)
 	}
-	elapsed := time.Since(start)
 	// Under HALF a quantum. The old code could not beat 20 ms for any socket, however fast,
 	// so this is the property under test rather than a performance nicety.
 	if elapsed >= 10*time.Millisecond {
@@ -80,10 +96,12 @@ func TestWaitForUnixSocketStillHonoursItsOverallTimeout(t *testing.T) {
 	if elapsed < 80*time.Millisecond {
 		t.Fatalf("returned after %v, before its own %v budget", elapsed, 80*time.Millisecond)
 	}
-	// Finer polling must not overshoot either: the backoff cap bounds how late the last
-	// sleep can push the deadline check.
+	// A loose sanity bound only. It CANNOT detect a coarse cap and does not claim to: with
+	// 1.5x growth the last sleep is at most ~0.5x the elapsed time, so elapsed stays within
+	// ~1.5x the budget for ANY cap value -- setting socketPollMax to 2s (2000x coarser) still
+	// passes this. TestWaitForUnixSocketBackoffGrowsAndIsCapped is what pins the schedule.
 	if elapsed > 400*time.Millisecond {
-		t.Fatalf("overshot its 80ms budget by too much (%v) -- the backoff cap is too coarse", elapsed)
+		t.Fatalf("elapsed %v against an 80ms budget: far beyond the ~1.5x the schedule allows", elapsed)
 	}
 }
 
@@ -123,5 +141,53 @@ func TestWaitForUnixSocketDialsRatherThanStats(t *testing.T) {
 	}
 	if err := waitForUnixSocket(context.Background(), path, 60*time.Millisecond); err == nil {
 		t.Fatal("a plain file at the socket path was accepted as ready -- this stats instead of dialling")
+	}
+}
+
+// The backoff schedule itself, pinned by counting PROBES rather than by wall clock. Wall-clock
+// assertions provably cannot do this: deleting the growth and the cap outright (a flat 250 us
+// poll) left every other test in this file green at -count=2, and setting socketPollMax to 2s
+// left the timeout test green at -count=3. So without this, a future edit that removes the cap
+// and burns ~4,000 probes/s per waiter -- the exact cost the pacing rationale says the growth
+// exists to prevent -- would ship green.
+func TestWaitForUnixSocketBackoffGrowsAndIsCapped(t *testing.T) {
+	path := filepath.Join(sockBase(t), "never.sock")
+
+	var probes int
+	restore := socketProbe
+	socketProbe = func(string) bool { probes++; return false }
+	t.Cleanup(func() { socketProbe = restore })
+
+	const budget = 200 * time.Millisecond
+	if err := waitForUnixSocket(context.Background(), path, budget); err == nil {
+		t.Fatal("waitForUnixSocket succeeded against a probe that never answers")
+	}
+
+	// The schedule: 8 growing sleeps cover the first 12.31 ms in 9 probes, then socketPollMax
+	// governs. Over 200 ms that is 9 + (200-12.31)/1 ~= 197 probes.
+	//
+	// The bounds are what discriminate, so they are stated as the failures they catch:
+	//   - growth removed (flat socketPollMin of 250 us) -> ~800 probes, above the upper bound;
+	//   - cap raised to 5 ms -> ~47 probes, below the lower bound;
+	//   - cap removed entirely -> growth runs away, ~12 probes, far below.
+	const lo, hi = 120, 400
+	if probes < lo || probes > hi {
+		t.Fatalf("%d probes over %v; want %d..%d for socketPollMin=%v growing %d/%d to a %v cap. "+
+			"Far more means the growth is gone (a flat fine poll); far fewer means the cap is coarser "+
+			"than %v or absent.",
+			probes, budget, lo, hi, socketPollMin, socketPollGrowthNum, socketPollGrowthDen,
+			socketPollMax, socketPollMax)
+	}
+
+	// And the FIRST retry must stay fine, which is the property the measured distribution
+	// actually cares about: a socket binding inside the first millisecond must not wait a
+	// coarse interval for its second look.
+	if socketPollMin > 500*time.Microsecond {
+		t.Fatalf("socketPollMin = %v: the first retry is no longer fine-grained", socketPollMin)
+	}
+	if socketPollMax > 2*time.Millisecond {
+		t.Fatalf("socketPollMax = %v: coarser than this re-inflates every sockwait measurement "+
+			"by up to the cap, which is what made the 5 ms version read as a continuous distribution",
+			socketPollMax)
 	}
 }
