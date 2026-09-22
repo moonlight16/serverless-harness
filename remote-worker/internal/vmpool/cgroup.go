@@ -213,6 +213,14 @@ func isPoolVMCgroupDirName(name string) bool {
 	if isPoolVMID(name) {
 		return true // Firecracker: the jailer's --id, verbatim
 	}
+	if isPooledCgroupDirName(name) {
+		// A reusable cgroup from cgroupPool (#258). Recognised so SweepOrphans still kills a
+		// dead VMM left inside one by a crashed worker. Note this INVERTS the invariant for
+		// the vm-<n> form: a vm-<n> cgroup present at startup is an orphan, whereas a
+		// pool-<n> one is normal -- what must not survive is a process inside it, and the
+		// sweep removing the directory too is harmless because acquire re-creates on miss.
+		return true
+	}
 	if unit, ok := strings.CutSuffix(name, chvScopeDirSuffix); ok {
 		// Cloud Hypervisor: chvScopeUnitName(id) + ".scope".
 		if id, ok := strings.CutPrefix(unit, chvScopeUnitPrefix); ok {
@@ -322,6 +330,11 @@ func unsafeToSignal(pid int) (reason string, unsafe bool) {
 // instead of a host-level OOM lottery whose size-ranked favourites include
 // microvm-worker itself. cgroup v2's memory.max accepts a bare byte count (no unit
 // suffix), which is what gets written here.
+// mkdirAllCgroup creates a cgroup directory. Separated so cgroupPool reads as intent rather than
+// as a bare MkdirAll: on real cgroupfs the kernel materialises the control files, and creating a
+// nested path is how a child cgroup comes into being at all.
+func mkdirAllCgroup(dir string) error { return os.MkdirAll(dir, 0o755) }
+
 func writeMemoryMax(dir string, bytes int64) error {
 	if bytes <= 0 {
 		return fmt.Errorf("vmpool: writeMemoryMax: bytes must be > 0, got %d", bytes)
