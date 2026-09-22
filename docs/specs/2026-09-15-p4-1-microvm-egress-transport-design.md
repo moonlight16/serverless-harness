@@ -163,21 +163,49 @@ is not mitigated.**
 
 ## 9. Experiments
 
+> **STATUS, 2026-09-22 — E12 has answered: yes. T1 stands, and the hold below is lifted.**
+> [#271](https://github.com/rossoctl/serverless-harness/issues/271) is closed COMPLETED and
+> [#273](https://github.com/rossoctl/serverless-harness/pull/273) is merged. `EXPERIMENTS.md`'s E12
+> section records rungs A, B, D and C@8 passing with two independent witnesses and the
+> pristine-snapshot check intact, so a guest-initiated connection on a second vsock port does
+> survive restore and the NIC option does not return. Rung C@128's dropped connections were traced
+> to the probe's own scaffolding rather than the restore mechanism — `start_host_listener` returned
+> as soon as the listener process was backgrounded rather than when it had reached `listen()`, so a
+> guest CONNECT could land before anything was listening and be answered with a correct RST. Fixed
+> in `b203e38`, confirmed on both substrates; see E13. The probe's guest helper has also landed, as
+> `remote-worker/cmd/e12-guest-client`.
+>
+> The gating language below is kept as the record of what was sealed before the run, not as live
+> guidance. **E13 and E14 are still open**, and the text below still governs them.
+
 **E12 gates everything and can invalidate T1.** P4 §2.4 establishes that _listening_ vsock sockets survive
 restore in the _host-initiated_ direction. This design adds a **second port** in the **guest-initiated**
 direction across restore, and neither the repo nor Firecracker's docs establish that it works. If E12
-fails, T1 is dead and the NIC option in §2 returns. **Build nothing before E12 answers.** E12 is tracked
-independently as [#271](https://github.com/rossoctl/serverless-harness/issues/271), written to be picked
-up without implementing any of this spec.
+fails, T1 is dead and the NIC option in §2 returns. **Build nothing before E12 answers** — the hold as
+written before the run; **discharged, see the status note above.** E12 was tracked independently as
+[#271](https://github.com/rossoctl/serverless-harness/issues/271), written to be picked up without
+implementing any of this spec.
 
-| #       | Question                                                                                                           | Substrate                          | Falsifiable prediction, to seal before running                                                                                                                                        |
-| ------- | ------------------------------------------------------------------------------------------------------------------ | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **E12** | Does a guest-initiated connection on a second vsock port work after restore, and after N restores of one snapshot? | `nested-m8i` (§9.1)                | **Works for all N.** Guest-initiated needs no handshake and no host-side state beyond the socket file, so there is strictly less to reset than in the direction already known to work |
-| **E13** | Added latency per HTTP request through the proxy vs. the container tier's direct call                              | `metal`, or nested × #266's ratio  | **< 5 ms p50 added.** The hop is host-local; E10 puts `run` at 2.85 ms of a 55.32 ms warm action                                                                                      |
-| **E14** | Does one shared proxy with 128 listeners move E11's knee?                                                          | `metal`, or nested once #266 lands | **Knee stays at c=8 and `bound` stays `replenishment`.** E11 measured `hostCpuFraction` 0.001 flat and Σ PSS 0.41 GB at 128 VMs                                                       |
+| #       | Question                                                                                                           | Substrate                          | Falsifiable prediction, to seal before running                                                                                                                                                                                                                |
+| ------- | ------------------------------------------------------------------------------------------------------------------ | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **E12** | Does a guest-initiated connection on a second vsock port work after restore, and after N restores of one snapshot? | `nested-m8i` (§9.1)                | **Works for all N.** Guest-initiated needs no handshake and no host-side state beyond the socket file, so there is strictly less to reset than in the direction already known to work. **Scored: held on the mechanism, not literally as stated** — see below |
+| **E13** | Added latency per HTTP request through the proxy vs. the container tier's direct call                              | `metal`, or nested × #266's ratio  | **< 5 ms p50 added.** The hop is host-local; E10 puts `run` at 2.85 ms of a 55.32 ms warm action                                                                                                                                                              |
+| **E14** | Does one shared proxy with 128 listeners move E11's knee?                                                          | `metal`, or nested once #266 lands | **Knee stays at c=8 and `bound` stays `replenishment`.** E11 measured `hostCpuFraction` 0.001 flat and Σ PSS 0.41 GB at 128 VMs                                                                                                                               |
 
 E13 and E14 reuse E10's and E11's drivers and P4 §7.1's `bound` vocabulary unchanged. Predictions are
 sealed in `deploy/microvm/predictions.json` before the first rung, per P4's practice.
+
+**E12's prediction is scored honestly rather than rounded to a pass.** Its reasoning — "strictly
+less to reset than in the direction already known to work" — was right, and that is the part this
+spec depends on. But "works for all N" did not hold on first pass: the authoritative pre-fix
+combined run produced 76/128 at N=128 and `ok=false` in `e12-answer.json`. It holds only **after a
+defect in the probe's own startup ordering was corrected** (`b203e38`, #273), which cut the failure
+rate 167.8x on metal and took the guest-side-reset signature to zero across 5,120 VM-attempts, and
+to zero on `nested-m8i` as well. A residual, substrate-specific failure mode remains on nested that
+is iowait-correlated and unrelated to the vsock mechanism. Recording it this way matters because
+this repo seals predictions before the first rung precisely so they cannot be quietly reinterpreted
+afterwards: a prediction that needed the rig fixed before it passed is a different record from a
+clean first-pass hit, even when the mechanism it claimed is vindicated.
 
 ### 9.1 Why E12 belongs on the nested rig, and must not share metal's snapshot
 
@@ -189,8 +217,9 @@ E12 has no verdict to print, only a yes or a no.
 **Sharing metal's snapshot would silently break someone else's result.** E12's guest needs a
 vsock-_initiating_ client in the rootfs, and that changes the rootfs digest. The authoritative E10/E11
 numbers were legitimised precisely by that digest being verified identical before and after every run
-(`sha256:668af5893e9c70ef`). Folding E12's helper into the snapshot a repeat metal run uses would
-invalidate the comparison that run exists to make — and it would do so invisibly. [#266](https://github.com/rossoctl/serverless-harness/issues/266)
+(`sha256:668af589...` — quoted at the same truncation `EXPERIMENTS.md` records, since nothing
+committed to this repo carries more of it). Folding E12's helper into the snapshot a repeat metal
+run uses would invalidate the comparison that run exists to make — and it would do so invisibly. [#266](https://github.com/rossoctl/serverless-harness/issues/266)
 reaches the same conclusion from the other side (its open question 4: Firecracker restores only on
 identical hardware, so a nested rig needs its own snapshot regardless). Building E12's snapshot on
 `nested-m8i` therefore contaminates nothing, and costs no metal time on a box that is currently contended.
@@ -237,8 +266,11 @@ Z5 §9's criteria 1, 2, 5 and 6 apply **unchanged** and are not restated. This s
 ## 12. Implementation notes for a fresh session
 
 Mirrors P4 §10's purpose: decide what can be decided, so a planner starting cold does not have to guess.
-**Nothing here should be built before [#271](https://github.com/rossoctl/serverless-harness/issues/271)
-(E12) answers.**
+
+**[#271](https://github.com/rossoctl/serverless-harness/issues/271) (E12) has answered yes, so this
+work is unblocked** — see the status note at the head of §9. The gate that stood here is discharged,
+not merely stale: T1 is confirmed, and `remote-worker/cmd/e12-guest-client` is already on `main`.
+E13 and E14 remain open, but neither gates the slice below.
 
 ### 12.1 Files this slice touches — settled
 
