@@ -46,3 +46,16 @@ updates:
           - 'google.golang.org/grpc*'
           - 'google.golang.org/protobuf*'
           - 'google.golang.org/genproto*'
+    ignore:
+      # grpc-go 1.84.0 is a regression, not an upgrade. The fix for CVE-2026-84445 (server
+      # panic on RPCs missing :authority and Host) shipped on the 1.83 maintenance branch as
+      # 1.83.2, but 1.84.0 was cut without it. Go's advisory ranges read
+      # `introduced 1.84.0-dev -> fixed 1.85.0-dev.0.20260825072537`, so 1.84.0 sits inside an
+      # unfixed window and trivy-scan correctly rejected the bump in #322. 1.83.2, which we
+      # already pin, is the only safe released version -- there is no 1.84.1, and the
+      # `v1.85.0-dev` tag sorts below the fixed pseudo-version. Drop this once 1.85.0 ships.
+      #
+      # Scoped to the exact version so a genuinely fixed 1.85.0 still arrives normally.
+      - dependency-name: 'google.golang.org/grpc'
+        versions:
+          - '1.84.0'
