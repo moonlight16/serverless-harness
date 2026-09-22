@@ -1,8 +1,10 @@
 package vmpool
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -460,9 +462,12 @@ func TestDestroyEmitsItsSubPhasesUnderDiagPhases(t *testing.T) {
 	}
 }
 
-// Off by default: the cost when SH_DIAG_PHASES is unset must be one nil check, and a Destroy
-// on the hot path must not format a line nobody reads.
-func TestDestroyEmitsNothingWithoutDiagPhases(t *testing.T) {
+// A nil phaseLog IS the SH_DIAG_PHASES-unset state (diag.go sets it once, in init), so this is
+// the path every production Exec takes -- and the one that would actually panic: a Destroy that
+// formatted its line before checking the gate would nil-deref here. Named for the nil path
+// rather than for "emits nothing", because asserting that nothing was emitted needs a different
+// mechanism -- see TestDestroyEmitsNothingWithoutDiagPhases below.
+func TestDestroyToleratesANilPhaseLog(t *testing.T) {
 	restore := phaseLog
 	phaseLog = nil
 	t.Cleanup(func() { phaseLog = restore })
@@ -474,5 +479,39 @@ func TestDestroyEmitsNothingWithoutDiagPhases(t *testing.T) {
 	vm := &firecrackerVM{id: "vm-78", key: "run-1", jailRoot: jailRoot}
 	if err := vm.Destroy(); err != nil {
 		t.Fatalf("Destroy: %v", err)
+	}
+}
+
+// A Destroy on the hot path must not format a line nobody reads. A counting phaseLog stub
+// cannot check that: a non-nil phaseLog IS diagnostics being ON, so a stub would be counting
+// the enabled path and asserting it stays silent. What "off" means is instead asserted against
+// the destination -- the standard logger, which is where phaseLog points when SH_DIAG_PHASES=1
+// (log.Printf). That also catches the regression the name promises and a stub would miss: a
+// later change emitting the line via log.Printf directly, bypassing the gate entirely.
+//
+// cgroupDir is set so every sub-phase runs, including the branch that would emit.
+func TestDestroyEmitsNothingWithoutDiagPhases(t *testing.T) {
+	restore := phaseLog
+	phaseLog = nil
+	t.Cleanup(func() { phaseLog = restore })
+
+	var logged bytes.Buffer
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(&logged)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(prevOut); log.SetFlags(prevFlags) })
+
+	slice := fakeSlice(t, map[string][]string{"vm-79": {}})
+	jailRoot := filepath.Join(t.TempDir(), "jail", "vm-79", "root")
+	if err := os.MkdirAll(jailRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	vm := &firecrackerVM{id: "vm-79", key: "run-1", jailRoot: jailRoot, cgroupDir: filepath.Join(slice, "vm-79")}
+	if err := vm.Destroy(); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if logged.Len() != 0 {
+		t.Errorf("Destroy logged %q with SH_DIAG_PHASES unset, want nothing", logged.String())
 	}
 }

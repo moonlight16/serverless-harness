@@ -827,7 +827,9 @@ func (v *firecrackerVM) Destroy() error {
 	// Sub-phase timing (#258 Task 3.1). Destroy is the largest phase of an Exec -- 36.77 ms
 	// at c=4, 65.06 ms at c=16, 164.27 ms at c=64, growing 4.5x across the sweep while Resume
 	// and Run stay flat -- and it was the only phase with no internal visibility. Behind
-	// SH_DIAG_PHASES like the restore phases, so the cost when off is one nil check.
+	// SH_DIAG_PHASES like the restore phases: the six time.Now() calls are ~100ns against a
+	// Destroy measured in tens of MILLISECONDS, so they are unconditional and only the log
+	// line is gated.
 	//
 	// Measured with time.Since rather than a running clock so each step is independent: they
 	// are reported separately precisely because the expectation is that ONE of them dominates,
