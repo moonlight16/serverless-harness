@@ -7,7 +7,11 @@ re-investigated. Issue #303 is the source; it closes with this preserved.
 **There is no restore-path serializer.** What looked like one was a fixed 20 ms retry in
 `waitForUnixSocket`, which accounted for ~90% of every restore while the real work took 2.7 ms
 (#304, fixed in PR #315). What looked like a knee "downstream of restore" was the worker's 4-slot
-concurrency cap (#305) — see the correction in `deploy/microvm/EXPERIMENTS.md` section E11.
+concurrency cap (#305).
+
+For the corrected reading of E11's `c=8` knee, see **issue #305** and **PR #300** — as of this note
+`EXPERIMENTS.md` section E11 still carries the 2026-09-17 banner that lists the knee as under repair,
+and #300 (which replaces it) is open. Follow #305 rather than the section until #300 merges.
 
 ## Ruled out
 
@@ -42,13 +46,20 @@ highest before the campaign began returned ~18% and nothing.
 
 ## Method notes worth keeping
 
-Instrumentation lived on a local `diag/259-serializer-probe` branch (never pushed): per-phase timing
-in `Restore`, plus `net/http/pprof` with `SetBlockProfileRate`/`SetMutexProfileFraction` behind
-`SH_DIAG_PPROF`. Overhead was negligible — 61.00 Exec/s instrumented vs 58.26 uninstrumented at the
-same `coldAcquireRate` ~0.998.
+Instrumentation lived on a local `diag/259-serializer-probe` branch (never pushed as such): per-phase
+timing in `Restore`, plus `net/http/pprof` with `SetBlockProfileRate`/`SetMutexProfileFraction` behind
+`SH_DIAG_PPROF`. Overhead was negligible — 61.00 Exec/s instrumented vs 58.26 uninstrumented.
 
-**`microvm-worker` had no pprof endpoint**, and adding one behind an env var would have saved most
-of a day. `SH_DIAG_PHASES` phase logging (#317) is what finally made everything after it measurable.
+(Those throughput figures were taken at the same driver `coldAcquireRate` of ~0.998 — which is the
+latency proxy #306 later discredited. It does not affect the comparison, since both arms were
+classified identically and the point was instrumentation overhead, not coldness. The real pool
+statistic is `coldAcquireRateTrue`.)
+
+**`microvm-worker` had no pprof endpoint at the time**, and adding one behind an env var would have
+saved most of a day. **This has since landed in #308**: `remote-worker/cmd/microvm-worker/main.go`
+gates `net/http/pprof` on `SH_DIAG_PPROF` and sets the same two rates
+(`SetBlockProfileRate(10000)`, `SetMutexProfileFraction(5)`). Do not re-add it.
+`SH_DIAG_PHASES` phase logging (#317) is what finally made everything after it measurable.
 
 A caution about the SIGQUIT dump, the strongest row in the table above: that same dump showed
 exactly **4** goroutines in `session.(*Session).Serve.func5`. That was the answer to the whole
