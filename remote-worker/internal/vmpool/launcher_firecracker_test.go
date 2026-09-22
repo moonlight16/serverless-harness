@@ -277,78 +277,34 @@ func envOr(k, def string) string {
 	return def
 }
 
-// Issue #255, escalated from hygiene to a measured 5.3x throughput defect.
-//
-// The per-VM cgroup is created by jailer (--cgroup) and, before this, was removed ONLY by
-// SweepOrphans -- which runs at startup. Destroy kills the process group, reaps it and
-// RemoveAll's the jail, but left the cgroup directory behind, so one leaked per Exec for the
-// whole life of the worker process and only a restart reclaimed them.
-//
-// Measured on srv-r16b14s16, one worker at 16 slots, 400 iters/slot, identical config either
-// side: ~41,000 stale directories gave 25.84 Exec/s with a mean restore sockwait of 1008 ms;
-// with the directories removed and nothing else changed, 136.51 Exec/s and 98 ms. Cgroup
-// create/destroy is kernel-serialised and degrades with how many exist, and a jailer cgroup
-// that is slow to set up delays Firecracker binding its API socket -- so the cost lands in
-// waitForUnixSocket, which is already ~90% of a restore (#304), and restores are how the
-// standby pool replenishes.
-//
-// The signature is worth knowing: throughput collapses while the host goes IDLE (88% idle at
-// the worst point), so a CPU-based diagnosis finds nothing.
-func TestDestroyRemovesThePerVMCgroupDirectory(t *testing.T) {
-	// A cgroup v2 tree is a directory with a cgroup.procs file, so this needs no root and
-	// no KVM. Empty pid list: Destroy has already SIGKILLed and reaped the VMM by this
-	// point, so the kernel has removed it from cgroup.procs.
-	slice := fakeSlice(t, map[string][]string{"vm-7": {}})
-	cgroupDir := filepath.Join(slice, "vm-7")
-	jailRoot := filepath.Join(t.TempDir(), "jail", "vm-7", "root")
-	if err := os.MkdirAll(jailRoot, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Non-vacuousness: a test for a removal must first prove the thing is there, or it
-	// passes just as well against a path that never existed.
-	if _, err := os.Stat(cgroupDir); err != nil {
-		t.Fatalf("fixture: cgroup dir must exist before Destroy: %v", err)
-	}
-
-	vm := &firecrackerVM{id: "vm-7", key: "run-1", jailRoot: jailRoot, cgroupDir: cgroupDir}
-	if err := vm.Destroy(); err != nil {
-		t.Fatalf("Destroy: %v", err)
-	}
-	if _, err := os.Stat(cgroupDir); !os.IsNotExist(err) {
-		t.Fatalf("cgroup dir %s still exists after Destroy (err=%v) -- one leaks per Exec", cgroupDir, err)
-	}
-	// The pre-existing job still has to happen.
-	if _, err := os.Stat(jailRoot); !os.IsNotExist(err) {
-		t.Fatalf("jailRoot %s survived Destroy (err=%v)", jailRoot, err)
-	}
-}
-
-// ParentCgroup empty means jailer's own default placement is used and --parent-cgroup is
-// omitted entirely (firecrackerCgroupArgs returns nil), so there is no per-VM cgroup of ours
-// to remove. Destroy must not invent a path or fail.
-func TestDestroyToleratesNoPerVMCgroup(t *testing.T) {
+// ParentCgroup empty means jailer's own default placement is used and --parent-cgroup is omitted
+// entirely (firecrackerCgroupArgs returns nil), so the launcher builds no pool and a VM carries no
+// cgroup of ours. Destroy must not invent one or fail. This is the shape every non-cgroup
+// deployment takes, so it is worth its own test rather than being implied by the pooled path.
+func TestDestroyToleratesNoPooledCgroup(t *testing.T) {
 	jailRoot := filepath.Join(t.TempDir(), "jail", "vm-8", "root")
 	if err := os.MkdirAll(jailRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	vm := &firecrackerVM{id: "vm-8", key: "run-1", jailRoot: jailRoot, cgroupDir: ""}
+	vm := &firecrackerVM{id: "vm-8", key: "run-1", jailRoot: jailRoot}
 	if err := vm.Destroy(); err != nil {
-		t.Fatalf("Destroy with no cgroup dir: %v", err)
+		t.Fatalf("Destroy with no pooled cgroup: %v", err)
+	}
+	if _, err := os.Stat(jailRoot); !os.IsNotExist(err) {
+		t.Fatalf("jailRoot survived Destroy (err=%v)", err)
 	}
 }
 
-// Destroy is idempotent. Deliberately NOT presented as a test of ENOENT tolerance: the
-// `destroyed` early-return sits BEFORE the cgroup branch, so a second call never attempts a
-// second rmdir and this could not fail for that reason. TestDestroyToleratesAnAlreadySweptCgroup
-// below covers the ENOENT path, which is the one that actually occurs.
+// Destroy is idempotent. Deliberately NOT presented as a test of the cgroup path: the `destroyed`
+// early-return sits BEFORE it, so a second call never reaches the release and this could not fail
+// for that reason. The pool's own behaviour on a second release, and on a cgroup that has
+// vanished, is pinned in cgroup_pool_test.go where it can actually fail.
 func TestDestroyIsIdempotent(t *testing.T) {
-	slice := fakeSlice(t, map[string][]string{"vm-9": {}})
 	jailRoot := filepath.Join(t.TempDir(), "jail", "vm-9", "root")
 	if err := os.MkdirAll(jailRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	vm := &firecrackerVM{id: "vm-9", key: "run-1", jailRoot: jailRoot, cgroupDir: filepath.Join(slice, "vm-9")}
+	vm := &firecrackerVM{id: "vm-9", key: "run-1", jailRoot: jailRoot}
 	if err := vm.Destroy(); err != nil {
 		t.Fatalf("first Destroy: %v", err)
 	}
@@ -357,63 +313,11 @@ func TestDestroyIsIdempotent(t *testing.T) {
 	}
 }
 
-// The REAL ENOENT case, and the one that makes the SweepOrphans / Destroy overlap safe: the
-// cgroup is already gone when Destroy reaches it. A startup sweep, an operator clearing the
-// slice by hand, or Restore's own cleanup() having already removed it all produce this. It
-// must be a no-op, not an error that would be counted as destroyFailed on every VM.
-//
-// This one CAN fail: it routes a genuinely missing directory through Destroy's cgroup branch,
-// where the idempotency test above stops at the early return.
-func TestDestroyToleratesAnAlreadySweptCgroup(t *testing.T) {
-	slice := fakeSlice(t, map[string][]string{"vm-10": {}})
-	cgroupDir := filepath.Join(slice, "vm-10")
-	if err := os.Remove(cgroupDir + "/cgroup.procs"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(cgroupDir); err != nil {
-		t.Fatal(err)
-	}
-	// Non-vacuousness: it must really be absent, or this proves nothing.
-	if _, err := os.Stat(cgroupDir); !os.IsNotExist(err) {
-		t.Fatalf("fixture: cgroup dir must be absent, got err=%v", err)
-	}
-	jailRoot := filepath.Join(t.TempDir(), "jail", "vm-10", "root")
-	if err := os.MkdirAll(jailRoot, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	vm := &firecrackerVM{id: "vm-10", key: "run-1", jailRoot: jailRoot, cgroupDir: cgroupDir}
-	if err := vm.Destroy(); err != nil {
-		t.Fatalf("Destroy over an already-removed cgroup must be a no-op, got: %v", err)
-	}
-}
-
 // removeCgroupDir's ENOENT tolerance, tested directly rather than through Destroy, since it
 // is the property both the startup sweep and the steady-state path rest on.
 func TestRemoveCgroupDirToleratesAMissingDirectory(t *testing.T) {
 	if err := removeCgroupDir(filepath.Join(t.TempDir(), "never-existed")); err != nil {
 		t.Fatalf("removeCgroupDir on a missing path: %v", err)
-	}
-}
-
-// The path Destroy removes must be the one jailer was told to create the cgroup under, or
-// the removal silently targets nothing. vmCgroupPath is the single authority on the name.
-func TestRestoreRecordsTheCgroupDirItToldJailerToUse(t *testing.T) {
-	opts := FirecrackerOptions{ParentCgroup: "microvm.slice/microvm-vms.slice"}
-	want := vmCgroupPath(ParentCgroupPath(opts.ParentCgroup), "vm-11")
-	if got := vmCgroupDirFor(opts, "vm-11"); got != want {
-		t.Fatalf("vmCgroupDirFor = %q, want %q", got, want)
-	}
-	// And empty ParentCgroup must yield no path at all, matching firecrackerCgroupArgs's
-	// nil return -- not Cgroup2Root itself, which would rmdir the cgroup ROOT.
-	if got := vmCgroupDirFor(FirecrackerOptions{}, "vm-11"); got != "" {
-		t.Fatalf("vmCgroupDirFor with no ParentCgroup = %q, want empty", got)
-	}
-	// An empty id has the same shape of consequence one level down: it would resolve to the
-	// shared PARENT SLICE, which every jailer --parent-cgroup and the next start's
-	// SweepOrphans depend on. Unreachable from nextIDLocked today; guarded here so it stays
-	// unreachable regardless of the caller.
-	if got := vmCgroupDirFor(opts, ""); got != "" {
-		t.Fatalf("vmCgroupDirFor with an empty id = %q, want empty (that path is the parent slice)", got)
 	}
 }
 
@@ -432,12 +336,23 @@ func TestDestroyEmitsItsSubPhasesUnderDiagPhases(t *testing.T) {
 	phaseLog = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
 	t.Cleanup(func() { phaseLog = restore })
 
-	slice := fakeSlice(t, map[string][]string{"vm-77": {}})
+	root := t.TempDir()
+	const parent = "microvm.slice/microvm-vms.slice"
+	if err := os.MkdirAll(filepath.Join(root, parent), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pool := newCgroupPool(parent, (256+32)<<20, root)
+	rel, err := pool.acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
 	jailRoot := filepath.Join(t.TempDir(), "jail", "vm-77", "root")
 	if err := os.MkdirAll(jailRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	vm := &firecrackerVM{id: "vm-77", key: "run-1", jailRoot: jailRoot, cgroupDir: filepath.Join(slice, "vm-77")}
+	// cgrouprmdir_us keeps its name but now measures the RELEASE (#258), so the aggregate
+	// tooling that parses these lines is unchanged.
+	vm := &firecrackerVM{id: "vm-77", key: "run-1", jailRoot: jailRoot, cgroups: pool, cgroupRel: rel}
 	if err := vm.Destroy(); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
@@ -501,12 +416,25 @@ func TestDestroyEmitsNothingWithoutDiagPhases(t *testing.T) {
 	log.SetFlags(0)
 	t.Cleanup(func() { log.SetOutput(prevOut); log.SetFlags(prevFlags) })
 
-	slice := fakeSlice(t, map[string][]string{"vm-79": {}})
+	// A real pooled cgroup, so the whole Destroy path runs -- including the release. That makes
+	// this assertion cover one more regression than it did before pooling: a release that logged
+	// on its happy path would put a line here on every single Exec. The release's leak and
+	// vanished-directory branches DO log, deliberately, and neither is taken here.
+	root := t.TempDir()
+	const parent = "microvm.slice/microvm-vms.slice"
+	if err := os.MkdirAll(filepath.Join(root, parent), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pool := newCgroupPool(parent, (256+32)<<20, root)
+	rel, err := pool.acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
 	jailRoot := filepath.Join(t.TempDir(), "jail", "vm-79", "root")
 	if err := os.MkdirAll(jailRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	vm := &firecrackerVM{id: "vm-79", key: "run-1", jailRoot: jailRoot, cgroupDir: filepath.Join(slice, "vm-79")}
+	vm := &firecrackerVM{id: "vm-79", key: "run-1", jailRoot: jailRoot, cgroups: pool, cgroupRel: rel}
 	if err := vm.Destroy(); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}

@@ -154,19 +154,17 @@ func TestFirecrackerProceedsPastTheCollisionGuardWhenTheJailIsFree(t *testing.T)
 	_ = marker
 }
 
-// #255, the failure path. Restore's cleanup() closure must remove the per-VM cgroup, not
-// only Destroy: cleanup() runs after cmd.Start(), so jailer has already created the cgroup
-// by the time a sockwait timeout or a failed LoadSnapshot gets there, and every replenish
-// retry draws a FRESH id from nextIDLocked -- so the leak is unbounded. A host that has
-// begun timing out on sockwait is precisely the host that then accumulates directories
-// fastest, which is the 5.3x feedback loop #255 measured.
+// #255's failure path, now under #258's pooling. cleanup() runs after cmd.Start(), so a sockwait
+// timeout or a failed LoadSnapshot reaches it with a cgroup already acquired -- and every replenish
+// retry draws a FRESH id, so what used to leak here was unbounded. Pooling removes that leak by
+// construction: there is nothing per-VM to leak, and the only requirement is that a failed restore
+// RETURNS its cgroup rather than stranding it.
 //
-// Driven through the REAL path rather than asserted structurally: the fake jailer exits 0
-// without ever creating the API socket, so Restore reaches waitForUnixSocket, and a
-// cancelled context makes that return in ~20 ms instead of its 5 s timeout. The per-VM
-// cgroup is pre-created because a shell-script jailer cannot make one, and opts.cgroupRoot
-// points the path at a temp tree because Cgroup2Root names the host's real cgroupfs.
-func TestRestoreCleanupRemovesThePerVMCgroupOnAFailedRestore(t *testing.T) {
+// Driven through the REAL path: the fake jailer exits 0 without ever creating the API socket, so
+// Restore reaches waitForUnixSocket, and a cancelled context makes that return in ~20 ms instead of
+// its 5 s timeout. opts.cgroupRoot points the pool at a temp tree because Cgroup2Root names the
+// host's real cgroupfs.
+func TestRestoreCleanupReturnsThePooledCgroupOnAFailedRestore(t *testing.T) {
 	base, err := os.MkdirTemp("/tmp", "fccg")
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
@@ -179,6 +177,9 @@ func TestRestoreCleanupRemovesThePerVMCgroupOnAFailedRestore(t *testing.T) {
 	}
 	cgRoot := filepath.Join(base, "cgroup")
 	const parent = "microvm.slice/microvm-vms.slice"
+	if err := os.MkdirAll(filepath.Join(cgRoot, parent), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	lc, err := NewFirecrackerLauncher(FirecrackerOptions{
 		JailerBin:            jailer,
 		FirecrackerBin:       filepath.Join(base, "firecracker"),
@@ -191,19 +192,9 @@ func TestRestoreCleanupRemovesThePerVMCgroupOnAFailedRestore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFirecrackerLauncher: %v", err)
 	}
-
-	// Stand in for the cgroup jailer creates via --cgroup; a shell script cannot.
-	cgDir := filepath.Join(cgRoot, parent, "vm-42")
-	if err := os.MkdirAll(cgDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(cgDir, "cgroup.procs"), []byte("\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// Non-vacuousness: it must be there before the failed restore, or the assertion below
-	// passes against a path that never existed.
-	if _, err := os.Stat(cgDir); err != nil {
-		t.Fatalf("fixture: cgroup dir must exist before Restore: %v", err)
+	pool := lc.(*firecrackerLauncher).cgroups
+	if pool == nil {
+		t.Fatal("launcher built no cgroup pool despite a ParentCgroup")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -214,7 +205,19 @@ func TestRestoreCleanupRemovesThePerVMCgroupOnAFailedRestore(t *testing.T) {
 		t.Fatal("Restore succeeded against a jailer that never creates an API socket")
 	}
 
-	if _, err := os.Stat(cgDir); !os.IsNotExist(err) {
-		t.Fatalf("cleanup() left the per-VM cgroup %s behind (err=%v) -- one leaks per failed restore, with a fresh id each retry", cgDir, err)
+	// The whole property: the cgroup is back for reuse, not stranded.
+	if pool.idle() != 1 {
+		t.Fatalf("after a failed restore the pool holds %d idle cgroups, want 1 -- cleanup() "+
+			"stranded it, which is the unbounded leak #255 found on this path", pool.idle())
+	}
+	if pool.mintedCount() != 1 {
+		t.Fatalf("minted %d cgroups for one attempt", pool.mintedCount())
+	}
+	// And the next attempt reuses it rather than minting.
+	if _, err := pool.acquire(); err != nil {
+		t.Fatalf("acquire after a failed restore: %v", err)
+	}
+	if pool.mintedCount() != 1 {
+		t.Fatalf("minted=%d; the returned cgroup should have been reused", pool.mintedCount())
 	}
 }

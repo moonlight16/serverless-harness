@@ -386,53 +386,57 @@ func TestWriteMemoryMaxBoundsOneVM(t *testing.T) {
 	}
 }
 
-func TestVMCgroupPathIsUnderTheParentSlice(t *testing.T) {
-	got := vmCgroupPath("/sys/fs/cgroup/microvm-vms.slice", "vm-7")
-	want := "/sys/fs/cgroup/microvm-vms.slice/vm-7"
-	if got != want {
-		t.Fatalf("vmCgroupPath = %q, want %q", got, want)
-	}
-	// The jailer is told the SAME parent (spec §5.3: "Firecracker's jailer has its own
-	// --cgroup arguments. They must be configured consistently with the systemd slice §6
-	// relies on for cleanup, or the two mechanisms fight and the leak we are preventing
-	// returns"), so a path that did not sit under the parent would split the tree in two.
-	if !strings.HasPrefix(got, "/sys/fs/cgroup/microvm-vms.slice/") {
-		t.Fatal("a VM cgroup outside the parent slice would escape systemd's KillMode")
-	}
-}
-
 // D1 (hardware-corrections): "two numbers that can drift is the bug." vmCgroupPath's
 // own test above only checks the PATH is inside the slice; this checks the VALUE the
 // Firecracker launcher configures into --cgroup memory.max= agrees with the same figure
 // admission control charges per VM (PerVMBytes), not a second, independently-maintained
 // constant.
 func TestFirecrackerJailerCgroupMemoryMaxAgreesWithPerVMBytes(t *testing.T) {
+	// D1's invariant is unchanged -- the per-VM cgroup bound IS PerVMBytes(cfg), the same figure
+	// admission control charges -- but #258 moved WHERE it is written. jailer's --cgroup is what
+	// CREATED a per-VM cgroup, and creating one per VM cost 195.52 ms of a 253 ms Destroy at 64
+	// slots plus an unbounded dying-cgroup population. So cgroupPool creates the cgroup and writes
+	// the bound, and jailer is given only --parent-cgroup.
+	//
+	// This test therefore asserts the invariant at its new home, and asserts that jailer is NOT
+	// asked to create anything -- which is the part that would silently reintroduce the churn.
 	cfg := Config{
 		GuestRAMBytes:   256 << 20,
 		VMOverheadBytes: DefaultVMOverheadBytes,
 	}
 	want := PerVMBytes(cfg)
 
-	opts := FirecrackerOptions{
-		SnapshotDir:          t.TempDir(),
-		JailerBin:            "/usr/bin/jailer",
-		FirecrackerBin:       "/usr/bin/firecracker",
-		ChrootBase:           t.TempDir(),
-		UID:                  1000,
-		GID:                  1000,
-		ParentCgroup:         "/sys/fs/cgroup/microvm-vms.slice",
-		CgroupMemoryMaxBytes: want,
+	root := t.TempDir()
+	const parent = "microvm.slice/microvm-vms.slice"
+	if err := os.MkdirAll(filepath.Join(root, parent), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	opts.setDefaults()
-	if err := opts.validate(); err != nil {
-		t.Fatalf("validate: %v", err)
+	pool := newCgroupPool(parent, want, root)
+	rel, err := pool.acquire()
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
 	}
 
-	args := firecrackerCgroupArgs(opts)
-	joined := strings.Join(args, " ")
-	wantFlag := "memory.max=" + strconv.FormatInt(want, 10)
-	if !strings.Contains(joined, wantFlag) {
-		t.Fatalf("jailer args %q do not contain %q — the cgroup bound has drifted from PerVMBytes(cfg) = %d", joined, wantFlag, want)
+	b, err := os.ReadFile(filepath.Join(root, rel, "memory.max"))
+	if err != nil {
+		t.Fatalf("the pool did not write memory.max: %v", err)
+	}
+	if got := strings.TrimSpace(string(b)); got != strconv.FormatInt(want, 10) {
+		t.Fatalf("memory.max = %q, want PerVMBytes(cfg) = %d -- the cgroup bound has drifted from "+
+			"the figure admission control charges (D1)", got, want)
+	}
+
+	args := strings.Join(firecrackerCgroupArgs(rel), " ")
+	if !strings.Contains(args, "--parent-cgroup "+rel) {
+		t.Fatalf("jailer args %q do not place the VM in the pooled cgroup %q", args, rel)
+	}
+	if !strings.Contains(args, "--cgroup-version 2") {
+		t.Fatalf("jailer args %q dropped --cgroup-version 2; jailer defaults to v1 (D2)", args)
+	}
+	// The load-bearing absence: --cgroup is what creates a per-VM cgroup.
+	if strings.Contains(args, "--cgroup ") || strings.Contains(args, "memory.max=") {
+		t.Fatalf("jailer args %q still pass --cgroup, which CREATES a per-VM cgroup and restores "+
+			"the churn #258 removed", args)
 	}
 }
 

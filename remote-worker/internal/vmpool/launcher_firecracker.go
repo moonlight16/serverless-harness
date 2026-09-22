@@ -79,24 +79,24 @@ type FirecrackerOptions struct {
 	// guess a value Task 17 has not defined yet.
 	ParentCgroup string
 
-	// cgroupRoot overrides where per-VM cgroup paths are rooted. Unexported, so nothing
-	// outside this package can set it: it exists so a test can drive the REAL restore
-	// failure path against a temporary cgroup tree, because Cgroup2Root is a const naming
-	// the host's actual cgroupfs and a test cannot create a cgroup there without root.
-	// Empty means Cgroup2Root, which is every production path.
+	// cgroupRoot overrides where the cgroup pool roots its directories. Unexported, so nothing
+	// outside this package can set it: it exists so a test can drive a REAL restore against a
+	// temporary cgroup tree, because Cgroup2Root is a const naming the host's actual cgroupfs and
+	// a test cannot create a cgroup there without root. Empty means Cgroup2Root, which is every
+	// production path.
 	cgroupRoot string
 
-	// CgroupMemoryMaxBytes is the per-VM cgroup memory.max jailer is told to write via
-	// --cgroup (Task 17, hardware-corrections D1). Without --cgroup, jailer only
-	// MOVES the jailed process into --parent-cgroup if that path already exists — it
-	// does NOT create a new cgroup, so on its own ParentCgroup produces no per-VM
-	// memory.max at all and spec §6's mitigation #3 ("a ballooning command is killed
-	// inside its own cgroup") is unimplemented; this was confirmed directly against
-	// real jailer output, confirmed on the rig rather than inferred. This value MUST equal
-	// vmpool.PerVMBytes(cfg) — the same figure admission control charges per VM — set
-	// by the caller (cmd/microvm-worker/main.go's launcherFor), never a fresh
-	// constant, or the two numbers drift apart (spec §5.3). Only meaningful, and only
-	// applied, when ParentCgroup is also set.
+	// CgroupMemoryMaxBytes is the per-VM cgroup's memory.max, and since #258 it is written by
+	// cgroupPool rather than by jailer. jailer is no longer told to create a per-VM cgroup at all:
+	// --cgroup was the flag that did that, and creating one per VM cost 195.52 ms of a 253 ms
+	// Destroy at 64 concurrency slots plus an unbounded dying-cgroup population. The pool creates
+	// the cgroup, writes this bound, and jailer is given only --parent-cgroup, which relocates the
+	// jailed process into a cgroup that already exists.
+	//
+	// The FIGURE is unchanged: PerVMBytes(cfg), the same one admission control charges (D1), so the
+	// kernel-enforced ceiling and the software gate still agree. It matters MORE than before, not
+	// less: writeMemoryMax rejects <= 0, so a zero here now fails every restore rather than
+	// silently omitting a flag. validate() refuses that combination at construction.
 	CgroupMemoryMaxBytes int64
 
 	// WorkspaceImageBytes sizes the lazily-created workspace.img ext4 filesystem
@@ -132,36 +132,16 @@ func (o FirecrackerOptions) validate() error {
 		return errors.New("firecracker: ChrootBase is required")
 	case o.ParentCgroup != "" && o.CgroupMemoryMaxBytes <= 0:
 		// D1: a ParentCgroup with no memory bound is exactly the half-wired state the
-		// hardware corrections found in committed code — jailer moves the process into
-		// the slice but creates no per-VM cgroup and sets no memory.max. Fail loudly at
-		// construction rather than silently omitting --cgroup at Restore time.
+		// hardware corrections found in committed code. The check is unchanged and matters MORE
+		// since #258 moved the write out of jailer: cgroupPool calls writeMemoryMax, which
+		// rejects <= 0, so a zero here fails every restore rather than silently omitting a flag.
+		// Fail loudly at construction instead.
 		return errors.New("firecracker: ParentCgroup is set but CgroupMemoryMaxBytes is <= 0 " +
-			"— jailer would move the VM into the slice without creating a per-VM cgroup or " +
-			"memory.max (spec §6 mitigation #3 would be unimplemented); set it from vmpool.PerVMBytes(cfg)")
+			"— the cgroup pool could not write a memory.max for the VMs it creates, so every " +
+			"restore would fail (spec §6 mitigation #3 would be unimplemented); set it from " +
+			"vmpool.PerVMBytes(cfg)")
 	}
 	return nil
-}
-
-// vmCgroupDirFor returns the cgroupfs path jailer will create for this VM, or "" when there
-// is no per-VM cgroup of ours to remove.
-//
-// Both guards below prevent Destroy from rmdir'ing a directory it does not own, one level
-// apart. With ParentCgroup unset, firecrackerCgroupArgs omits --parent-cgroup entirely, so
-// nothing per-VM was created and a path built anyway would resolve to Cgroup2Root -- the
-// cgroup ROOT. With an empty id, vmCgroupPath resolves to the shared PARENT SLICE, which
-// every jailer --parent-cgroup and the next start's SweepOrphans depend on. The id guard is
-// unreachable today (nextIDLocked is the only id source and never yields ""), but this
-// function exists precisely to be the one place that cannot disagree with
-// firecrackerCgroupArgs about what is safe to remove, so the invariant belongs here rather
-// than resting on a caller in another file.
-func vmCgroupDirFor(opts FirecrackerOptions, id string) string {
-	if opts.ParentCgroup == "" || id == "" {
-		return ""
-	}
-	if opts.cgroupRoot != "" {
-		return vmCgroupPath(filepath.Join(opts.cgroupRoot, opts.ParentCgroup), id)
-	}
-	return vmCgroupPath(ParentCgroupPath(opts.ParentCgroup), id)
 }
 
 // firecrackerCgroupArgs returns the jailer flags that create and bound this VM's own
@@ -172,20 +152,28 @@ func vmCgroupDirFor(opts FirecrackerOptions, id string) string {
 // --parent-cgroup alone only relocates the process into the shared parent). Split out
 // of Restore's argv construction so a test can assert the memory bound agrees with
 // PerVMBytes(cfg) without spawning jailer.
-func firecrackerCgroupArgs(opts FirecrackerOptions) []string {
-	if opts.ParentCgroup == "" {
+func firecrackerCgroupArgs(parentRel string) []string {
+	if parentRel == "" {
 		return nil
 	}
-	args := []string{"--cgroup-version", "2", "--parent-cgroup", opts.ParentCgroup}
-	if opts.CgroupMemoryMaxBytes > 0 {
-		args = append(args, "--cgroup", fmt.Sprintf("memory.max=%d", opts.CgroupMemoryMaxBytes))
-	}
-	return args
+	// NO --cgroup (#258). That flag is what CREATES a per-VM cgroup, and creating one per VM cost
+	// 195.52 ms of a 253 ms Destroy at 64 slots plus an unbounded dying-cgroup population.
+	// --parent-cgroup alone relocates the jailed process into a cgroup that ALREADY EXISTS, which
+	// cgroupPool created and on which it wrote memory.max = PerVMBytes -- so D1's bound still
+	// applies to every VM, from the same figure admission control charges, just written by us
+	// rather than by jailer.
+	//
+	// --cgroup-version 2 stays explicit: jailer's own default is "1", which this cgroup2-only host
+	// does not have (D2).
+	return []string{"--cgroup-version", "2", "--parent-cgroup", parentRel}
 }
 
 // firecrackerLauncher is the Firecracker arm of Launcher.
 type firecrackerLauncher struct {
 	opts FirecrackerOptions
+	// cgroups hands out reusable per-VM cgroups (#258). Nil when ParentCgroup is unset, in which
+	// case jailer's own default placement is used and there is no cgroup of ours at all.
+	cgroups *cgroupPool
 }
 
 // NewFirecrackerLauncher validates opts, applies defaults, and returns a Launcher.
@@ -196,7 +184,11 @@ func NewFirecrackerLauncher(opts FirecrackerOptions) (Launcher, error) {
 	if err := opts.validate(); err != nil {
 		return nil, err
 	}
-	return &firecrackerLauncher{opts: opts}, nil
+	l := &firecrackerLauncher{opts: opts}
+	if opts.ParentCgroup != "" {
+		l.cgroups = newCgroupPool(opts.ParentCgroup, opts.CgroupMemoryMaxBytes, opts.cgroupRoot)
+	}
+	return l, nil
 }
 
 func (l *firecrackerLauncher) Kind() VMMKind { return Firecracker }
@@ -280,6 +272,17 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 			req.ID, apiSockHost, l.opts.ParentCgroup)
 	}
 
+	// Acquired BEFORE the jailer starts, because jailer only relocates into --parent-cgroup if
+	// that path already exists (#258). Released by Destroy, or by cleanup() on every failure path
+	// below, so a failed restore does not strand it.
+	var cgroupRel string
+	if l.cgroups != nil {
+		var cgErr error
+		if cgroupRel, cgErr = l.cgroups.acquire(); cgErr != nil {
+			return nil, fmt.Errorf("firecracker: restore %s: %w", req.ID, cgErr)
+		}
+	}
+
 	var cmd *exec.Cmd
 	// cleanup mirrors Destroy's error handling below: a failure here (permission,
 	// EBUSY) must be surfaced, not swallowed, or the caller sees only the original
@@ -307,11 +310,13 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		// exactly the host that then accumulates directories fastest, which is the
 		// feedback loop #255 measured at 5.3x. removeCgroupDir returns nil when the
 		// directory was never created, so this is safe on the earlier error paths too.
-		if dir := vmCgroupDirFor(l.opts, req.ID); dir != "" {
-			waitForCgroupEmpty(dir)
-			if err := removeCgroupDir(dir); err != nil {
-				errs = append(errs, err)
-			}
+		// RETURN the pooled cgroup rather than removing it (#258). This is the path #255 found
+		// leaking a directory per failed restore -- a sockwait timeout or a failed LoadSnapshot,
+		// each retry drawing a fresh id -- and pooling removes that leak by construction, because
+		// there is nothing per-VM to leak. release() still refuses to reuse one with a process
+		// left inside, so a half-started jailer cannot be handed to the next tenant.
+		if cgroupRel != "" && l.cgroups != nil {
+			l.cgroups.release(cgroupRel)
 		}
 		return errors.Join(errs...)
 	}
@@ -399,7 +404,7 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 	// of the three is load-bearing, not decorative — without it jailer relocates this
 	// process into the shared parent cgroup but creates no cgroup of its own, so no
 	// per-VM memory.max is ever set (Task 17, hardware-corrections D1).
-	args = append(args, firecrackerCgroupArgs(l.opts)...)
+	args = append(args, firecrackerCgroupArgs(cgroupRel)...)
 	// Coordinator finding #5: this launcher never issues PUT /network-interfaces —
 	// standbys are headless by construction, not by omission. Nothing below adds one.
 	args = append(args, "--", "--api-sock", apiSockRelPath)
@@ -447,7 +452,8 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		key:           req.Key,
 		cmd:           cmd,
 		jailRoot:      jailRoot,
-		cgroupDir:     vmCgroupDirFor(l.opts, req.ID),
+		cgroups:       l.cgroups,
+		cgroupRel:     cgroupRel,
 		apiSockHost:   apiSockHost,
 		vsockHostPath: filepath.Join(jailRoot, vsockRelPath),
 		vsockPort:     l.opts.VsockPort,
@@ -709,11 +715,13 @@ type firecrackerVM struct {
 
 	cmd      *exec.Cmd // the jailer process; execve's into FirecrackerBin, same pid
 	jailRoot string
-	// cgroupDir is the per-VM cgroup jailer was told to create, or "" when ParentCgroup is
-	// unset and jailer's own default placement is used. Recorded at restore so Destroy
-	// removes the SAME path that was created -- deriving it again later would let the two
-	// drift apart, and a removal that targets the wrong path silently does nothing.
-	cgroupDir     string
+	// cgroups is the pool cgroupRel came from, and where Destroy returns it. Nil means there is
+	// nothing pooled: either no ParentCgroup, or a VM built outside the launcher.
+	cgroups *cgroupPool
+	// cgroupRel is the slice-relative pooled cgroup this VM was placed in, returned on Destroy
+	// rather than removed (#258).
+	cgroupRel string
+
 	apiSockHost   string
 	vsockHostPath string
 	vsockPort     uint32
@@ -872,20 +880,22 @@ func (v *firecrackerVM) Destroy() error {
 	// caller logs it and counts destroyFailed rather than failing the Exec, which is the
 	// right weight: a leaked directory must be visible, and must not break a command that
 	// already ran correctly.
-	if v.cgroupDir != "" {
-		// Split from the rmdir because waitForCgroupEmpty sleeps a FIXED 10 ms between reads
-		// -- the same pattern #304 removed from waitForUnixSocket. It should never fire here
-		// (cmd.Wait above has reaped the VMM, so cgroup.procs should already be empty), but
-		// that is exactly the assumption that proved wrong for waitForUnixSocket, so it is
-		// measured rather than assumed.
+	if v.cgroupRel != "" && v.cgroups != nil {
+		// RETURNED to the pool, not removed (#258). This is where the rmdir used to be, and where
+		// it measured 2.15 / 15.53 / 195.52 ms at 4 / 16 / 64 concurrency slots -- 77% of Destroy
+		// at the top, because cgroup removal is kernel-serialised.
+		//
+		// waitForCgroupEmpty still runs first because release() reads cgroup.procs to decide
+		// whether reuse is safe, and cmd.Wait above should already have emptied it -- measured at
+		// 0.04-0.07 ms, i.e. it never fires. The phase names are kept so a run's aggregate tooling
+		// is unchanged: cgroupwait_us still means the same thing, and cgrouprmdir_us now measures
+		// the RELEASE, which is expected to be ~0 because it is a slice append.
 		cgWaitStart := time.Now()
-		waitForCgroupEmpty(v.cgroupDir)
+		waitForCgroupEmpty(v.cgroups.abs(v.cgroupRel))
 		phCgroupWait = time.Since(cgWaitStart)
-		cgRmStart := time.Now()
-		if err := removeCgroupDir(v.cgroupDir); err != nil {
-			errs = append(errs, err)
-		}
-		phCgroupRmdir = time.Since(cgRmStart)
+		cgRelStart := time.Now()
+		v.cgroups.release(v.cgroupRel)
+		phCgroupRmdir = time.Since(cgRelStart)
 	}
 	if phaseLog != nil {
 		phaseLog("vmpool: destroy phases id=%s kill_us=%d wait_us=%d removeall_us=%d cgroupwait_us=%d cgrouprmdir_us=%d total_us=%d",
