@@ -405,3 +405,83 @@ A restore-only probe at c=64 across N keys, reporting VM/s, decides the whole qu
 This is strictly cheaper than building the reaper and discovering the same thing from a null
 throughput result, and it cannot be confounded by the change under test because the change is not
 in it.
+
+## Measured: the restore+destroy ceiling is ~870/s, and my supply-bound prediction was WRONG
+
+Run 2026-09-23 on `srv-r16b14s16` (72 cpu, 754 GiB, governor `performance`, swap off, host
+otherwise idle, `who` empty, load 0.00 before). `--mode=replenish --vmm=firecracker` with the
+concurrency fix, `drop_caches` once before each ladder, orphans cleared by cgroup membership
+before every rung. `wall_ms/measured` is the rate; the destroy is inside the wall window because a
+real host restores and reaps at the same time.
+
+**Ladder 1 — descending 64 to 1, `c=8` repeated last, 400 iterations per slot:**
+
+| c              | restore+destroy /s | p50 restore | p95 restore | failures | dying cgroups |
+| -------------- | ------------------ | ----------- | ----------- | -------- | ------------- |
+| 64             | 714.61             | 28.18 ms    | 57.84 ms    | 0        | 50 -> 52      |
+| 32             | 435.03             | 19.51 ms    | 40.75 ms    | 0        | 52 -> 52      |
+| 16             | 264.03             | 15.65 ms    | 27.88 ms    | 0        | 52 -> 52      |
+| 8              | 160.56             | 11.71 ms    | 22.89 ms    | 0        | 52 -> 52      |
+| 4              | 90.24              | 10.51 ms    | 24.90 ms    | 0        | 52 -> 52      |
+| 2              | 51.62              | 11.71 ms    | 24.19 ms    | 0        | 52 -> 53      |
+| 1              | 27.78              | 17.28 ms    | 22.95 ms    | 0        | 53 -> 53      |
+| **8 (repeat)** | **160.88**         | 11.71 ms    | 23.36 ms    | 0        | 53 -> 53      |
+
+Drift anchor agrees to **0.20%**. Dying cgroups 50 -> 53 across ~53,000 VMs, so #319's pool is
+holding and none of this is #255's degradation. Scaling above c=8 is a clean **1.64-1.65x per
+doubling** (rate proportional to c^0.72) with **no knee**.
+
+**Ladder 2 — past c=64, `c=128` repeated last, 250 iterations per slot:**
+
+| c                | restore+destroy /s | p50 restore | p95 restore | failures |
+| ---------------- | ------------------ | ----------- | ----------- | -------- |
+| 256              | 856.28             | 201.32 ms   | 308.61 ms   | 0        |
+| **128**          | **872.18**         | 74.57 ms    | 114.66 ms   | 0        |
+| 64               | 656.05             | 33.31 ms    | 64.54 ms    | 0        |
+| **128 (repeat)** | **875.10**         | 75.53 ms    | 115.31 ms   | 0        |
+
+Drift anchor agrees to **0.33%**. **The pipeline peaks at ~872/s at c=128** and turns over by
+c=256, where the rate falls to 856 while restore latency rises 2.7x — capacity spent on queueing.
+
+One honesty note: c=64 reads 714.61 in ladder 1 and 656.05 in ladder 2, an **8.2% spread**. In
+ladder 1 it was the first rung after `drop_caches`; in ladder 2 it ran third, after 96,000 VMs.
+Dying cgroups moved only 50 -> 54, so that is not the cause. Treat c=64 as ~660-715/s and do not
+read a 5% throughput result against it as signal.
+
+### The prediction I pre-registered was falsified
+
+I predicted "restore supply is ~577 VM/s and it is THE ceiling", with the supply-bound outcome as
+the likely one. **It is not.** The pipeline delivers 872/s — 1.51x the production 577.55 Exec/s.
+The campaign's "past 64 slots demand outruns the replenishment rate" was true of the _slot_ ladder
+and I over-read it into a statement about supply. Adding slots raises concurrency, turnover, standby
+commitment and queue depth together; this probe raises turnover alone, and supply had room.
+
+### What the numbers now say the deferral is worth
+
+Corroboration first: at c=64 the probe's cycle is 64/714.61 = 89.56 ms, of which restore p50 is
+28.18 ms, leaving **61.38 ms** of destroy — against the campaign's **61.51 ms** Destroy at 64 slots.
+Two drivers, same quantity, **0.2%** apart. The probe is measuring the right thing.
+
+Every Exec needs exactly one restore and one destroy, and the pipeline that does _only_ those two
+peaks at ~872/s. So:
+
+**~870 Exec/s is the hard ceiling on this design at current restore and destroy costs — 1.51x over
+577.55.** The proposal's 800-900 estimate is therefore not above what the machine can do; it lands
+exactly on the pipeline's saturation point. That is a narrower claim than the CPU-headroom
+arithmetic that produced it (which is still retired — the bound is the pipeline, not the idle 34%),
+but it arrives at the same number.
+
+Reaching it is not comfortable. Deferring 52.48 ms of a 104.11 ms per-Exec leaves 51.63 ms, i.e.
+**demand of 1240 Exec/s at 64 slots against ~870 of supply** — so supply binds, per-Exec settles
+near 64/870 = 73.6 ms, and the missing ~22 ms has to surface somewhere. It will surface in
+`Acquire`: sustaining 870 restores/s needs ~65 concurrent restores at the 75 ms latency that rate
+costs, which 64 sequential-per-run replenish loops can only just cover.
+
+**Revised prediction, replacing the pre-registered pair:** 800-870 Exec/s (1.39-1.51x), with
+`Acquire` growing from 4.30 ms toward ~20-25 ms and `coldAcquireRateTrue` rising from 0.142. Under
+this model that Acquire growth is **the expected signature of success**, not the cgroup-rmdir
+failure mode — the distinction is whether throughput moves with it. Flat throughput plus growing
+Acquire is still a rejection.
+
+Records: `srv-r16b14s16:~/i307-ladder1/`, `~/i307-ladder2/`, driver
+`~/i307-restore-ceiling.sh`, binary built from this branch at `~/i307-probe/`.
