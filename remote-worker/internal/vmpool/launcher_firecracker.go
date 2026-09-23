@@ -895,6 +895,10 @@ func (v *firecrackerVM) Destroy() error {
 	// are reported separately precisely because the expectation is that ONE of them dominates,
 	// and a running total cannot show which.
 	var phKill, phWait, phDrain, phRemoveAll, phCgroupWait, phCgroupRmdir time.Duration
+	// Declared out here so the phase line can report them as UNOBSERVED (-1) on the path
+	// where there was no process to watch at all.
+	var fdGone, threadsGone time.Duration
+	var fdSeen, threadsSeen bool
 	phaseStart := time.Now()
 	if cmd != nil && cmd.Process != nil {
 		pid := cmd.Process.Pid
@@ -904,6 +908,11 @@ func (v *firecrackerVM) Destroy() error {
 		}
 		phKill = time.Since(killStart)
 		waitStart := time.Now()
+		// Started from the same instant wait_us is measured from, so the two are directly
+		// comparable -- which is the entire question (#307): is there an observable point where
+		// this VMM can no longer touch workspace.img, reached measurably before the reap ends?
+		// No-ops unless SH_DIAG_PHASES=1.
+		obs, stopObs := startFCExitObserver(pid, waitStart)
 		if phaseLog == nil {
 			_ = cmd.Wait() // reap; "signal: killed" is the expected outcome, not a failure
 			phWait = time.Since(waitStart)
@@ -944,6 +953,8 @@ func (v *firecrackerVM) Destroy() error {
 			_ = cmd.Wait()
 			phDrain = time.Since(drainStart)
 		}
+		stopObs()
+		fdGone, threadsGone, fdSeen, threadsSeen = obs.results()
 	}
 	// #307 Q4: removeall grows 5.92 -> 22.72 ms across the slot sweep, and it is the only
 	// step in Destroy where a storage-layer answer could apply -- but only for bytes that
@@ -1002,8 +1013,11 @@ func (v *firecrackerVM) Destroy() error {
 		phCgroupRmdir = time.Since(cgRelStart)
 	}
 	if phaseLog != nil {
-		phaseLog("vmpool: destroy phases id=%s kill_us=%d wait_us=%d drain_us=%d removeall_us=%d cgroupwait_us=%d cgrouprmdir_us=%d total_us=%d",
-			v.id, phKill.Microseconds(), phWait.Microseconds(), phDrain.Microseconds(), phRemoveAll.Microseconds(),
+		phaseLog("vmpool: destroy phases id=%s kill_us=%d wait_us=%d drain_us=%d fdgone_us=%d "+
+			"threadsgone_us=%d removeall_us=%d cgroupwait_us=%d cgrouprmdir_us=%d total_us=%d",
+			v.id, phKill.Microseconds(), phWait.Microseconds(), phDrain.Microseconds(),
+			barrierUs(fdGone, fdSeen), barrierUs(threadsGone, threadsSeen),
+			phRemoveAll.Microseconds(),
 			phCgroupWait.Microseconds(), phCgroupRmdir.Microseconds(), time.Since(phaseStart).Microseconds())
 	}
 	return errors.Join(errs...)
