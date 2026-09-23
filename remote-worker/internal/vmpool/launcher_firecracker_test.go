@@ -368,8 +368,12 @@ func TestDestroyEmitsItsSubPhasesUnderDiagPhases(t *testing.T) {
 	}
 	// Every sub-step of Destroy, plus the id to correlate with the restore line and the total
 	// so the parts can be checked against the whole.
+	// drain_us splits cmd.Wait at os/exec's own boundary between reaping the VMM and
+	// draining the stdout/stderr copy goroutines (#307), so it is named here for the same
+	// reason as the rest: the aggregate tooling reads these names, and 89% of Destroy
+	// landing in "wait" is the reading this field exists to disambiguate.
 	for _, want := range []string{
-		"id=vm-77", "kill_us=", "wait_us=", "removeall_us=", "cgroupwait_us=", "cgrouprmdir_us=", "total_us=",
+		"id=vm-77", "kill_us=", "wait_us=", "drain_us=", "removeall_us=", "cgroupwait_us=", "cgrouprmdir_us=", "total_us=",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("destroy phase line missing %q: %s", want, got)

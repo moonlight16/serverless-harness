@@ -894,7 +894,7 @@ func (v *firecrackerVM) Destroy() error {
 	// Measured with time.Since rather than a running clock so each step is independent: they
 	// are reported separately precisely because the expectation is that ONE of them dominates,
 	// and a running total cannot show which.
-	var phKill, phWait, phRemoveAll, phCgroupWait, phCgroupRmdir time.Duration
+	var phKill, phWait, phDrain, phRemoveAll, phCgroupWait, phCgroupRmdir time.Duration
 	phaseStart := time.Now()
 	if cmd != nil && cmd.Process != nil {
 		pid := cmd.Process.Pid
@@ -904,8 +904,60 @@ func (v *firecrackerVM) Destroy() error {
 		}
 		phKill = time.Since(killStart)
 		waitStart := time.Now()
-		_ = cmd.Wait() // reap; "signal: killed" is the expected outcome, not a failure
-		phWait = time.Since(waitStart)
+		if phaseLog == nil {
+			_ = cmd.Wait() // reap; "signal: killed" is the expected outcome, not a failure
+			phWait = time.Since(waitStart)
+		} else {
+			// #307 diagnostic split. cmd.Wait() is TWO waits, not one: os/exec's Wait
+			// calls Process.Wait() (the wait4 that reaps the VMM) and only then
+			// awaitGoroutines(), which blocks until the stdout/stderr copying goroutines
+			// return. Those goroutines exist because Restore sets Stdout/Stderr to
+			// io.Discard, and writerDescriptor takes the pipe branch for any writer that
+			// is not an *os.File -- so every VM allocates two os.Pipe()s and two
+			// goroutines, and this phase pays to drain them.
+			//
+			// Timing the halves apart is the whole point: "cmd.Wait is 89% of Destroy" is
+			// consistent with the kernel being slow to tear down a 256 MiB mapping AND with
+			// this process being slow to schedule two goroutines under load, and those have
+			// opposite fixes. Split only under diagnostics so the production path keeps the
+			// single Wait and its error semantics.
+			//
+			// The second call's Process.Wait() fails fast with ECHILD -- the process was
+			// already reaped just above, so there is no child left to wait for. Cmd.Wait does
+			// NOT return early on that error: it assigns c.ProcessState and falls through to
+			// awaitGoroutines regardless. So phDrain is the goroutine drain, not a second reap.
+			//
+			// One invariant this creates, stated because it holds only on this branch: because
+			// Cmd.ProcessState is assigned from the FAILED second Process.Wait(), it is left
+			// nil here, where the production path above leaves it set. Harmless today -- both
+			// results are discarded and nothing downstream of Destroy reads it -- but an
+			// exit-code check added inside this branch would see a nil that cannot be
+			// reproduced in production.
+			//
+			// Verified against go1.25.0, the toolchain these numbers were measured with:
+			// errors.Is(err, syscall.ECHILD) is true and errors.Is(err, os.ErrProcessDone) is
+			// false. ErrProcessDone is what Signal returns on a finished process, not what
+			// Wait returns on a second call.
+			_, _ = cmd.Process.Wait()
+			phWait = time.Since(waitStart)
+			drainStart := time.Now()
+			_ = cmd.Wait()
+			phDrain = time.Since(drainStart)
+		}
+	}
+	// #307 Q4: removeall grows 5.92 -> 22.72 ms across the slot sweep, and it is the only
+	// step in Destroy where a storage-layer answer could apply -- but only for bytes that
+	// this unlink actually frees. Six of the jail's entries are hardlinks to the golden
+	// snapshot and to the run's workspace image, so unlinking them drops a refcount and
+	// frees nothing; the jailer's own copy of the exec-file is the one entry whose blocks
+	// are released here. Inventory it before removal rather than reasoning about it, so the
+	// thin-provisioning conversation starts from a number. Diagnostics only: this is a stat
+	// walk per VM.
+	if phaseLog != nil {
+		inv := jailInventory(v.jailRoot)
+		phaseLog("vmpool: destroy jail id=%s entries=%d dirs=%d linked=%d linked_bytes=%d linked_blocks512=%d owned=%d owned_bytes=%d owned_blocks512=%d",
+			v.id, inv.entries, inv.dirs, inv.linked, inv.linkedBytes, inv.linkedBlocks512,
+			inv.owned, inv.ownedBytes, inv.ownedBlocks512)
 	}
 	removeAllStart := time.Now()
 	if err := os.RemoveAll(v.jailRoot); err != nil {
@@ -950,8 +1002,8 @@ func (v *firecrackerVM) Destroy() error {
 		phCgroupRmdir = time.Since(cgRelStart)
 	}
 	if phaseLog != nil {
-		phaseLog("vmpool: destroy phases id=%s kill_us=%d wait_us=%d removeall_us=%d cgroupwait_us=%d cgrouprmdir_us=%d total_us=%d",
-			v.id, phKill.Microseconds(), phWait.Microseconds(), phRemoveAll.Microseconds(),
+		phaseLog("vmpool: destroy phases id=%s kill_us=%d wait_us=%d drain_us=%d removeall_us=%d cgroupwait_us=%d cgrouprmdir_us=%d total_us=%d",
+			v.id, phKill.Microseconds(), phWait.Microseconds(), phDrain.Microseconds(), phRemoveAll.Microseconds(),
 			phCgroupWait.Microseconds(), phCgroupRmdir.Microseconds(), time.Since(phaseStart).Microseconds())
 	}
 	return errors.Join(errs...)

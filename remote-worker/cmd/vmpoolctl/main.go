@@ -24,13 +24,18 @@ import (
 // rung is unreportable without it; spec §6 additionally requires the substrate
 // recorded in every run record, which is what VMM and Host are for.
 type runResult struct {
-	VMM             string            `json:"vmm"`
-	Host            string            `json:"host"`
-	Key             string            `json:"key"`
-	Command         string            `json:"command"`
-	Mode            string            `json:"mode"`
-	Iterations      int               `json:"iterations"`
-	Concurrency     int               `json:"concurrency"`
+	VMM         string `json:"vmm"`
+	Host        string `json:"host"`
+	Key         string `json:"key"`
+	Command     string `json:"command"`
+	Mode        string `json:"mode"`
+	Iterations  int    `json:"iterations"`
+	Concurrency int    `json:"concurrency"`
+	// Keys is recorded because on the Firecracker arm it, not Concurrency, bounds how
+	// many VMs were ever alive at once (SerializesExecsPerRun). A record carrying
+	// concurrency without keys is the one that cannot be read back correctly -- #307's
+	// original table is the worked example.
+	Keys            int               `json:"keys"`
 	WarmupDiscarded int               `json:"warmup_discarded"`
 	Failures        int               `json:"failures"`
 	StandbyDepth    int               `json:"standby_depth"`
@@ -87,9 +92,15 @@ func realMain(args []string, stdout io.Writer) error {
 		committedMB = fs.Int64("max-committed-mb", 32<<10, "MaxCommittedBytes, MiB")
 		iterations  = fs.Int("iterations", 1, "how many Execs to run")
 		concurrency = fs.Int("concurrency", 1, "how many Execs in flight at once")
-		timeoutS    = fs.Uint("timeout-s", 30, "per-Exec timeout")
-		asJSON      = fs.Bool("json", false, "emit one runResult JSON record")
-		mode        = fs.String("mode", "exec",
+		keys        = fs.Int("keys", 1,
+			"mode=exec only: spread the Execs across this many distinct workspace_keys. "+
+				"REQUIRED to exceed one VM in flight on the Firecracker arm: that launcher "+
+				"reports SerializesExecsPerRun, so a run's execGate admits one Exec at a time "+
+				"and --concurrency alone only queues goroutines at that gate. --keys=1 "+
+				"(the default) reproduces the historical single-key behaviour")
+		timeoutS = fs.Uint("timeout-s", 30, "per-Exec timeout")
+		asJSON   = fs.Bool("json", false, "emit one runResult JSON record")
+		mode     = fs.String("mode", "exec",
 			"exec | replenish | teardown-inflight | teardown-standby | teardown-bulk (spec §7.2)")
 		warmup = fs.Int("warmup", -1,
 			"iterations to discard before measuring; -1 means min(iterations/10, 5) (spec §7.5)")
@@ -126,6 +137,29 @@ func realMain(args []string, stdout io.Writer) error {
 	if *iterations < 1 || *concurrency < 1 {
 		return fmt.Errorf("--iterations and --concurrency must be >= 1")
 	}
+	if *keys < 1 {
+		return fmt.Errorf("--keys must be >= 1")
+	}
+	// Refused rather than silently clamped. On the Firecracker arm --concurrency above
+	// --keys cannot be delivered -- the surplus goroutines park on some run's execGate --
+	// and a record reporting concurrency=16 keys=1 is exactly the shape that made #307's
+	// original c=8/c=16 table read as "Destroy does not scale with load" when both columns
+	// had in fact run one VM at a time. Clamping would produce the same wrong record with a
+	// warning nobody reads.
+	//
+	// THIS CONDITION MIRRORS firecrackerLauncher.SerializesExecsPerRun, which is the
+	// authority on it, and must be updated if a second arm ever reports true: a new
+	// serializing launcher would otherwise accept --concurrency > --keys and produce exactly
+	// the unreadable record this refusal exists to prevent. It is not asked of the launcher
+	// directly because lc is not constructed until below, and reordering construction ahead
+	// of flag validation to satisfy one check is the more fragile trade. Compared against
+	// the VMMKind constant rather than a raw string so this stays in step with launcher()
+	// if the wire name changes.
+	if *keys < *concurrency && *mode == "exec" && *vmm == string(vmpool.Firecracker) {
+		return fmt.Errorf("--concurrency=%d needs --keys>=%d on the firecracker arm: it "+
+			"SerializesExecsPerRun, so %d key(s) admit at most %d Exec(s) at a time and the rest "+
+			"would queue, recording a concurrency this run never reached", *concurrency, *concurrency, *keys, *keys)
+	}
 	// Spec §7.5: "The first restore differs from the hundredth (page cache, THP,
 	// fragmentation). Discard warmup, report steady state." -1 is the "unset"
 	// sentinel — 0 is a legitimate, explicit request for no warmup at all.
@@ -134,6 +168,18 @@ func realMain(args []string, stdout io.Writer) error {
 		warmupN = *iterations / 10
 		if warmupN > 5 {
 			warmupN = 5
+		}
+		// With --keys>1 the default is also floored at one warmup per key. The warmup loop
+		// round-robins the keys, so a default of 5 against --keys=64 would leave 59 run pools
+		// cold and charge their first restores to the MEASURED window -- reintroducing exactly
+		// the effect this warmup exists to exclude, and doing it in proportion to the variable
+		// a slot sweep varies. Only the derived default is raised: an explicit --warmup is the
+		// caller's decision and is left alone (including an explicit 0).
+		// Guarded on keys>1, not on keys>warmupN: at the default --keys=1 there is one run
+		// pool and the historical default must be returned unchanged, including the
+		// --iterations=1 case where any floor at all would exceed it.
+		if *mode == "exec" && *keys > 1 && *keys > warmupN {
+			warmupN = *keys
 		}
 	}
 	if warmupN >= *iterations {
@@ -211,7 +257,7 @@ func realMain(args []string, stdout io.Writer) error {
 	host, _ := os.Hostname()
 	res := runResult{
 		VMM: *vmm, Host: host, Key: *key, Command: command, Mode: *mode,
-		Iterations: *iterations, Concurrency: *concurrency,
+		Iterations: *iterations, Concurrency: *concurrency, Keys: keysUsed(*mode, *keys),
 		StandbyDepth: cfg.StandbyDepth, GuestRAMMB: *guestMB,
 		Substrate: *substrate,
 		Limits:    gatherLimits(),
@@ -240,7 +286,7 @@ func realMain(args []string, stdout io.Writer) error {
 	var samples []sample
 	switch *mode {
 	case "exec":
-		samples, firstErr = runExecMode(pool, *key, command, []byte(*stdin), *timeoutS, *iterations, warmupN, *concurrency, &res)
+		samples, firstErr = runExecMode(pool, *key, command, []byte(*stdin), *timeoutS, *iterations, warmupN, *concurrency, *keys, &res)
 	case "replenish":
 		samples, firstErr = runReplenishMode(hooks, *key, *iterations, warmupN, &res)
 	case "teardown-inflight", "teardown-standby":
@@ -315,10 +361,40 @@ func realMain(args []string, stdout io.Writer) error {
 // bash it would otherwise reuse (spec §5.4). This is the flag E10's rung 2 uses
 // twice: once with stdin empty (parked bash) and once with it set (fresh
 // `bash -c`), pricing the one distinction §5.4 draws.
-func runExecMode(pool vmpool.Pool, key, command string, stdin []byte, timeoutS uint, iterations, warmupN, concurrency int, res *runResult) ([]sample, error) {
+// keysUsed reports how many distinct keys the run ACTUALLY used, which is what the record
+// must carry. Only mode=exec spreads across keys -- the warmup floor and the round-robin are
+// both gated on it -- so every other mode uses exactly one however --keys was set.
+//
+// Recording the flag instead would put "keys": 8 on a replenish run that used one, which is
+// the same failure in miniature as the table this field was added to make unreadable-proof:
+// a record that parses cleanly and means something other than what it says.
+func keysUsed(mode string, keys int) int {
+	if mode != "exec" {
+		return 1
+	}
+	return keys
+}
+
+// execKey names the workspace_key iteration i runs under. With keys=1 it returns the
+// bare key, so every historical invocation is byte-identical to what it was before
+// --keys existed; above 1 it round-robins, which is what gives the Firecracker arm more
+// than one execGate to hold and therefore more than one VM alive at a time.
+func execKey(key string, keys, i int) string {
+	if keys <= 1 {
+		return key
+	}
+	return fmt.Sprintf("%s-k%d", key, i%keys)
+}
+
+func runExecMode(pool vmpool.Pool, key, command string, stdin []byte, timeoutS uint, iterations, warmupN, concurrency, keys int, res *runResult) ([]sample, error) {
+	// Warmup walks the keys in the same round-robin as the measured loop, so every run
+	// pool that will be used has already paid its first restore before timing starts.
+	// Warming only key 0 would leave keys-1 of them cold and charge those first restores
+	// to the measured window -- the "first restore differs from the hundredth" effect the
+	// --warmup flag exists to exclude, reintroduced through the back door.
 	for i := 0; i < warmupN; i++ {
 		ph := &vmpool.Phases{}
-		_, _ = pool.ExecPhased(context.Background(), key, vmpool.Exec{
+		_, _ = pool.ExecPhased(context.Background(), execKey(key, keys, i), vmpool.Exec{
 			ReqID: uint64(i + 1), Command: command, Stdin: stdin, TimeoutS: uint32(timeoutS), Streaming: true,
 		}, discardSink{}, ph)
 	}
@@ -339,7 +415,7 @@ func runExecMode(pool vmpool.Pool, key, command string, stdin []byte, timeoutS u
 			var s sample
 			t0 := time.Now()
 			ph := &vmpool.Phases{}
-			_, err := pool.ExecPhased(context.Background(), key, vmpool.Exec{
+			_, err := pool.ExecPhased(context.Background(), execKey(key, keys, i), vmpool.Exec{
 				ReqID: uint64(warmupN + i + 1), Command: command, Stdin: stdin, TimeoutS: uint32(timeoutS), Streaming: true,
 			}, discardSink{}, ph)
 			s.total = time.Since(t0)
