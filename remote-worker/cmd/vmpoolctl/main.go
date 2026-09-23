@@ -160,6 +160,23 @@ func realMain(args []string, stdout io.Writer) error {
 			"SerializesExecsPerRun, so %d key(s) admit at most %d Exec(s) at a time and the rest "+
 			"would queue, recording a concurrency this run never reached", *concurrency, *concurrency, *keys, *keys)
 	}
+	// A mode that ignores --concurrency must REFUSE it, never run at c=1 under a c=N
+	// label. Before this, every mode except exec accepted the flag, echoed "conc=4" into
+	// its own record, and ran a serial loop -- so a teardown or replenishment rung swept
+	// across concurrency produced a table whose columns differed by nothing at all. That
+	// is not hypothetical: #307's "flat across c=8/c=16" finding was published from the
+	// same defect one layer over, where a single shared execGate rather than a serial loop
+	// did the flattening. Same posture as the mode dispatcher's default case below: make
+	// two lists that must agree disagree LOUDLY.
+	switch *mode {
+	case "exec", "replenish": // these honour it; every other mode is serial by construction
+	default:
+		if *concurrency > 1 {
+			return fmt.Errorf("--mode=%s runs serially and ignores --concurrency=%d: it would "+
+				"report a c=%d rung measured at c=1. Use --mode=exec or --mode=replenish to "+
+				"sweep concurrency", *mode, *concurrency, *concurrency)
+		}
+	}
 	// Spec §7.5: "The first restore differs from the hundredth (page cache, THP,
 	// fragmentation). Discard warmup, report steady state." -1 is the "unset"
 	// sentinel — 0 is a legitimate, explicit request for no warmup at all.
@@ -288,7 +305,7 @@ func realMain(args []string, stdout io.Writer) error {
 	case "exec":
 		samples, firstErr = runExecMode(pool, *key, command, []byte(*stdin), *timeoutS, *iterations, warmupN, *concurrency, *keys, &res)
 	case "replenish":
-		samples, firstErr = runReplenishMode(hooks, *key, *iterations, warmupN, &res)
+		samples, firstErr = runReplenishMode(hooks, *key, *iterations, warmupN, *concurrency, &res)
 	case "teardown-inflight", "teardown-standby":
 		samples, firstErr = runTeardownPerVMMode(hooks, *mode, *key, *wsRoot, *iterations, warmupN, &res)
 	case "teardown-bulk":
@@ -443,7 +460,7 @@ func runExecMode(pool vmpool.Pool, key, command string, stdin []byte, timeoutS u
 // job). No command ever runs, so run/resume/destroy all stay at their zero value on
 // every sample: reporting a run figure here would invite reading this rung as a hot
 // path rung.
-func runReplenishMode(hooks vmpool.BenchmarkHooks, key string, iterations, warmupN int, res *runResult) ([]sample, error) {
+func runReplenishMode(hooks vmpool.BenchmarkHooks, key string, iterations, warmupN, concurrency int, res *runResult) ([]sample, error) {
 	for i := 0; i < warmupN; i++ {
 		if vm, err := hooks.RestoreOne(context.Background(), key); err == nil {
 			_ = vm.Destroy()
@@ -453,22 +470,44 @@ func runReplenishMode(hooks vmpool.BenchmarkHooks, key string, iterations, warmu
 	measured := iterations - warmupN
 	samples := make([]sample, measured)
 	var firstErr error
+	var mu sync.Mutex
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
 	start := time.Now()
 	for i := 0; i < measured; i++ {
-		t0 := time.Now()
-		vm, err := hooks.RestoreOne(context.Background(), key)
-		d := time.Since(t0)
-		samples[i].acquire = d
-		samples[i].total = d
-		if err != nil {
-			res.Failures++
-			if firstErr == nil {
-				firstErr = err
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			t0 := time.Now()
+			vm, err := hooks.RestoreOne(context.Background(), key)
+			d := time.Since(t0)
+			mu.Lock()
+			samples[i].acquire = d
+			samples[i].total = d
+			if err != nil {
+				res.Failures++
+				if firstErr == nil {
+					firstErr = err
+				}
 			}
-			continue
-		}
-		_ = vm.Destroy()
+			mu.Unlock()
+			if err != nil {
+				return
+			}
+			// Destroyed inside the goroutine but AFTER the sample is stamped, so it stays
+			// out of the per-restore timing exactly as it did when this loop was serial.
+			// It is inside the WALL window on purpose: at concurrency > 1 a real host is
+			// restoring and reaping at the same time, so wall_ms/measured is the sustained
+			// rate the pipeline can hold rather than a reciprocal of restore latency. That
+			// is the quantity #307's deferred-reap question needs, and it makes this an
+			// UPPER BOUND on Exec/s: every Exec must do at least this restore and this
+			// destroy, plus a Resume and a Run this mode never issues.
+			_ = vm.Destroy()
+		}(i)
 	}
+	wg.Wait()
 	res.WallMs = time.Since(start).Milliseconds()
 	return samples, firstErr
 }
