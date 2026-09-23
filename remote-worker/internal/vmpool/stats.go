@@ -21,6 +21,11 @@ type Stats struct {
 	Replenishments    uint64
 	ReplenishFailures uint64
 	DestroyFailures   uint64
+	// ReapsInline counts deferred reaps that ran on the caller's goroutine because the
+	// reaper's queue was full -- i.e. teardowns that paid today's synchronous cost anyway.
+	// Nonzero means the reaper is saturated, which is the first thing to check when a
+	// deferral arm measures flat: the arm was partly not applied.
+	ReapsInline uint64
 	// TimeoutsClamped counts Execs whose timeout_s this package had to bound
 	// (clampTimeoutS): absent/zero, or above MaxExecTimeoutS. A nonzero and growing
 	// figure is a caller-side fact, not a pool fault — most likely a relay that omits
