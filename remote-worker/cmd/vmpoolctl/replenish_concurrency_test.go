@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -116,6 +118,31 @@ func TestConcurrencyIsAcceptedByModesThatHonourIt(t *testing.T) {
 		if _, err := run(t, "--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir,
 			"--key=run-a", "--mode="+mode, "--iterations=4", "--concurrency=2", "--", "true"); err != nil {
 			t.Fatalf("--mode=%s --concurrency=2: %v", mode, err)
+		}
+	}
+}
+
+// "Record the configuration next to the number" is the campaign's most expensive lesson:
+// #259's two-worker result and E11's c=8 knee were both reproducible, correctly reported, and
+// meant something other than what they said, because MaxConcurrent=4 was not in the frame. The
+// deferred reap (#307) is an A/B on one binary, so which arm a record came from has to be IN
+// the record -- otherwise the two arms are distinguishable only by which shell loop wrote them.
+func TestTheRecordCarriesWhetherTheReapWasDeferred(t *testing.T) {
+	dir := t.TempDir()
+	for _, workers := range []int{0, 8} {
+		out, err := run(t, "--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir,
+			"--key=run-a", "--iterations=2", "--warmup=0", "--json",
+			"--defer-reap-workers="+strconv.Itoa(workers), "--", "true")
+		if err != nil {
+			t.Fatalf("workers=%d: %v (out=%s)", workers, err, out)
+		}
+		var rec runResult
+		if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &rec); err != nil {
+			t.Fatalf("not JSON: %v\n%s", err, out)
+		}
+		if rec.DeferReapWorkers != workers {
+			t.Fatalf("DeferReapWorkers=%d, want %d: the arm is not in the record",
+				rec.DeferReapWorkers, workers)
 		}
 	}
 }
