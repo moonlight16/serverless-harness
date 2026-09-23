@@ -485,3 +485,77 @@ Acquire is still a rejection.
 
 Records: `srv-r16b14s16:~/i307-ladder1/`, `~/i307-ladder2/`, driver
 `~/i307-restore-ceiling.sh`, binary built from this branch at `~/i307-probe/`.
+
+## SETTLED BY MEASUREMENT: `/proc/<pid>/fd` empties at 1.4 ms of a 53 ms reap
+
+The open question above — "is there an observable point where the guest is provably gone but the
+reap has not finished?" — is answered. There is, it is not either of the things #307 looked at, and
+it is the correctness property itself rather than a proxy.
+
+Measured on `srv-r16b14s16`, `SH_DIAG_PHASES=1`, both barriers timed from the SIGKILL so both are
+directly comparable with `wait_us`.
+
+**Serial (`--mode=teardown-inflight`, n=24), zero unobserved:**
+
+| sub-phase     | mean     | median   | min      | max      | share of wait |
+| ------------- | -------- | -------- | -------- | -------- | ------------- |
+| `kill`        | 6 µs     | 5 µs     | 4 µs     | 22 µs    | —             |
+| `threadsgone` | 243 µs   | 238 µs   | 175 µs   | 312 µs   | **1.46%**     |
+| `fdgone`      | 1334 µs  | 1294 µs  | 1177 µs  | 2421 µs  | **7.98%**     |
+| `wait`        | 17354 µs | 17972 µs | 10271 µs | 22989 µs | 100%          |
+
+**Under load (`--mode=replenish --concurrency=64`, n=1216):**
+
+| sub-phase     | mean     | median   | p95      | max      | unobserved |
+| ------------- | -------- | -------- | -------- | -------- | ---------- |
+| `kill`        | 115 µs   | 55 µs    | 427 µs   | 1458 µs  | —          |
+| `threadsgone` | 1021 µs  | 450 µs   | 2124 µs  | 65271 µs | **12**     |
+| `fdgone`      | 1862 µs  | 1408 µs  | 4617 µs  | 8850 µs  | **0**      |
+| `wait`        | 53069 µs | 52883 µs | 75728 µs | 88490 µs | —          |
+
+`wait` at c=64 reads 53.07 ms here against #307's 52.48 ms from the `--keys` exec driver — **1.1%
+apart**, a third independent corroboration.
+
+### `fdgone` is the barrier; `threadsgone` is not
+
+**`fdgone` is unconditional and always early.** 0 of 1216 unobserved, and **0 of 1216 landed later
+than the reap**. Median 1.4 ms, p95 4.6 ms, worst case 8.85 ms — against a 53 ms wait. It is
+**3.58% of the reap on the mean and 20.7% at its very worst.**
+
+**`threadsgone` is not usable**, and this is the reason to have measured both rather than picking
+the one that sounded sufficient. Under load it has **12 unobserved samples and a 65 ms maximum** —
+sometimes the thread group simply does not empty before the leader is reaped. The barrier I
+reasoned was "weaker but adequate" is the unreliable one; the one that _is_ the correctness
+property is rock solid.
+
+### What this licenses
+
+At 1.4 ms (median) after the SIGKILL the VMM **holds no file descriptor at all**. Not "probably
+cannot write to `workspace.img`" — it has no descriptor with which to write to anything, `exit_files`
+having dropped every `f_count` before the expensive `__fput` work runs. The remaining **96%** of
+`cmd.Wait` is `rcu_barrier` and `__synchronize_srcu` under `kvm_vm_release`.
+
+`os.ReadDir` returning zero entries cannot be a false early positive: before `exit_files` it returns
+the descriptors, and a vanished `/proc/<pid>/fd` returns an _error_, which the probe reports as
+"cannot tell" rather than as zero — the guard that makes the -1 convention load-bearing. PID reuse
+cannot confuse it either, because the child is not reaped until `cmd.Wait`.
+
+**So the design changes, and gets stronger.** The gate no longer needs to rest on quiescence plus a
+≲1 ms unmeasured window:
+
+| sub-phase              | c=64 cost                     | side of the gate |
+| ---------------------- | ----------------------------- | ---------------- |
+| `kill`                 | 0.12 ms                       | **held**         |
+| poll to `fdgone`       | **1.4 ms median, 4.6 ms p95** | **held**         |
+| `wait` (`cmd.Wait`)    | ~53 ms                        | deferred         |
+| `removeall`            | 5.9-22.7 ms                   | deferred         |
+| `cgroupwait` + release | ~0                            | deferred         |
+
+Holding the gate to `fdgone` costs ~1.5 ms instead of ~53 ms and is **provable rather than argued**.
+The earlier plan to release at `kill` is superseded: it was cheaper by 1.4 ms and very much weaker.
+
+The residual risks named earlier are also retired by this. The `jbd2`/`ext4lazyinit` spontaneous-write
+window closes at `fdgone` along with everything else, so `mkfs.ext4 -F` leaving `lazy_itable_init`
+at its default no longer matters.
+
+Records: `srv-r16b14s16:/tmp/i307-bar.log` (serial), `/tmp/i307-bar64.log` (c=64).
