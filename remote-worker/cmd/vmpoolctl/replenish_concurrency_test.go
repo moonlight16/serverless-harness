@@ -152,3 +152,28 @@ func TestTheRecordCarriesWhetherTheReapWasDeferred(t *testing.T) {
 		}
 	}
 }
+
+// ReplenishDelay defaults to 200 ms, and at 64 slots a slot consumes a VM every ~102 ms -- so
+// refilling cannot start until the slot has already been empty for ~100 ms, and a cold acquire
+// is structural rather than a symptom of load. #307's deferred reap made the consumer 1.7x
+// faster and pushed coldAcquireRateTrue from 0.161 to 0.741, which makes this the knob to sweep
+// next. It was not reachable from the driver at all, so no rung had ever varied it.
+func TestReplenishDelayIsSettableAndRecorded(t *testing.T) {
+	dir := t.TempDir()
+	for _, ms := range []int{200, 20} {
+		out, err := run(t, "--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir,
+			"--key=run-a", "--iterations=2", "--warmup=0", "--json",
+			"--replenish-delay-ms="+strconv.Itoa(ms), "--", "true")
+		if err != nil {
+			t.Fatalf("ms=%d: %v (out=%s)", ms, err, out)
+		}
+		var rec runResult
+		if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &rec); err != nil {
+			t.Fatalf("not JSON: %v\n%s", err, out)
+		}
+		if rec.ReplenishDelayMs != ms {
+			t.Fatalf("ReplenishDelayMs=%d, want %d: the knob is not in the record, so two "+
+				"rungs that differ only by it are indistinguishable", rec.ReplenishDelayMs, ms)
+		}
+	}
+}

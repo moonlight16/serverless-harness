@@ -39,6 +39,9 @@ type runResult struct {
 	// deferral rung measures flat.
 	ReapsInline      uint64 `json:"reaps_inline"`
 	DeferReapWorkers int    `json:"defer_reap_workers"`
+	// ReplenishDelayMs is recorded for the same reason: it is the grace before a popped slot
+	// is refilled, and at 64 slots the 200 ms default is longer than a slot's whole cycle.
+	ReplenishDelayMs int `json:"replenish_delay_ms"`
 	// Keys is recorded because on the Firecracker arm it, not Concurrency, bounds how
 	// many VMs were ever alive at once (SerializesExecsPerRun). A record carrying
 	// concurrency without keys is the one that cannot be read back correctly -- #307's
@@ -106,6 +109,9 @@ func realMain(args []string, stdout io.Writer) error {
 				"reports SerializesExecsPerRun, so a run's execGate admits one Exec at a time "+
 				"and --concurrency alone only queues goroutines at that gate. --keys=1 "+
 				"(the default) reproduces the historical single-key behaviour")
+		replenishMs = fs.Int("replenish-delay-ms", int(vmpool.DefaultReplenishDelay/time.Millisecond),
+			"grace before refilling a popped standby slot. The 200ms default exceeds a slot's whole "+
+				"cycle at 64 slots, so replenishment starts after the slot has already gone cold (#307)")
 		deferReap = fs.Int("defer-reap-workers", 0,
 			"move the VM reap tail (cmd.Wait, jail unlink, cgroup release) off the execGate-held "+
 				"path onto this many background workers, releasing the gate at the descriptor barrier "+
@@ -262,6 +268,7 @@ func realMain(args []string, stdout io.Writer) error {
 		MaxRuns:           *maxRuns,
 		MaxCommittedBytes: *committedMB << 20,
 		DeferReapWorkers:  *deferReap,
+		ReplenishDelay:    time.Duration(*replenishMs) * time.Millisecond,
 	}
 	pool, err := vmpool.New(cfg, lc, vmpool.RealClock())
 	if err != nil {
@@ -292,6 +299,7 @@ func realMain(args []string, stdout io.Writer) error {
 		Substrate:        *substrate,
 		Limits:           gatherLimits(),
 		DeferReapWorkers: *deferReap,
+		ReplenishDelayMs: *replenishMs,
 	}
 
 	// --pin-memfile: mlock the snapshot's memory file so restores across VMs share
