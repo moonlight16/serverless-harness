@@ -559,3 +559,52 @@ window closes at `fdgone` along with everything else, so `mkfs.ext4 -F` leaving 
 at its default no longer matters.
 
 Records: `srv-r16b14s16:/tmp/i307-bar.log` (serial), `/tmp/i307-bar64.log` (c=64).
+
+## Measured: 1.70x on the gate-held path, mechanism confirmed
+
+`--mode=exec --concurrency=64` against **one** `workspace_key`, arms interleaved off/on/off/on,
+1200 Execs each, 100 discarded, `drop_caches` once, orphans cleared per rep.
+
+**One key is the point.** The Firecracker launcher `SerializesExecsPerRun`, so all 64 goroutines
+queue at that key's single `execGate` and throughput is exactly `1/(gate-held time)`. That makes
+this a direct measurement of the critical section the change alters, with nothing else in it.
+
+| arm    | Exec/s    | per-Exec | Acquire | Resume | Run  | **Destroy** | p95     | inline | failures |
+| ------ | --------- | -------- | ------- | ------ | ---- | ----------- | ------- | ------ | -------- |
+| off    | 21.24     | 47.08 ms | 0.00    | 23.00  | 2.64 | 20.64       | 3297 ms | 0      | 0        |
+| **on** | **36.25** | 27.59 ms | 0.00    | 23.24  | 2.65 | **1.49**    | 1785 ms | 0      | 0        |
+| off    | 21.34     | 46.85 ms | 0.00    | 22.98  | 2.64 | 20.14       | 3154 ms | 0      | 0        |
+| **on** | **36.30** | 27.55 ms | 0.00    | 23.20  | 2.64 | **1.48**    | 1786 ms | 0      | 0        |
+
+**1.704x.** Reproducibility: off 21.24 / 21.34 (**0.5%**), on 36.25 / 36.30 (**0.14%**) — far
+inside the 8.2% session spread recorded earlier, so the effect is not drift.
+
+**The mechanism is confirmed term by term, which is what makes this more than a number.**
+`Destroy` falls from 20.4 ms to **1.49 ms** — the barrier (measured independently at 1.41 ms
+median) replacing the whole reap, exactly as designed. `Resume` (23.00 -> 23.24) and `Run` (2.64 ->
+2.64) do not move, so nothing was traded. p95 nearly halves. `Acquire` stays at 0.00 ms, so no cost
+reappeared where the cgroup-rmdir deferral's did. `reaps_inline` is 0, so the reaper was never
+saturated and the arm was fully applied. Zero failures in 4800 Execs.
+
+Destroy reads 20.4 ms rather than the 53 ms of a 64-slot run because one key serialises the
+teardowns too, so each sees c=1 conditions — and 20.4 ms sits right on #307's 19.28 ms `wait` at
+c=1. Another corroboration, and a reminder of what this rung is.
+
+### What this does and does not establish
+
+**Established:** the critical section shrinks 1.70x, by removing the reap and nothing else, with
+the barrier costing what it was measured to cost. The correctness argument, the barrier, and the
+implementation all behave as predicted.
+
+**Not established: end-to-end throughput at 64 slots.** This rung deliberately has one key, so its
+absolute Exec/s (21 -> 36) is a critical-section figure, not the 577 Exec/s production number. The
+production configuration needs one key per slot (#334's `--keys`), and there the restore+destroy
+pipeline ceiling of ~872/s binds instead: the prediction stays **800-870 Exec/s, at most 1.51x**,
+with the residue surfacing in `Acquire`. A 1.70x critical-section win against a 1.51x supply
+ceiling means **supply, not the gate, is what will bind next** — which is the outcome the ceiling
+ladder already pointed at.
+
+That run is the remaining work, and it needs #334 merged; attempting it on this branch alone would
+measure c=1 whatever `--concurrency` says, which is the bug #334 exists to fix.
+
+Records: `srv-r16b14s16:~/i307-ab1/`, driver `~/i307-ab.sh`.
