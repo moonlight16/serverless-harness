@@ -61,21 +61,35 @@ type runResult struct {
 	P95AcquireUs    int64             `json:"p95_acquire_us"`
 	P50ResumeUs     int64             `json:"p50_resume_us"`
 	P95ResumeUs     int64             `json:"p95_resume_us"`
-	P50RunUs        int64             `json:"p50_run_us"`
-	P95RunUs        int64             `json:"p95_run_us"`
-	P50DestroyUs    int64             `json:"p50_destroy_us"`
-	P95DestroyUs    int64             `json:"p95_destroy_us"`
-	P50TotalUs      int64             `json:"p50_total_us"`
-	P95TotalUs      int64             `json:"p95_total_us"`
-	WallMs          int64             `json:"wall_ms"`
-	CPUChildUs      int64             `json:"cpu_child_us"`
+	// Resume's three sub-phases (Firecracker only; zero on the CHV arm, which has no
+	// workspace mount). They sum to resume_us, which keeps its old meaning so that
+	// earlier campaign tables stay comparable -- see vmpool.Phases.
+	P50VMResumeUs  int64 `json:"p50_vmresume_us"`
+	P95VMResumeUs  int64 `json:"p95_vmresume_us"`
+	P50VsockDialUs int64 `json:"p50_vsockdial_us"`
+	P95VsockDialUs int64 `json:"p95_vsockdial_us"`
+	P50MountUs     int64 `json:"p50_mount_us"`
+	P95MountUs     int64 `json:"p95_mount_us"`
+	P50RunUs       int64 `json:"p50_run_us"`
+	P95RunUs       int64 `json:"p95_run_us"`
+	P50DestroyUs   int64 `json:"p50_destroy_us"`
+	P95DestroyUs   int64 `json:"p95_destroy_us"`
+	P50TotalUs     int64 `json:"p50_total_us"`
+	P95TotalUs     int64 `json:"p95_total_us"`
+	WallMs         int64 `json:"wall_ms"`
+	CPUChildUs     int64 `json:"cpu_child_us"`
 }
 
 // sample holds one measured iteration's phase decomposition. Every mode fills in
 // only the fields its own primitive touches — e.g. "replenish" never sets run, and
 // leaving the rest at their zero value is exactly what keeps a replenishment rung
 // from being misread as a hot-path rung (see TestModeReplenishMeasuresRestoreOnly).
-type sample struct{ acquire, resume, run, destroy, total time.Duration }
+type sample struct {
+	acquire, resume, run, destroy, total time.Duration
+	// Resume's sub-phases. Zero on every mode but "exec", and zero on the CHV arm,
+	// for the same reason the other fields are: a mode fills only what it touches.
+	vmResume, vsockDial, mount time.Duration
+}
 
 func main() {
 	if err := realMain(os.Args[1:], os.Stdout); err != nil {
@@ -357,6 +371,9 @@ func realMain(args []string, stdout io.Writer) error {
 
 	res.P50AcquireUs, res.P95AcquireUs = pct(samples, func(s sample) time.Duration { return s.acquire })
 	res.P50ResumeUs, res.P95ResumeUs = pct(samples, func(s sample) time.Duration { return s.resume })
+	res.P50VMResumeUs, res.P95VMResumeUs = pct(samples, func(s sample) time.Duration { return s.vmResume })
+	res.P50VsockDialUs, res.P95VsockDialUs = pct(samples, func(s sample) time.Duration { return s.vsockDial })
+	res.P50MountUs, res.P95MountUs = pct(samples, func(s sample) time.Duration { return s.mount })
 	res.P50RunUs, res.P95RunUs = pct(samples, func(s sample) time.Duration { return s.run })
 	res.P50DestroyUs, res.P95DestroyUs = pct(samples, func(s sample) time.Duration { return s.destroy })
 	res.P50TotalUs, res.P95TotalUs = pct(samples, func(s sample) time.Duration { return s.total })
@@ -463,6 +480,7 @@ func runExecMode(pool vmpool.Pool, key, command string, stdin []byte, timeoutS u
 			}, discardSink{}, ph)
 			s.total = time.Since(t0)
 			s.acquire, s.resume, s.run, s.destroy = ph.Acquire, ph.Resume, ph.Run, ph.Destroy
+			s.vmResume, s.vsockDial, s.mount = ph.VMResume, ph.VsockDial, ph.Mount
 			mu.Lock()
 			samples[i] = s
 			if err != nil {

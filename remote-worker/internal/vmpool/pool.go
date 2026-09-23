@@ -216,6 +216,18 @@ type Phases struct {
 	Run     time.Duration
 	Destroy time.Duration
 	Cold    ColdCause // "" when the acquire was warm
+
+	// Resume's three sub-phases, populated only by a launcher implementing
+	// resumePhaser (Firecracker does; CHV does not, and reports zeros). They SUM to
+	// Resume, which is deliberately left meaning the whole phase: several campaign
+	// tables compare resume_us across runs, and a silently redefined field reads as a
+	// missing phase rather than as an error (#336 kept total_us the same way).
+	//
+	// Resume was the last opaque phase on the execGate-held critical path -- ~23 ms of
+	// a ~102 ms Exec at 64 slots with nothing inside it.
+	VMResume  time.Duration // PATCH /vm {state: Resumed} -- Firecracker un-pauses the vcpus
+	VsockDial time.Duration // host-initiated vsock dial + "CONNECT <port>" handshake
+	Mount     time.Duration // guest round trip running the /workspace mount
 }
 
 // ExecPhased is Exec with instrumentation. Exec delegates to it with a throwaway
@@ -318,6 +330,11 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 	resumeErr := vm.Resume(runCtx)
 	if ph != nil {
 		ph.Resume = p.clk.Now().Sub(t0)
+		// Read the sub-phases even on the error path: a Resume that failed IN one of
+		// the three steps is exactly when knowing which one matters most.
+		if rp, ok := vm.(resumePhaser); ok {
+			ph.VMResume, ph.VsockDial, ph.Mount = rp.ResumePhases()
+		}
 	}
 	if resumeErr != nil {
 		if cErr := p.classify(ctx, &timedOut, timeoutS); cErr != nil {

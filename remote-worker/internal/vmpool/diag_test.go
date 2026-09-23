@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	wexec "github.com/kagenti/serverless-harness/remote-worker/internal/exec"
 )
@@ -72,7 +73,14 @@ func TestRunnerEmitsAllFourPhases(t *testing.T) {
 	// clock does not advance, so all four are legitimately 0 even on correct code. What the
 	// field set catches is a dropped phase or a rename, which is the failure that makes an
 	// aggregated run silently miss a term.
-	for _, field := range []string{"acquire_us=", "resume_us=", "run_us=", "destroy_us=", "cold="} {
+	for _, field := range []string{
+		"acquire_us=", "resume_us=",
+		// Resume's sub-phases (#307 follow-up). Named here for the same reason as the
+		// rest: resume_us was the last opaque phase on the gate-held path, and a rename
+		// or a drop would make an aggregated run silently miss a term rather than fail.
+		"vmresume_us=", "vsockdial_us=", "mount_us=",
+		"run_us=", "destroy_us=", "cold=",
+	} {
 		if !strings.Contains(got, field) {
 			t.Errorf("phase line is missing %q: %s", field, got)
 		}
@@ -85,5 +93,77 @@ func TestRunnerEmitsAllFourPhases(t *testing.T) {
 	// to Exec and ph stays zero, leaving cold="" here.
 	if want := fmt.Sprintf("cold=%q", string(ColdFirstExec)); !strings.Contains(got, want) {
 		t.Errorf("phase line has no %s -- Phases was not populated (Exec, not ExecPhased): %s", want, got)
+	}
+}
+
+// phasingLauncher hands back VMs that report Resume sub-phases, i.e. that implement
+// resumePhaser the way firecrackerVM does.
+type phasingLauncher struct {
+	*fakeLauncher
+	vmResume, vsockDial, mount time.Duration
+}
+
+func (l *phasingLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, error) {
+	vm, err := l.fakeLauncher.Restore(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return &phasingVM{VM: vm, lc: l}, nil
+}
+
+type phasingVM struct {
+	VM
+	lc *phasingLauncher
+}
+
+func (v *phasingVM) ResumePhases() (vmResume, vsockDial, mount time.Duration) {
+	return v.lc.vmResume, v.lc.vsockDial, v.lc.mount
+}
+
+// TestExecPhasedReportsResumeSubPhases pins the type assertion in ExecPhased. Resume was
+// the last opaque phase on the execGate-held critical path, and the whole decomposition
+// hangs off one optional-interface check: drop it and resume_us keeps reporting while the
+// three sub-phases silently read zero, which is indistinguishable from a launcher that
+// does not implement the seam. Asserting on VALUES, not just field names, is what
+// separates those two cases -- the fake clock cannot advance a real duration, so the
+// launcher hands back fixed ones.
+func TestExecPhasedReportsResumeSubPhases(t *testing.T) {
+	p, lc, _ := testPool(t)
+	pl := &phasingLauncher{
+		fakeLauncher: lc,
+		vmResume:     300 * time.Microsecond,
+		vsockDial:    2 * time.Millisecond,
+		mount:        20 * time.Millisecond,
+	}
+	// testPool already built the pool around lc, so swap the launcher the pool holds.
+	p.(*pool).lc = pl
+
+	var ph Phases
+	if _, err := p.ExecPhased(context.Background(), "k1", Exec{
+		ReqID: 1, Command: "true", TimeoutS: 5,
+	}, &capturingSink{}, &ph); err != nil {
+		t.Fatalf("ExecPhased: %v", err)
+	}
+
+	if ph.VMResume != pl.vmResume || ph.VsockDial != pl.vsockDial || ph.Mount != pl.mount {
+		t.Errorf("sub-phases = (%v, %v, %v), want (%v, %v, %v) -- the resumePhaser assertion in ExecPhased is not wired",
+			ph.VMResume, ph.VsockDial, ph.Mount, pl.vmResume, pl.vsockDial, pl.mount)
+	}
+}
+
+// TestResumeSubPhasesAreZeroWithoutTheSeam is the other half: a launcher that does NOT
+// implement resumePhaser must report zeros rather than panicking on the assertion. That
+// is the CHV arm, whose Resume has no workspace mount to decompose.
+func TestResumeSubPhasesAreZeroWithoutTheSeam(t *testing.T) {
+	p, _, _ := testPool(t)
+	var ph Phases
+	if _, err := p.ExecPhased(context.Background(), "k1", Exec{
+		ReqID: 1, Command: "true", TimeoutS: 5,
+	}, &capturingSink{}, &ph); err != nil {
+		t.Fatalf("ExecPhased: %v", err)
+	}
+	if ph.VMResume != 0 || ph.VsockDial != 0 || ph.Mount != 0 {
+		t.Errorf("sub-phases = (%v, %v, %v), want all zero for a launcher without the seam",
+			ph.VMResume, ph.VsockDial, ph.Mount)
 	}
 }

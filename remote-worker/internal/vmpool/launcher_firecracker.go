@@ -788,6 +788,25 @@ type firecrackerVM struct {
 	// would read as missing phases.
 	phKill, phBarrier time.Duration
 	barrierSeen       bool
+	// Resume's three sub-phases, from the LAST Resume. Stashed rather than returned
+	// because Resume's signature is the VM interface's, shared with a launcher this
+	// decomposition does not apply to -- see resumePhaser in diag.go. Written by
+	// Resume and read by ResumePhases, both under mu: Resume runs on the Exec's
+	// goroutine while the deferred reaper may be touching this same VM's mu.
+	phVMResume, phVsockDial, phMount time.Duration
+}
+
+// ResumePhases implements resumePhaser (diag.go). Zero until the first Resume.
+func (v *firecrackerVM) ResumePhases() (vmResume, vsockDial, mount time.Duration) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.phVMResume, v.phVsockDial, v.phMount
+}
+
+func (v *firecrackerVM) stashResumePhases(vmResume, vsockDial, mount time.Duration) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.phVMResume, v.phVsockDial, v.phMount = vmResume, vsockDial, mount
 }
 
 func (v *firecrackerVM) Key() string { return v.key }
@@ -806,15 +825,30 @@ func (v *firecrackerVM) Resume(ctx context.Context) error {
 		return err
 	}
 
+	// Sub-phase timing for resumePhaser. time.Now(), not a Clock, for the reason the
+	// runOverConn call below already documents: VM implementations have none injected.
+	// Every stamp is recorded even on a failure path -- a Resume that failed IN one of
+	// these steps is when knowing which one matters most -- so each assignment happens
+	// before the error check, and stashPhases runs via defer.
+	var phVMResume, phVsockDial, phMount time.Duration
+	phaseStart := time.Now()
+	defer func() { v.stashResumePhases(phVMResume, phVsockDial, phMount) }()
+
 	fc := newFCClient(v.apiSockHost)
-	if err := fc.Resume(ctx); err != nil {
-		return fmt.Errorf("firecracker: resume %s: %w", v.id, err)
+	resumeErr := fc.Resume(ctx)
+	phVMResume = time.Since(phaseStart)
+	if resumeErr != nil {
+		return fmt.Errorf("firecracker: resume %s: %w", v.id, resumeErr)
 	}
 
+	dialStart := time.Now()
 	conn, err := dialVsock(v.vsockHostPath, v.vsockPort)
+	phVsockDial = time.Since(dialStart)
 	if err != nil {
 		return fmt.Errorf("firecracker: resume %s: dial vsock: %w", v.id, err)
 	}
+	mountStart := time.Now()
+	defer func() { phMount = time.Since(mountStart) }()
 	// runOverConn closes conn itself (guestconn.go), and this is a FRESH connection
 	// used for exactly this one internal command — never reused by Run, which dials
 	// its own (see runOverConn's doc comment on why: established connections are

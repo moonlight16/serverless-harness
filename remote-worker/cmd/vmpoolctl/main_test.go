@@ -90,6 +90,17 @@ func TestRunsOneExecInAVMAndReportsItAsJSON(t *testing.T) {
 	// mount, exactly a cost this benchmark exists to expose. The fake's Resume is
 	// a no-op so it may legitimately measure ~0us; what must hold is that the
 	// field is present in the contract, not that it's nonzero.
+	for _, f := range []string{
+		// Resume's sub-phases must reach the JSON record, or a ladder cannot read the
+		// decomposition back even though the worker log has it (#307 follow-up).
+		`"p50_vmresume_us"`, `"p95_vmresume_us"`,
+		`"p50_vsockdial_us"`, `"p95_vsockdial_us"`,
+		`"p50_mount_us"`, `"p95_mount_us"`,
+	} {
+		if !strings.Contains(out, f) {
+			t.Errorf("record is missing %s: %s", f, out)
+		}
+	}
 	if !strings.Contains(out, `"p50_resume_us"`) || !strings.Contains(out, `"p95_resume_us"`) {
 		t.Errorf("record missing resume phase fields, out=%s", out)
 	}

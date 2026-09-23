@@ -3,6 +3,7 @@ package vmpool
 import (
 	"log"
 	"os"
+	"time"
 )
 
 // Opt-in phase logging. #305 and #307 were both found by decomposing an Exec into
@@ -29,7 +30,21 @@ func logPhases(ph *Phases) {
 	if phaseLog == nil {
 		return
 	}
-	phaseLog("vmpool: exec phases acquire_us=%d resume_us=%d run_us=%d destroy_us=%d cold=%q",
+	phaseLog("vmpool: exec phases acquire_us=%d resume_us=%d vmresume_us=%d vsockdial_us=%d mount_us=%d run_us=%d destroy_us=%d cold=%q",
 		ph.Acquire.Microseconds(), ph.Resume.Microseconds(),
+		ph.VMResume.Microseconds(), ph.VsockDial.Microseconds(), ph.Mount.Microseconds(),
 		ph.Run.Microseconds(), ph.Destroy.Microseconds(), string(ph.Cold))
+}
+
+// resumePhaser is the seam a VM implements to report Resume's internal decomposition.
+// Optional on purpose: Resume's signature returns only an error, and widening the VM
+// interface would force the CHV launcher (whose Resume is a different shape entirely --
+// virtio-fs, no workspace mount) to answer a question that does not apply to it. A
+// launcher that does not implement this reports zeros, which read as "not decomposed"
+// rather than as "measured zero" because resume_us stays populated beside them.
+//
+// The three values are the LAST Resume's, stashed by it rather than returned, and are
+// read on the same goroutine immediately after Resume returns.
+type resumePhaser interface {
+	ResumePhases() (vmResume, vsockDial, mount time.Duration)
 }
