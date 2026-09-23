@@ -18,11 +18,19 @@ import (
 //
 // So `linked` counts dentry work and `owned_bytes` counts block work, and only the
 // second is a number a thin-provisioning or storage-layer argument can spend.
+//
+// The block counts are split along the same line as the byte counts, and for the same
+// reason. Allocated blocks are worth reporting next to apparent size because the two
+// disagree on a sparse or thin-provisioned image, and that gap is what a storage-layer
+// proposal would be claiming to exploit -- but the gap that matters is between owned bytes
+// and owned BLOCKS, since those are the blocks this unlink returns. One combined total would
+// be dominated by the ~3.1 GB of hardlinked snapshot components and would bury exactly the
+// comparison it was added to enable.
 type jailStats struct {
-	entries, dirs           int64
-	linked, owned           int64
-	linkedBytes, ownedBytes int64
-	blocks512               int64
+	entries, dirs                   int64
+	linked, owned                   int64
+	linkedBytes, ownedBytes         int64
+	linkedBlocks512, ownedBlocks512 int64
 }
 
 // jailInventory walks a jail root and classifies its entries. Errors are swallowed
@@ -46,14 +54,15 @@ func jailInventory(root string) jailStats {
 			return nil
 		}
 		nlink, blocks := statLinksAndBlocks(info)
-		s.blocks512 += blocks
 		if nlink > 1 {
 			s.linked++
 			s.linkedBytes += info.Size()
+			s.linkedBlocks512 += blocks
 			return nil
 		}
 		s.owned++
 		s.ownedBytes += info.Size()
+		s.ownedBlocks512 += blocks
 		return nil
 	})
 	return s

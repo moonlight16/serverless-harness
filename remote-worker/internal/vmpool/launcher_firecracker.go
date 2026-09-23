@@ -922,9 +922,22 @@ func (v *firecrackerVM) Destroy() error {
 			// opposite fixes. Split only under diagnostics so the production path keeps the
 			// single Wait and its error semantics.
 			//
-			// The second call's Process.Wait() returns ErrProcessDone without a syscall
-			// (os.Process remembers it was reaped), so phDrain is awaitGoroutines and not a
-			// second reap.
+			// The second call's Process.Wait() fails fast with ECHILD -- the process was
+			// already reaped just above, so there is no child left to wait for. Cmd.Wait does
+			// NOT return early on that error: it assigns c.ProcessState and falls through to
+			// awaitGoroutines regardless. So phDrain is the goroutine drain, not a second reap.
+			//
+			// One invariant this creates, stated because it holds only on this branch: because
+			// Cmd.ProcessState is assigned from the FAILED second Process.Wait(), it is left
+			// nil here, where the production path above leaves it set. Harmless today -- both
+			// results are discarded and nothing downstream of Destroy reads it -- but an
+			// exit-code check added inside this branch would see a nil that cannot be
+			// reproduced in production.
+			//
+			// Verified against go1.25.0, the toolchain these numbers were measured with:
+			// errors.Is(err, syscall.ECHILD) is true and errors.Is(err, os.ErrProcessDone) is
+			// false. ErrProcessDone is what Signal returns on a finished process, not what
+			// Wait returns on a second call.
 			_, _ = cmd.Process.Wait()
 			phWait = time.Since(waitStart)
 			drainStart := time.Now()
@@ -942,8 +955,9 @@ func (v *firecrackerVM) Destroy() error {
 	// walk per VM.
 	if phaseLog != nil {
 		inv := jailInventory(v.jailRoot)
-		phaseLog("vmpool: destroy jail id=%s entries=%d dirs=%d linked=%d linked_bytes=%d owned=%d owned_bytes=%d blocks512=%d",
-			v.id, inv.entries, inv.dirs, inv.linked, inv.linkedBytes, inv.owned, inv.ownedBytes, inv.blocks512)
+		phaseLog("vmpool: destroy jail id=%s entries=%d dirs=%d linked=%d linked_bytes=%d linked_blocks512=%d owned=%d owned_bytes=%d owned_blocks512=%d",
+			v.id, inv.entries, inv.dirs, inv.linked, inv.linkedBytes, inv.linkedBlocks512,
+			inv.owned, inv.ownedBytes, inv.ownedBlocks512)
 	}
 	removeAllStart := time.Now()
 	if err := os.RemoveAll(v.jailRoot); err != nil {

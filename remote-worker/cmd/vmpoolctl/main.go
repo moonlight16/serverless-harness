@@ -146,7 +146,16 @@ func realMain(args []string, stdout io.Writer) error {
 	// original c=8/c=16 table read as "Destroy does not scale with load" when both columns
 	// had in fact run one VM at a time. Clamping would produce the same wrong record with a
 	// warning nobody reads.
-	if *keys < *concurrency && *mode == "exec" && *vmm == "firecracker" {
+	//
+	// THIS CONDITION MIRRORS firecrackerLauncher.SerializesExecsPerRun, which is the
+	// authority on it, and must be updated if a second arm ever reports true: a new
+	// serializing launcher would otherwise accept --concurrency > --keys and produce exactly
+	// the unreadable record this refusal exists to prevent. It is not asked of the launcher
+	// directly because lc is not constructed until below, and reordering construction ahead
+	// of flag validation to satisfy one check is the more fragile trade. Compared against
+	// the VMMKind constant rather than a raw string so this stays in step with launcher()
+	// if the wire name changes.
+	if *keys < *concurrency && *mode == "exec" && *vmm == string(vmpool.Firecracker) {
 		return fmt.Errorf("--concurrency=%d needs --keys>=%d on the firecracker arm: it "+
 			"SerializesExecsPerRun, so %d key(s) admit at most %d Exec(s) at a time and the rest "+
 			"would queue, recording a concurrency this run never reached", *concurrency, *concurrency, *keys, *keys)
@@ -248,7 +257,7 @@ func realMain(args []string, stdout io.Writer) error {
 	host, _ := os.Hostname()
 	res := runResult{
 		VMM: *vmm, Host: host, Key: *key, Command: command, Mode: *mode,
-		Iterations: *iterations, Concurrency: *concurrency, Keys: *keys,
+		Iterations: *iterations, Concurrency: *concurrency, Keys: keysUsed(*mode, *keys),
 		StandbyDepth: cfg.StandbyDepth, GuestRAMMB: *guestMB,
 		Substrate: *substrate,
 		Limits:    gatherLimits(),
@@ -352,6 +361,20 @@ func realMain(args []string, stdout io.Writer) error {
 // bash it would otherwise reuse (spec §5.4). This is the flag E10's rung 2 uses
 // twice: once with stdin empty (parked bash) and once with it set (fresh
 // `bash -c`), pricing the one distinction §5.4 draws.
+// keysUsed reports how many distinct keys the run ACTUALLY used, which is what the record
+// must carry. Only mode=exec spreads across keys -- the warmup floor and the round-robin are
+// both gated on it -- so every other mode uses exactly one however --keys was set.
+//
+// Recording the flag instead would put "keys": 8 on a replenish run that used one, which is
+// the same failure in miniature as the table this field was added to make unreadable-proof:
+// a record that parses cleanly and means something other than what it says.
+func keysUsed(mode string, keys int) int {
+	if mode != "exec" {
+		return 1
+	}
+	return keys
+}
+
 // execKey names the workspace_key iteration i runs under. With keys=1 it returns the
 // bare key, so every historical invocation is byte-identical to what it was before
 // --keys existed; above 1 it round-robins, which is what gives the Firecracker arm more

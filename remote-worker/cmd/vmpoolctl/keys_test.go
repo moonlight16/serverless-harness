@@ -109,6 +109,34 @@ func TestDerivedWarmupIsFlooredAtOnePerKey(t *testing.T) {
 	}
 }
 
+// Only mode=exec spreads Execs across keys, so every other mode used exactly one however
+// --keys was set. Recording the flag rather than what was used would put "keys": 8 on a
+// replenish run that had one run pool -- a record that parses cleanly and misstates the one
+// field added to stop records being misread.
+func TestKeysRecordedIsWhatTheModeActuallyUsed(t *testing.T) {
+	if got := keysUsed("exec", 8); got != 8 {
+		t.Errorf("keysUsed(exec, 8) = %d, want 8", got)
+	}
+	for _, mode := range []string{"replenish", "teardown-inflight", "teardown-standby", "teardown-bulk"} {
+		if got := keysUsed(mode, 8); got != 1 {
+			t.Errorf("keysUsed(%s, 8) = %d, want 1: only exec spreads across keys", mode, got)
+		}
+	}
+}
+
+// The same thing end to end, through the record a rung is actually parsed from.
+func TestANonExecRecordDoesNotClaimTheKeysFlag(t *testing.T) {
+	dir := t.TempDir()
+	out, err := run(t, "--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir,
+		"--key=k", "--mode=replenish", "--iterations=6", "--keys=8", "--json", "--", "true")
+	if err != nil {
+		t.Fatalf("realMain: %v", err)
+	}
+	if rec := decode(t, out); rec.Keys != 1 {
+		t.Errorf("keys = %d in a replenish record, want 1 (the mode ignores --keys)", rec.Keys)
+	}
+}
+
 // An explicit --warmup is the caller's decision. Raising it would silently discard
 // iterations they asked to measure, and "0" is a legitimate, deliberate request.
 func TestAnExplicitWarmupIsNotRaisedByKeys(t *testing.T) {
