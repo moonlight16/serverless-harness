@@ -780,6 +780,14 @@ type firecrackerVM struct {
 
 	mu        sync.Mutex
 	destroyed bool
+	// killed latches the barrier half so the two entry points (Destroy, and
+	// KillAndBarrier+Reap) cannot signal or re-time the same VMM twice.
+	killed bool
+	// The barrier half's timings, stashed so Reap can emit ONE phase line covering both
+	// halves -- the fields are parsed by whatever aggregates a run, so splitting the line
+	// would read as missing phases.
+	phKill, phBarrier time.Duration
+	barrierSeen       bool
 }
 
 func (v *firecrackerVM) Key() string { return v.key }
@@ -873,7 +881,93 @@ func (v *firecrackerVM) Run(ctx context.Context, c Command, out Sink) (Result, e
 // per VM but a caller-side bug retrying it must not become a second failure mode.
 // A failure here is logged and counted by pool.go's destroy, never returned up the
 // Exec path — it does not change what the command already did.
+// Destroy is the whole teardown, synchronously: the barrier half then the reap half. It is
+// what every caller outside the hot path uses -- Close, the reclaim goroutine, replenishOne's
+// post-warm branch, DestroyAllStandbys -- and its contract is unchanged. Idempotent: spec §6
+// requires abort-after-teardown not to error, and pool.go calls this exactly once per VM but a
+// caller-side bug retrying it must not become a second failure mode. A failure is logged and
+// counted by pool.go's destroy, never returned up the Exec path -- it does not change what the
+// command already did.
+//
+// It does NOT wait for the barrier, because the gate is held across the whole thing here
+// anyway: paying for an observation nobody acts on would be a regression in the arm that has
+// the deferral switched off, and that arm has to be exactly as it was for the A/B to mean
+// anything.
 func (v *firecrackerVM) Destroy() error {
+	return errors.Join(v.kill(false), v.Reap())
+}
+
+// KillAndBarrier is deferredReaper's first half: SIGKILL the jailer's (and by the same pid,
+// Firecracker's) process group, then block until that process holds no file descriptor.
+//
+// An error here means the barrier could not be OBSERVED, and pool.destroy answers it by
+// reaping synchronously under the gate -- the old ordering. Nothing about this call is
+// best-effort: it is the licence for opening the gate early, so "I could not check" must be
+// distinguishable from "checked, and it is safe".
+func (v *firecrackerVM) KillAndBarrier() error { return v.kill(true) }
+
+// kill signals the VMM and, when waitForBarrier, waits for its descriptors to close.
+//
+// WHY THE DESCRIPTORS ARE THE RIGHT BARRIER (#307). execGate exists because "a second guest
+// mounting [the ext4 workspace] rw while the first still holds it would corrupt it". The mount
+// is the GUEST's -- Resume issues `mount -o rw,noatime /dev/vdb /workspace` over vsock -- so
+// the invariant is that at most one live guest holds the image. `kill` alone does not establish
+// it: kill(2) only queues the signal, and a thread inside an uninterruptible pwrite completes
+// it first. An empty /proc/<pid>/fd does establish it, and directly rather than by inference:
+// a process with no descriptor cannot write to workspace.img. exit_files drops every f_count
+// before the expensive __fput work runs, which is why it lands early -- median 1.41 ms against
+// a 52.88 ms reap at c=64, 0 of 1216 samples unobserved and 0 later than the reap.
+//
+// The measurement also rejected the alternative. /proc/<pid>/status Threads: reaching 1 sounds
+// sufficient (no vCPU or device thread left to issue a write) but under load it had 12
+// unobserved samples and a 65 ms maximum: the thread group sometimes does not empty before the
+// leader is reaped.
+//
+// NO PROCESS IS A SATISFIED BARRIER, not a failed one. There is nothing that could write.
+func (v *firecrackerVM) kill(waitForBarrier bool) error {
+	v.mu.Lock()
+	if v.destroyed || v.killed {
+		v.mu.Unlock()
+		return nil
+	}
+	v.killed = true
+	cmd := v.cmd
+	v.mu.Unlock()
+
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	var errs []error
+	pid := cmd.Process.Pid
+	killStart := time.Now()
+	if err := fcKillProcessGroup(pid); err != nil && !fcProcessNotFound(err) {
+		errs = append(errs, fmt.Errorf("kill -%d: %w", pid, err))
+	}
+	phKill := time.Since(killStart)
+	var phBarrier time.Duration
+	seen := false
+	if waitForBarrier {
+		phBarrier, seen = fcWaitFDsGone(pid, fcBarrierTimeout)
+		if !seen {
+			errs = append(errs, fmt.Errorf("barrier for %d: /proc/%d/fd did not empty within %v",
+				pid, pid, fcBarrierTimeout))
+		}
+	}
+	v.mu.Lock()
+	v.phKill, v.phBarrier, v.barrierSeen = phKill, phBarrier, seen
+	v.mu.Unlock()
+	return errors.Join(errs...)
+}
+
+// Reap is deferredReaper's second half and the rest of the teardown: cmd.Wait, the jail unlink,
+// then the cgroup release, in that order and unchanged from when they ran inside Destroy. Safe
+// on any goroutine, and safe to call without KillAndBarrier (Destroy does exactly that).
+//
+// The ORDER inside here is load-bearing and is why the tail is deferred as a unit rather than
+// piecemeal: RemoveAll unlinks the jail, which holds a hardlink to workspace.img, and
+// cgroups.release reads cgroup.procs to decide whether reuse is safe. Both must follow the
+// reap, exactly as before.
+func (v *firecrackerVM) Reap() error {
 	v.mu.Lock()
 	if v.destroyed {
 		v.mu.Unlock()
@@ -881,55 +975,46 @@ func (v *firecrackerVM) Destroy() error {
 	}
 	v.destroyed = true
 	cmd := v.cmd
+	phKill, phBarrier, barrierSeen := v.phKill, v.phBarrier, v.barrierSeen
 	v.mu.Unlock()
 
 	var errs []error
-	// Sub-phase timing (#258 Task 3.1). Destroy is the largest phase of an Exec -- 36.77 ms
-	// at c=4, 65.06 ms at c=16, 164.27 ms at c=64, growing 4.5x across the sweep while Resume
-	// and Run stay flat -- and it was the only phase with no internal visibility. Behind
-	// SH_DIAG_PHASES like the restore phases: the six time.Now() calls are ~100ns against a
-	// Destroy measured in tens of MILLISECONDS, so they are unconditional and only the log
-	// line is gated.
+	// Sub-phase timing (#258 Task 3.1). Destroy is the largest phase of an Exec and was the
+	// only one with no internal visibility. Behind SH_DIAG_PHASES like the restore phases: the
+	// time.Now() calls are ~100ns against a Destroy measured in tens of MILLISECONDS, so they
+	// are unconditional and only the log line is gated.
 	//
 	// Measured with time.Since rather than a running clock so each step is independent: they
 	// are reported separately precisely because the expectation is that ONE of them dominates,
 	// and a running total cannot show which.
-	var phKill, phWait, phDrain, phRemoveAll, phCgroupWait, phCgroupRmdir time.Duration
-	// Declared out here so the phase line can report them as UNOBSERVED (-1) on the path
-	// where there was no process to watch at all.
+	var phWait, phDrain, phRemoveAll, phCgroupWait, phCgroupRmdir time.Duration
+	// Declared out here so the phase line can report them as UNOBSERVED (-1) on the path where
+	// there was no process to watch at all.
 	var fdGone, threadsGone time.Duration
 	var fdSeen, threadsSeen bool
 	phaseStart := time.Now()
 	if cmd != nil && cmd.Process != nil {
-		pid := cmd.Process.Pid
-		killStart := time.Now()
-		if err := fcKillProcessGroup(pid); err != nil && !fcProcessNotFound(err) {
-			errs = append(errs, fmt.Errorf("kill -%d: %w", pid, err))
-		}
-		phKill = time.Since(killStart)
 		waitStart := time.Now()
 		// Started from the same instant wait_us is measured from, so the two are directly
-		// comparable -- which is the entire question (#307): is there an observable point where
-		// this VMM can no longer touch workspace.img, reached measurably before the reap ends?
-		// No-ops unless SH_DIAG_PHASES=1.
-		obs, stopObs := startFCExitObserver(pid, waitStart)
+		// comparable. No-ops unless SH_DIAG_PHASES=1. When KillAndBarrier already waited for
+		// the descriptors, fdgone_us here reads ~0, which is correct: they were already gone.
+		obs, stopObs := startFCExitObserver(cmd.Process.Pid, waitStart)
 		if phaseLog == nil {
 			_ = cmd.Wait() // reap; "signal: killed" is the expected outcome, not a failure
 			phWait = time.Since(waitStart)
 		} else {
-			// #307 diagnostic split. cmd.Wait() is TWO waits, not one: os/exec's Wait
-			// calls Process.Wait() (the wait4 that reaps the VMM) and only then
-			// awaitGoroutines(), which blocks until the stdout/stderr copying goroutines
-			// return. Those goroutines exist because Restore sets Stdout/Stderr to
-			// io.Discard, and writerDescriptor takes the pipe branch for any writer that
-			// is not an *os.File -- so every VM allocates two os.Pipe()s and two
-			// goroutines, and this phase pays to drain them.
+			// #334's diagnostic split. cmd.Wait() is TWO waits, not one: os/exec's Wait calls
+			// Process.Wait() (the wait4 that reaps the VMM) and only then awaitGoroutines(),
+			// which blocks until the stdout/stderr copying goroutines return. Those goroutines
+			// exist because Restore sets Stdout/Stderr to io.Discard, and writerDescriptor takes
+			// the pipe branch for any writer that is not an *os.File -- so every VM allocates two
+			// os.Pipe()s and two goroutines, and this phase pays to drain them.
 			//
 			// Timing the halves apart is the whole point: "cmd.Wait is 89% of Destroy" is
-			// consistent with the kernel being slow to tear down a 256 MiB mapping AND with
-			// this process being slow to schedule two goroutines under load, and those have
-			// opposite fixes. Split only under diagnostics so the production path keeps the
-			// single Wait and its error semantics.
+			// consistent with the kernel being slow to tear down a 256 MiB mapping AND with this
+			// process being slow to schedule two goroutines under load, and those have opposite
+			// fixes. It answered 0.006-0.055 ms, i.e. 0.016-0.097% of Destroy. Split only under
+			// diagnostics so the production path keeps the single Wait and its error semantics.
 			//
 			// The second call's Process.Wait() fails fast with ECHILD -- the process was
 			// already reaped just above, so there is no child left to wait for. Cmd.Wait does
@@ -956,14 +1041,13 @@ func (v *firecrackerVM) Destroy() error {
 		stopObs()
 		fdGone, threadsGone, fdSeen, threadsSeen = obs.results()
 	}
-	// #307 Q4: removeall grows 5.92 -> 22.72 ms across the slot sweep, and it is the only
-	// step in Destroy where a storage-layer answer could apply -- but only for bytes that
-	// this unlink actually frees. Six of the jail's entries are hardlinks to the golden
-	// snapshot and to the run's workspace image, so unlinking them drops a refcount and
-	// frees nothing; the jailer's own copy of the exec-file is the one entry whose blocks
-	// are released here. Inventory it before removal rather than reasoning about it, so the
-	// thin-provisioning conversation starts from a number. Diagnostics only: this is a stat
-	// walk per VM.
+	// #307 Q4: removeall grows 5.92 -> 22.72 ms across the slot sweep, and it is the only step
+	// in Destroy where a storage-layer answer could apply -- but only for bytes that this unlink
+	// actually frees. Six of the jail's entries are hardlinks to the golden snapshot and to the
+	// run's workspace image, so unlinking them drops a refcount and frees nothing; the jailer's
+	// own copy of the exec-file is the one entry whose blocks are released here. Inventory it
+	// before removal rather than reasoning about it, so the thin-provisioning conversation starts
+	// from a number. Diagnostics only: this is a stat walk per VM.
 	if phaseLog != nil {
 		inv := jailInventory(v.jailRoot)
 		phaseLog("vmpool: destroy jail id=%s entries=%d dirs=%d linked=%d linked_bytes=%d linked_blocks512=%d owned=%d owned_bytes=%d owned_blocks512=%d",
@@ -1013,12 +1097,17 @@ func (v *firecrackerVM) Destroy() error {
 		phCgroupRmdir = time.Since(cgRelStart)
 	}
 	if phaseLog != nil {
-		phaseLog("vmpool: destroy phases id=%s kill_us=%d wait_us=%d drain_us=%d fdgone_us=%d "+
-			"threadsgone_us=%d removeall_us=%d cgroupwait_us=%d cgrouprmdir_us=%d total_us=%d",
-			v.id, phKill.Microseconds(), phWait.Microseconds(), phDrain.Microseconds(),
-			barrierUs(fdGone, fdSeen), barrierUs(threadsGone, threadsSeen),
+		phaseLog("vmpool: destroy phases id=%s kill_us=%d barrier_us=%d wait_us=%d fdgone_us=%d "+
+			"drain_us=%d threadsgone_us=%d removeall_us=%d cgroupwait_us=%d cgrouprmdir_us=%d total_us=%d",
+			v.id, phKill.Microseconds(), barrierUs(phBarrier, barrierSeen), phWait.Microseconds(),
+			barrierUs(fdGone, fdSeen), phDrain.Microseconds(), barrierUs(threadsGone, threadsSeen),
 			phRemoveAll.Microseconds(),
-			phCgroupWait.Microseconds(), phCgroupRmdir.Microseconds(), time.Since(phaseStart).Microseconds())
+			phCgroupWait.Microseconds(), phCgroupRmdir.Microseconds(),
+			// total_us still means THE WHOLE TEARDOWN, both halves, so it reconciles against
+			// its parts and stays comparable with every table recorded before the split. Taking
+			// time.Since(phaseStart) alone would silently redefine it as the tail only -- a
+			// renamed field by stealth, which reads as a phase that got faster.
+			(phKill + phBarrier + time.Since(phaseStart)).Microseconds())
 	}
 	return errors.Join(errs...)
 }

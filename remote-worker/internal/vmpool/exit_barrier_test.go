@@ -126,3 +126,49 @@ func TestDestroyReportsBothExitBarriersAgainstTheWait(t *testing.T) {
 		}
 	}
 }
+
+// fcWaitFDsGone is the production barrier: it runs INSIDE execGate, so unlike the diagnostic
+// observer it must be bounded. Measured at 1.41 ms median and 8.85 ms worst case at c=64.
+func TestWaitFDsGoneReturnsAsSoonAsTheDescriptorsAreClosed(t *testing.T) {
+	calls := 0
+	restoreExitProbes(t,
+		func(int) (int, bool) { calls++; return map[bool]int{true: 2, false: 0}[calls < 3], true },
+		func(int) (int, bool) { return 1, true },
+	)
+	d, ok := fcWaitFDsGone(1234, time.Second)
+	if !ok {
+		t.Fatal("ok=false with the descriptors reported closed")
+	}
+	if d <= 0 {
+		t.Fatalf("d=%v, want positive", d)
+	}
+}
+
+// A barrier that never arrives must TIME OUT and report it, never block the gate forever and
+// never claim an observation it does not have. pool.destroy turns !ok into the old synchronous
+// ordering, which is the only safe fallback.
+func TestWaitFDsGoneGivesUpRatherThanHoldingTheGateForever(t *testing.T) {
+	restoreExitProbes(t,
+		func(int) (int, bool) { return 3, true }, // never drains
+		func(int) (int, bool) { return 1, true },
+	)
+	start := time.Now()
+	if _, ok := fcWaitFDsGone(1234, 60*time.Millisecond); ok {
+		t.Fatal("ok=true for a barrier that never arrived")
+	}
+	if el := time.Since(start); el > 2*time.Second {
+		t.Fatalf("took %v to give up on a 60ms budget", el)
+	}
+}
+
+// "Cannot tell" is not "drained". An unreadable /proc/<pid>/fd must not satisfy the barrier --
+// that is the reading that would let the gate open on a process still holding the image.
+func TestWaitFDsGoneRefusesAnUnreadableCount(t *testing.T) {
+	restoreExitProbes(t,
+		func(int) (int, bool) { return 0, false },
+		func(int) (int, bool) { return 1, true },
+	)
+	if _, ok := fcWaitFDsGone(1234, 60*time.Millisecond); ok {
+		t.Fatal("ok=true from an unreadable count: 'cannot tell' was treated as 'drained'")
+	}
+}

@@ -194,3 +194,36 @@ func barrierUs(d time.Duration, seen bool) int64 {
 	}
 	return d.Microseconds()
 }
+
+// fcBarrierTimeout bounds the production barrier. p95 is 4.62 ms and the worst of 1216
+// samples was 8.85 ms at c=64, so 100 ms is ~11x the worst observed -- generous enough that
+// hitting it means something is genuinely wrong, and short enough that it cannot wedge a run.
+// Exceeding it is NOT tolerated silently: pool.destroy turns it into the old synchronous
+// ordering, which is the only safe fallback.
+const fcBarrierTimeout = 100 * time.Millisecond
+
+// fcWaitFDsGone blocks until pid holds no file descriptor, returning how long that took and
+// whether it was observed at all.
+//
+// THIS RUNS INSIDE execGate, which is the difference between it and fcExitObserver: it is
+// production, not diagnostics, so it is bounded and it does not spawn a goroutine. What it buys
+// is the other 96% -- the gate is released here instead of after cmd.Wait, which is 1.41 ms
+// median rather than 52.88 ms at c=64 (#307).
+//
+// "Cannot tell" is never "drained": fcProcFDCount reports an unreadable /proc/<pid>/fd as
+// (0, false), and only (0, true) satisfies the barrier. Treating an error as zero would open
+// the gate for a process that may still hold the image -- and it is the likely reading, since
+// a vanished directory is an error and a reaped process has no directory.
+func fcWaitFDsGone(pid int, timeout time.Duration) (time.Duration, bool) {
+	start := time.Now()
+	deadline := start.Add(timeout)
+	for {
+		if n, ok := fcProcFDCount(pid); ok && n == 0 {
+			return time.Since(start), true
+		}
+		if !time.Now().Before(deadline) {
+			return time.Since(start), false
+		}
+		time.Sleep(fcExitBarrierPoll)
+	}
+}

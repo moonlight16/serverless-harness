@@ -3,6 +3,8 @@ package vmpool
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -262,5 +264,57 @@ func TestAnUnobservableBarrierReapsSynchronouslyInsteadOfDeferring(t *testing.T)
 	}
 	if got := p.Stats().DestroyFailures; got == 0 {
 		t.Fatal("DestroyFailures=0: an unobservable barrier must be visible in Stats, not silent")
+	}
+}
+
+// The Firecracker arm is the only one with a gate to open, so it is the only VM that needs the
+// split. A compile-time assertion because pool.destroy's type switch silently falls back to the
+// synchronous path if it is ever lost -- which would read as "the deferral does nothing" in a
+// throughput table rather than as a build error.
+var _ deferredReaper = (*firecrackerVM)(nil)
+
+// KillAndBarrier then Reap must do exactly what Destroy does, once, and leave the VM in the
+// same state -- including refusing a later Destroy. Two entry points to one teardown is the
+// hazard here (the jail unlinked twice, the cgroup released twice and handed to two tenants).
+func TestKillAndBarrierThenReapIsExactlyOneTeardown(t *testing.T) {
+	root := t.TempDir()
+	const parent = "microvm.slice/microvm-vms.slice"
+	if err := os.MkdirAll(filepath.Join(root, parent), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cgp := newCgroupPool(parent, (256+32)<<20, root)
+	rel, err := cgp.acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jailRoot := filepath.Join(t.TempDir(), "jail", "vm-42", "root")
+	if err := os.MkdirAll(jailRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	vm := &firecrackerVM{id: "vm-42", key: "run-1", jailRoot: jailRoot, cgroups: cgp, cgroupRel: rel}
+
+	// No process, so the barrier is trivially satisfied: there is nothing that could write.
+	if err := vm.KillAndBarrier(); err != nil {
+		t.Fatalf("KillAndBarrier: %v", err)
+	}
+	if err := vm.Reap(); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if _, err := os.Stat(jailRoot); !os.IsNotExist(err) {
+		t.Fatalf("jail still present after Reap: %v", err)
+	}
+	if got := cgp.idle(); got != 1 {
+		t.Fatalf("cgroupPool idle=%d after Reap, want 1 released", got)
+	}
+	// Idempotent across the two entry points, not just within one.
+	if err := vm.Destroy(); err != nil {
+		t.Fatalf("Destroy after Reap: %v", err)
+	}
+	if err := vm.Reap(); err != nil {
+		t.Fatalf("second Reap: %v", err)
+	}
+	if got := cgp.idle(); got != 1 {
+		t.Fatalf("cgroupPool idle=%d after a repeated teardown, want 1: the cgroup was "+
+			"released twice and could be handed to two tenants", got)
 	}
 }
