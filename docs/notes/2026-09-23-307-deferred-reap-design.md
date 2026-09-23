@@ -608,3 +608,65 @@ That run is the remaining work, and it needs #334 merged; attempting it on this 
 measure c=1 whatever `--concurrency` says, which is the bug #334 exists to fix.
 
 Records: `srv-r16b14s16:~/i307-ab1/`, driver `~/i307-ab.sh`.
+
+## END TO END at 64 slots: 1.12x, and the bound moved to restore supply
+
+`--mode=exec --concurrency=64 --keys=64` (one key per slot, #334), arms interleaved
+off/on/off/on, 16,000 Execs per rung, 128 discarded, `drop_caches` once, orphans cleared per
+rung, cores-busy differenced from `/proc/stat`.
+
+| arm    | Exec/s     | Acquire   | Resume | Run  | Destroy  | p95       | cores busy    | `coldAcquireRateTrue` | inline | dying |
+| ------ | ---------- | --------- | ------ | ---- | -------- | --------- | ------------- | --------------------- | ------ | ----- |
+| off    | 576.68     | **0.00**  | 31.86  | 3.86 | 56.41    | 160.77 ms | 28.0/72 (39%) | **0.161**             | 0      | 54→55 |
+| **on** | **636.56** | **38.76** | 34.29  | 4.36 | **4.37** | 204.19 ms | 38.1/72 (53%) | **0.731**             | 0      | 55→56 |
+| off    | 543.64     | **0.00**  | 32.12  | 3.85 | 59.81    | 185.72 ms | 28.2/72 (39%) | **0.167**             | 0      | 56→55 |
+| **on** | **617.01** | **44.86** | 33.45  | 4.21 | **4.46** | 211.30 ms | 37.5/72 (52%) | **0.751**             | 24     | 55→56 |
+
+**off mean 560.16, on mean 626.79 — 1.119x.** Zero failures in 64,000 Execs. Dying cgroups flat
+54→56, so this is not #255.
+
+The off arm reproduces the campaign's baseline exactly: **576.68 against 577.55**. Its rep-to-rep
+spread is 6.1% (576.68 / 543.64) and the on arm's is 3.2%, so 1.12x clears the noise — but not by
+the margin 1.5x would have.
+
+### The mechanism worked and the bound moved, exactly as predicted
+
+`Destroy` falls **56-60 ms to 4.4 ms**: the deferral does what the single-key A/B said it does.
+Resume and Run barely move. `reaps_inline` is 0 and then 24 of 16,000 (0.15%), so the reaper was
+essentially never saturated and the arm was fully applied.
+
+**And `Acquire` goes 0.00 to ~42 ms while `coldAcquireRateTrue` goes 0.161 to 0.741.** Three of
+every four acquires now pay a restore inline. That is the predicted signature, and it is why 1.70x
+on the critical section becomes 1.12x end to end: the gate stopped being the constraint and the
+**restore supply became it, immediately.**
+
+Cores-busy rose 39% to 52.5% — the right direction, but not saturation, so CPU is still not the
+bound. The pre-registered success criterion was "throughput up AND the bound visibly moved to CPU".
+Throughput is up and the bound moved, but it moved to **replenishment, not CPU**.
+
+### Why it fell short of the 800-870 prediction
+
+That prediction came from the ~872 VM/s restore+destroy ceiling, and it was the wrong ceiling to
+divide by. The probe reached 872/s with its _own_ workers doing the restores. Production restores
+through `replenishOne`, which is **sequential per run** — one timer per slot, "so a finished Exec
+does not create D VMs in the same instant" — so 64 keys can have at most 64 restores in flight,
+each now taking the ~75 ms that rate costs. At a 0.74 cold rate most restores are not even
+happening in the background any more: they are inline, inside the Exec, which puts them back on the
+very critical path the deferral cleared.
+
+So the achievable ceiling is not 872 but ~630, and the deferral has already reached it.
+
+### Verdict
+
+**Keep it, but as a 1.12x, not a 1.4-1.5x.** It is a real gain above noise, the mechanism is
+proven, the correctness rests on a measured barrier, and it costs ~1.5 ms of gate time. But it is
+not the lever the issue expected, and the honest headline is that **it converts a gate bound into a
+replenishment bound** — p95 gets _worse_ (161 → 204 ms) as a direct result.
+
+The next lever is now sharply identified and it is not this one: **per-run replenishment is
+sequential, and with a 1.7x faster consumer that is what binds.** Raising in-flight replenishment
+per run (or `StandbyDepth` above its default 2) is the cheap thing to test next, and #274 — a VM
+serving several Execs — attacks the same ceiling by needing fewer restores per Exec.
+
+Records: `srv-r16b14s16:~/i307-e2e1/`, driver `~/i307-e2e.sh`. Stacked on #334, whose `--keys`
+this rung requires: without it every rung measures c=1 whatever `--concurrency` says.
