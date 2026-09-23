@@ -670,3 +670,61 @@ serving several Execs — attacks the same ceiling by needing fewer restores per
 
 Records: `srv-r16b14s16:~/i307-e2e1/`, driver `~/i307-e2e.sh`. Stacked on #334, whose `--keys`
 this rung requires: without it every rung measures c=1 whatever `--concurrency` says.
+
+## The replenishment knobs are both dead ends, and the reason generalises
+
+Deferral ON throughout, 64 slots, one key per slot, 16,000 Execs per rung, one knob varied per
+rung, anchor (`200ms`, `D=2`) first and last.
+
+| delay  | D   | Exec/s     | Acquire  | Destroy | p95    | cores      | `coldTrue` | inline |
+| ------ | --- | ---------- | -------- | ------- | ------ | ---------- | ---------- | ------ |
+| 200 ms | 2   | **651.19** | 24.75    | 4.24    | 210 ms | 36.5 (51%) | 0.645      | 371    |
+| 20 ms  | 2   | 627.43     | 29.48    | 4.72    | 233 ms | 37.7 (52%) | 0.716      | 117    |
+| 0 ms   | 2   | 626.44     | 42.15    | 4.67    | 206 ms | 37.9 (53%) | 0.740      | 0      |
+| 200 ms | 4   | 569.19     | 7.54     | 4.87    | 325 ms | 35.5 (49%) | 0.532      | 37     |
+| 200 ms | 8   | 458.99     | **0.00** | 7.44    | 400 ms | 35.9 (50%) | **0.059**  | 3093   |
+| 20 ms  | 8   | 442.10     | **0.00** | 8.36    | 417 ms | 35.0 (49%) | **0.046**  | 3251   |
+| 200 ms | 2   | **570.52** | 54.34    | 4.92    | 228 ms | 36.9 (51%) | 0.772      | 0      |
+
+**READ THE ANCHOR FIRST: 651.19 then 570.52, a 12.4% drift across the sweep.** Nothing smaller than
+that is a result here. That disqualifies the `delay` column and the `D=4` rung outright, and it is
+the reason the anchor is run twice.
+
+### `ReplenishDelay` is not the problem
+
+200 -> 20 -> 0 ms moves throughput 651 -> 627 -> 626, inside the drift, and pushes the cold rate the
+_wrong_ way (0.645 -> 0.740). My hypothesis — that a 200 ms grace longer than a slot's ~102 ms cycle
+must be starving the pool — is **wrong**. It does not matter when demand exceeds supply: removing
+the grace only starts more concurrent restores, which then contend. The default stands.
+
+### `StandbyDepth` fixes the cold rate completely and costs 20-30% throughput
+
+`D=8` is the striking rung. It does exactly what it was supposed to: `coldAcquireRateTrue` falls
+**0.645 to 0.059** and `Acquire` reaches **0.00 ms** — the pool keeps up perfectly, every acquire
+warm. And throughput falls to 459/442, **20-30% below both anchors**, well outside the drift, with
+p95 nearly doubling (210 -> 400 ms) and `reaps_inline` reaching 3093 of 16,000 (19%) as the reaper
+saturates under the heavier host.
+
+### Why, and why this generalises
+
+**A warm acquire does not remove work, it relocates it.** Every Exec needs exactly one restore
+whatever the pool does; a cold acquire pays for it inline, a warm one pays for it on a background
+goroutine. Deepening the pool converts inline restores into background restores — and then charges
+extra for 512 additional resident VMs, their cgroups, and the memory traffic.
+
+So **the cold rate was a symptom, not the cause.** Driving it to 0.059 bought nothing because the
+restore supply ceiling is a **work** ceiling, not a scheduling artifact. That retires both knobs the
+same way the campaign retired slots: `Acquire` can be made to look perfect while throughput gets
+worse, which is precisely the shape that made the 16-slot knee an artifact.
+
+### What is actually left
+
+Only reducing **restores per Exec**. Every lever that reschedules them has now been measured and
+rejected: more slots (campaign), deeper standby, shorter replenish grace, and — on the teardown side
+— deferring the reap, which works but only until supply binds.
+
+That is **#274** (a VM serving several Execs) and nothing else in this family. It is the one change
+that makes the restore count fall rather than move, and #307 already priced it: ~19 ms of
+unavoidable grace period per VM destroyed against 6.2 ms for the command itself.
+
+Records: `srv-r16b14s16:~/i307-knob1/`, driver `~/i307-knob.sh`.
