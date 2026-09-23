@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kagenti/serverless-harness/remote-worker/internal/vmpool"
 )
@@ -24,11 +25,24 @@ type countingHooks struct {
 	maxSeen  int
 	restores atomic.Int64
 
-	// release gates every RestoreOne so the test controls overlap rather than racing
-	// it. Without it a fast fake could complete each restore before the next goroutine
-	// is scheduled, and maxSeen would read 1 on a CORRECT implementation -- a flaky
-	// test that fails for a reason the production code does not have.
-	release chan struct{}
+	// want is the concurrency the driver was asked for, and gate is a REAL BARRIER: it stays
+	// closed until that many restores are simultaneously in flight, so every arrival holds its
+	// peers until the peak has actually been reached.
+	//
+	// The previous version fed an unbuffered channel one token at a time, which did NOT deliver
+	// the property its comment claimed. A worker could increment inFlight, take its token and
+	// decrement again before any peer had incremented, so maxSeen was whatever the scheduler
+	// produced -- 2 or 3 against a requested 4. That passed 30/30 without -race and failed 16/30
+	// under it, which is the CI configuration ("Build and test remote-worker" runs go test -race).
+	//
+	// gateOnce is load-bearing. inFlight reaches want once per BATCH, not once per run: the
+	// semaphore admits `want` goroutines, they release together, and the next batch can reach it
+	// again. An unguarded close() therefore panics with "close of closed channel" -- reproduced
+	// at iterations=400, concurrency=4 under -race. Rarer than the flake it replaces and strictly
+	// worse, since a panic fails the whole package.
+	want     int
+	gate     chan struct{}
+	gateOnce sync.Once
 }
 
 func (h *countingHooks) RestoreOne(_ context.Context, key string) (vmpool.VM, error) {
@@ -37,13 +51,33 @@ func (h *countingHooks) RestoreOne(_ context.Context, key string) (vmpool.VM, er
 	if h.inFlight > h.maxSeen {
 		h.maxSeen = h.inFlight
 	}
+	reached := h.inFlight >= h.want
 	h.mu.Unlock()
 	h.restores.Add(1)
-	<-h.release
+	if reached {
+		h.gateOnce.Do(func() { close(h.gate) })
+	}
+	// Bounded rather than a bare receive. A serial implementation can never reach want, so the
+	// gate never opens and the honest outcome is a failure -- but hanging to the package timeout
+	// reports it as "panic: test timed out" with no mention of concurrency. Waiting a bounded
+	// time lets the assertion below name the actual defect, and it costs a failing run only.
+	select {
+	case <-h.gate:
+	case <-time.After(5 * time.Second):
+	}
 	h.mu.Lock()
 	h.inFlight--
 	h.mu.Unlock()
 	return &countingVM{key: key}, nil
+}
+
+// peak reports the high-water mark under the lock. wg.Wait() inside runReplenishMode already
+// happens-before this read -- the detector reports no race on it across 30 runs -- but taking the
+// lock keeps the invariant local to this type instead of resting on the caller's internals.
+func (h *countingHooks) peak() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.maxSeen
 }
 
 func (h *countingHooks) FillStandbys(context.Context, string, int) error { return nil }
@@ -64,14 +98,7 @@ func (v *countingVM) Run(context.Context, vmpool.Command, vmpool.Sink) (vmpool.R
 // per-restore latency reciprocal rather than a supply ceiling.
 func TestModeReplenishOverlapsRestoresAtTheRequestedConcurrency(t *testing.T) {
 	const iterations, concurrency = 12, 4
-	h := &countingHooks{release: make(chan struct{})}
-	// Let every restore through as it arrives; the barrier only stops a restore from
-	// finishing before its peers have been counted.
-	go func() {
-		for i := 0; i < iterations; i++ {
-			h.release <- struct{}{}
-		}
-	}()
+	h := &countingHooks{want: concurrency, gate: make(chan struct{})}
 
 	var res runResult
 	samples, err := runReplenishMode(h, "run-a", iterations, 0, concurrency, &res)
@@ -84,10 +111,14 @@ func TestModeReplenishOverlapsRestoresAtTheRequestedConcurrency(t *testing.T) {
 	if got := h.restores.Load(); got != int64(iterations) {
 		t.Fatalf("RestoreOne called %d times, want %d", got, iterations)
 	}
-	if h.maxSeen != concurrency {
-		t.Fatalf("peak concurrent RestoreOne = %d, want %d: --concurrency is being "+
-			"accepted and ignored, so a c=%d rung measures c=%d",
-			h.maxSeen, concurrency, concurrency, h.maxSeen)
+	// Equality is sound BECAUSE the gate is a barrier: it cannot open until `concurrency`
+	// restores are in flight, so a correct driver reaches exactly that peak and a serial one
+	// cannot reach it at all. Asserting it against whatever the scheduler happened to produce is
+	// what made this flaky; asserting >= 2 instead would pass a driver that overlaps two restores
+	// when asked for sixty-four.
+	if got := h.peak(); got != concurrency {
+		t.Fatalf("peak concurrent RestoreOne = %d, want %d: --concurrency is being accepted and "+
+			"ignored, so a c=%d rung measures c=%d", got, concurrency, concurrency, got)
 	}
 }
 

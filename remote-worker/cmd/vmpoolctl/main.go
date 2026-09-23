@@ -115,7 +115,10 @@ func realMain(args []string, stdout io.Writer) error {
 		deferReap = fs.Int("defer-reap-workers", 0,
 			"move the VM reap tail (cmd.Wait, jail unlink, cgroup release) off the execGate-held "+
 				"path onto this many background workers, releasing the gate at the descriptor barrier "+
-				"instead (#307). 0 keeps teardown synchronous, which is the arm to compare against")
+				"instead (#307). 0 keeps teardown synchronous, which is the arm to compare against. "+
+				"64 is the size to reach for: the pipeline turns over ~870 VMs/s at its peak and a "+
+				"reap is ~53 ms, so ~46 tails are in flight there, and they are blocking latency "+
+				"rather than CPU -- the kernel absorbs reaps concurrently (49/s at c=1 to 1131/s at c=64)")
 		timeoutS = fs.Uint("timeout-s", 30, "per-Exec timeout")
 		asJSON   = fs.Bool("json", false, "emit one runResult JSON record")
 		mode     = fs.String("mode", "exec",

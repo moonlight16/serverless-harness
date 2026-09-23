@@ -503,7 +503,7 @@ func (p *pool) destroy(key string, vm VM) {
 			// OLD ordering: finish the entire teardown here, synchronously, before returning --
 			// and returning is what opens the gate (see ExecPhased's defer order). Slower, and
 			// exactly as safe as before the deferral existed.
-			p.counters.destroyFailed()
+			p.counters.barrierUnobserved()
 			log.Printf("vmpool: barrier for %q: %v; reaping synchronously under the gate", key, err)
 			if rErr := dr.Reap(); rErr != nil {
 				p.counters.destroyFailed()

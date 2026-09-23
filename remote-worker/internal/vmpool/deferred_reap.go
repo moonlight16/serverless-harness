@@ -6,13 +6,6 @@ import (
 	"sync/atomic"
 )
 
-// DefaultDeferReapWorkers sizes the reaper when deferral is on but unsized. At the measured
-// peak the pipeline turns over ~870 VMs/s and a reap is ~53 ms, so ~46 are in flight at any
-// instant; 64 covers that with headroom and matches the slot count the peak runs at. Reaps
-// are pure blocking latency -- the kernel absorbs them concurrently, Destroy throughput going
-// 49/s at c=1 to 1131/s at c=64 -- so these goroutines cost almost no CPU.
-const DefaultDeferReapWorkers = 64
-
 // deferredReaper is implemented by a VM whose teardown splits at an OBSERVABLE barrier: a
 // point after which it can no longer touch the run's workspace, reached long before the
 // kernel has finished reclaiming it.

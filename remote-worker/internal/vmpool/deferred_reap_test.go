@@ -262,8 +262,19 @@ func TestAnUnobservableBarrierReapsSynchronouslyInsteadOfDeferring(t *testing.T)
 		t.Fatalf("reaps=%d immediately after Exec returned, want 1: a VM whose barrier could "+
 			"not be observed was deferred anyway, which opens the gate on an unchecked claim", reaps)
 	}
-	if got := p.Stats().DestroyFailures; got == 0 {
-		t.Fatal("DestroyFailures=0: an unobservable barrier must be visible in Stats, not silent")
+	// Counted as its OWN reason, not as a destroy failure. The destroy succeeded -- it just did
+	// not get to be deferred -- and DestroyFailures is exported in microvm-worker's diagnostics
+	// where the natural reading is "failures per VM, at most one". Folding the barrier into it
+	// double-counted a VM whose barrier was unreadable AND whose reap then failed, so a
+	// falling-back arm would over-report against the VM count, which is the exact ratio you would
+	// use to decide whether the fallback is firing.
+	st := p.Stats()
+	if st.BarrierUnobserved != 1 {
+		t.Fatalf("BarrierUnobserved=%d, want 1", st.BarrierUnobserved)
+	}
+	if st.DestroyFailures != 0 {
+		t.Fatalf("DestroyFailures=%d, want 0: the reap succeeded, only the barrier was "+
+			"unobservable, and conflating the two double-counts", st.DestroyFailures)
 	}
 }
 
