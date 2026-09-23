@@ -428,14 +428,20 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 	// phSpawn times cmd.Start() RETURNING, which is all it ever measured -- it used to be
 	// logged as jailer_us and read as the jailer's work (#328). The jailer's actual chroot
 	// construction happens after this and is now measured as jailersetup_us below.
-	phSpawn = time.Since(phaseStart) - phPrep - phWsImg
+	// ONE clock reading ends phSpawn and opens the boundary's window, so the two really do
+	// start at the same instant. Taking a second time.Now() below charged the gap between them
+	// -- two branches and a struct alloc -- to fcBind, because fcBind is computed as the
+	// remainder of phSock. Nanoseconds against a 1 ms poll quantum, so it changed no conclusion,
+	// but it made the claim below that the two halves partition phSock exactly untrue.
+	spawnEnd := time.Now()
+	phSpawn = spawnEnd.Sub(phaseStart) - phPrep - phWsImg
 
 	// The boundary observer is built only when diagnostics are on. Unlike the phase clocks --
 	// five time.Now() calls at ~100 ns against a restore measured in tens of milliseconds -- this
 	// one costs a procfs read per poll iteration, so the production path must not pay it.
 	var boundary *fcExecBoundary
 	if phaseLog != nil && cmd.Process != nil {
-		boundary = newFCExecBoundary(cmd.Process.Pid, l.opts.FirecrackerBin, time.Now())
+		boundary = newFCExecBoundary(cmd.Process.Pid, l.opts.FirecrackerBin, spawnEnd)
 	}
 	var observe func()
 	if boundary != nil {
@@ -461,14 +467,23 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 
 	if phaseLog != nil {
 		phLoad := time.Since(phaseStart) - phPrep - phWsImg - phSpawn - phSock
-		// jailerSetup is measured from the instant the sockwait window opened, so it and fcBind
-		// partition phSock exactly rather than approximately.
-		setup, seen := boundary.elapsed()
-		logRestorePhases(req.ID, restorePhases{
+		ph := restorePhases{
 			prep: phPrep, wsimg: phWsImg, spawn: phSpawn,
-			jailerSetup: setup, fcBind: phSock - setup, boundaryObserved: seen,
 			sock: phSock, load: phLoad, total: time.Since(phaseStart),
-		})
+		}
+		// The two halves are set ONLY when the boundary was observed, so the struct is correct
+		// where it is built rather than correct by a downstream override. With an unobserved
+		// boundary, fcBind would otherwise be computed as phSock - 0 -- the whole window,
+		// attributed to Firecracker -- and only logRestorePhases' -1 would stop it being logged.
+		// That override stays as defence in depth for any future caller, and is what
+		// TestRestorePhaseLineReportsAnUnobservedBoundaryAsMinusOne pins.
+		//
+		// jailerSetup is measured from spawnEnd, which is exactly where phSock's window opens,
+		// so these two partition phSock rather than approximately partitioning it.
+		if setup, seen := boundary.elapsed(); seen {
+			ph.jailerSetup, ph.fcBind, ph.boundaryObserved = setup, phSock-setup, true
+		}
+		logRestorePhases(req.ID, ph)
 	}
 	return &firecrackerVM{
 		id:            req.ID,

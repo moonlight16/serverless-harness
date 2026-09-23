@@ -272,8 +272,14 @@ Base's own curve reproduces #328's U-shape closely — 16.68 ms at one driver ag
 near c=8 and still rises toward idle, with the pool's curve simply shifted down. Whatever causes the
 rise at low load is not the chroot, and remains unexplained.
 
-**The split holds in-harness.** `jailer_setup` is **93.7%** of `sockwait`; `fc_bind`'s median is
-46 us. Firecracker is not the cost, measured now by the instrument rather than by strace.
+**The split holds in-harness.** `jailer_setup` is **93.7%** of `sockwait`. Firecracker is not the
+cost, measured now by the instrument rather than by strace.
+
+`fc_bind`'s median reads 46 us, and that figure is **censored, not a measurement of Firecracker**:
+both the flip and the bind are seen by one 1 ms-capped poll, so whenever they land in the same
+iteration `fc_bind` reads ~0 (limitation 2 below). Read it as "at or below the poll resolution",
+which is the direction that matters here, and quote the untraced 0.37 ms from §2 -- taken under a
+tight poll -- if a number for Firecracker's bind time is actually needed.
 
 **A bonus on the teardown side.** `removeall_us` — which now measures the release rather than an
 `os.RemoveAll` — falls from 996 us to 308 us, −69%, while `wait_us` is unchanged at +0.7%. Not
