@@ -107,8 +107,14 @@ below 745.7 GiB in any arm.
 
 That is far below the per-VM accounting. `PerVMBytes` is 288 MiB (256 guest + 32 overhead), so 64
 concurrent VMs should cost ~18 GiB and the admission budget for these runs was set to 480 GiB. But
-guest memory is a `MAP_SHARED` mapping of one snapshot memory file which the **worker** pins once via
-`PinMemoryFile`, so VMs share a single copy. Sampling 306 per-VM cgroups found `memory.current` at
+the sharing is copy-on-write over one page-cache-resident file: the **worker** maps the snapshot's
+memory file `MAP_SHARED` and mlocks it once via `PinMemoryFile`, and **each VMM then maps that same
+file `MAP_PRIVATE`**, so 64 VMs read one physical copy and are charged only for the pages they dirty.
+(An earlier version of this note said guest memory was itself `MAP_SHARED`, conflating the worker's
+pin with the VMMs' mappings. Measured on 2026-09-23, `/proc/<pid>/maps` reads `256MiB rw-p …/memfile`
+— private — with `Rss` 31 MiB and `Private_Dirty` 5.7 MiB of the 256 MiB region, and THP `madvise`
+with `AnonHugePages: 0`, so these are 4 KiB PTEs. The density conclusion is unchanged; only the
+mechanism was described wrongly. See #307.) Sampling 306 per-VM cgroups found `memory.current` at
 0.9 MiB mean and 2 MiB max, `memory.events` all zero, and nothing within 8 MiB of the 288 MiB limit.
 
 So `SH_MAX_COMMITTED_MB` is worst-case **commitment** accounting — what it would cost if every VM
