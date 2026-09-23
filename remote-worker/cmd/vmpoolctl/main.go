@@ -33,7 +33,12 @@ type runResult struct {
 	Concurrency int    `json:"concurrency"`
 	// DeferReapWorkers records WHICH ARM this rung ran, because the deferred reap (#307)
 	// is an A/B on one binary. 0 is the synchronous teardown.
-	DeferReapWorkers int `json:"defer_reap_workers"`
+	// ReapsInline counts deferred reaps that ran on the caller's goroutine because the
+	// reaper was saturated, i.e. teardowns that paid the synchronous cost anyway. Nonzero
+	// means the arm was only PARTLY applied, which is the first thing to check when a
+	// deferral rung measures flat.
+	ReapsInline      uint64 `json:"reaps_inline"`
+	DeferReapWorkers int    `json:"defer_reap_workers"`
 	// Keys is recorded because on the Firecracker arm it, not Concurrency, bounds how
 	// many VMs were ever alive at once (SerializesExecsPerRun). A record carrying
 	// concurrency without keys is the one that cannot be read back correctly -- #307's
@@ -347,6 +352,7 @@ func realMain(args []string, stdout io.Writer) error {
 
 	st := pool.Stats()
 	res.WarmAcquires = st.WarmAcquires
+	res.ReapsInline = st.ReapsInline
 	res.ColdAcquires = map[string]uint64{}
 	for k, v := range st.ColdAcquires {
 		res.ColdAcquires[string(k)] = v

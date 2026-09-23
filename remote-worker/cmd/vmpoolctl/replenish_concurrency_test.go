@@ -144,5 +144,11 @@ func TestTheRecordCarriesWhetherTheReapWasDeferred(t *testing.T) {
 			t.Fatalf("DeferReapWorkers=%d, want %d: the arm is not in the record",
 				rec.DeferReapWorkers, workers)
 		}
+		// A saturated reaper means the arm was only partly applied -- reaps that ran inline paid
+		// the synchronous cost anyway -- and it is the first thing to check when a deferral arm
+		// measures flat. It has to be readable from the record, not inferred.
+		if !strings.Contains(out, `"reaps_inline"`) {
+			t.Fatalf("record has no reaps_inline: a saturated reaper would be invisible\n%s", out)
+		}
 	}
 }
