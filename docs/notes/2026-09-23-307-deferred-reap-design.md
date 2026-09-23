@@ -349,3 +349,59 @@ Behind an env flag so the arm is an A/B on one binary, not a branch comparison �
   instrument, one short run.)
 - `mkfs.ext4 -F` leaves `lazy_itable_init` at its default. Worth confirming whether the guest runs
   `ext4lazyinit` at all, since it is the only spontaneous post-`sync` writer identified.
+
+## Addendum: a conservation argument, and a cheaper gate to clear first
+
+Written after the sections above, on reading `replenish.go` and the recorded slot ceiling. It
+sharpens the value objection from "weaker than stated" to "there is a second gate, and it is
+cheaper to test than to build".
+
+**Exec/s and restores/s are the same number.** Every Exec destroys its VM (`defer destroy()`, no
+exceptions) and every VM serves exactly one Exec (standbys restore unmounted, `Resume` mounts,
+`Destroy` follows). At steady state the pool cannot consume VMs faster than it produces them, so
+**throughput is bounded by the aggregate restore rate, identically.**
+
+The deferred reap does not touch the restore path. And it does not even let replenishment start
+sooner, because `pool.destroy` already calls `scheduleReplenishLocked` _before_ `vm.Destroy()` —
+the refill is armed while the old VMM is still being reaped, today. **The change is purely
+demand-side.**
+
+This also puts the proposal's ~870 Exec/s CPU-headroom estimate on ground the campaign has already
+cleared twice. From the recorded ceiling: "CPU is NOT the bound — 66-70% across a 4x slot range
+while throughput falls. ~34% of the host is idle and unreachable by more slots. The ~800 Exec/s
+extrapolation is dead... The CPU-efficiency arithmetic is fine; the assumption that slots can spend
+the headroom is what fails." The deferral is a different mechanism from adding slots, but it spends
+the headroom the same way — by asking for VMs faster.
+
+### What the replenish path can actually supply
+
+No global concurrency cap exists: `scheduleReplenishLocked` arms a timer per run and each
+`replenishOne` runs on its own goroutine. But it is **sequential per run** — deliberately, "one
+timer per slot rather than a burst, so a finished Exec does not create D VMs in the same instant" —
+so a single run supplies at most `1 / (restore + ReplenishDelay)`, on the order of 40 VM/s at a
+~25 ms restore.
+
+With one key per slot that is ~2560 VM/s of nominal supply at 64 slots against 577/s of demand, and
+the low cold rate (0.142) agrees that per-run supply is not the limit. So the ceiling is
+**aggregate restore throughput under concurrency** — contention in the shared restore path, which
+is 82–85% jailer chroot construction. The 128-slot rung delivering only 524/s while demanding more
+is evidence that aggregate ceiling is near 577/s; but that rung also changed concurrency, standby
+commitment and queue depth at the same time, so it is confounded and not decisive.
+
+### The cheaper experiment, to run BEFORE implementing
+
+**Measure the aggregate restore ceiling with no Execs at all, at fixed concurrency.** `vmpoolctl
+--mode=replenish` cannot answer it: `runReplenishMode` is a serial `for` loop over
+`RestoreOne`/`Destroy`, so it measures restore _latency_, not supply _rate_.
+
+A restore-only probe at c=64 across N keys, reporting VM/s, decides the whole question:
+
+- **ceiling ≲650 VM/s** — the deferred reap cannot raise throughput, by conservation. Record it as a
+  rejection without writing the reaper, and the 1.4x expectation is retired along with it. This is
+  the outcome the campaign data points at.
+- **ceiling ≥1200 VM/s** — supply has room, the demand-side lever is live, and the 1.4x is back on
+  the table. Then implement.
+
+This is strictly cheaper than building the reaper and discovering the same thing from a null
+throughput result, and it cannot be confounded by the change under test because the change is not
+in it.
