@@ -27,6 +27,21 @@ func (s *capturingSink) out() string     { s.mu.Lock(); defer s.mu.Unlock(); ret
 func testPool(t *testing.T) (Pool, *fakeLauncher, *fakeClock) {
 	t.Helper()
 	lc := newFakeLauncher()
+	p, clk := testPoolWith(t, lc)
+	return p, lc, clk
+}
+
+// testPoolWith is testPool for a test that needs its own Launcher implementation.
+//
+// It exists so the launcher goes in through New rather than being assigned afterwards.
+// New starts `go p.reclaimLoop()` before it returns, and p.lc is read from warm, which
+// that goroutine can reach — so `p.(*pool).lc = lc` after construction is an
+// unsynchronized write to a field a live goroutine may read. It happens to stay green
+// under -race today only because this helper leaves StandbyPerKey unset, so the reclaim
+// path never reaches warm; that makes it a tripwire armed for whoever gives this helper a
+// standby count, and it would surface as a flake somewhere else entirely.
+func testPoolWith(t *testing.T, lc Launcher) (Pool, *fakeClock) {
+	t.Helper()
 	clk := newFakeClock()
 	cfg := Config{
 		VMM:               lc.Kind(),
@@ -40,7 +55,7 @@ func testPool(t *testing.T) (Pool, *fakeLauncher, *fakeClock) {
 		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = p.Close() })
-	return p, lc, clk
+	return p, clk
 }
 
 func TestExecRunsOneCommandInAVMAndDestroysIt(t *testing.T) {

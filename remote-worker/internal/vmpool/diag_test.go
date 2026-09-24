@@ -128,15 +128,15 @@ func (v *phasingVM) ResumePhases() (vmResume, vsockDial, mount time.Duration) {
 // separates those two cases -- the fake clock cannot advance a real duration, so the
 // launcher hands back fixed ones.
 func TestExecPhasedReportsResumeSubPhases(t *testing.T) {
-	p, lc, _ := testPool(t)
 	pl := &phasingLauncher{
-		fakeLauncher: lc,
+		fakeLauncher: newFakeLauncher(),
 		vmResume:     300 * time.Microsecond,
 		vsockDial:    2 * time.Millisecond,
 		mount:        20 * time.Millisecond,
 	}
-	// testPool already built the pool around lc, so swap the launcher the pool holds.
-	p.(*pool).lc = pl
+	// Through New, not assigned afterwards -- see testPoolWith on why that would be a
+	// data race against the reclaim goroutine.
+	p, _ := testPoolWith(t, pl)
 
 	var ph Phases
 	if _, err := p.ExecPhased(context.Background(), "k1", Exec{

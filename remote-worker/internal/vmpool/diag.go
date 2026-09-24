@@ -43,8 +43,18 @@ func logPhases(ph *Phases) {
 // launcher that does not implement this reports zeros, which read as "not decomposed"
 // rather than as "measured zero" because resume_us stays populated beside them.
 //
+// ONE EXCEPTION to reading zeros that way, and it is on the failure path ExecPhased
+// deliberately reads (pool.go): a Resume that fails part-way stashes zeros for the steps
+// it never entered, so e.g. a failed fc.Resume reports a populated vmresume_us with
+// vsockdial_us and mount_us at zero -- the same shape as a launcher that decomposes only
+// the first step. The zeros are truthful (those steps did not happen), and the two cases
+// are told apart by the Exec having errored at all, not by the phase line. No ladder row
+// is produced from a failed Exec, so this misleads nothing that aggregates a run.
+//
 // The three values are the LAST Resume's, stashed by it rather than returned, and are
-// read on the same goroutine immediately after Resume returns.
+// read on the same goroutine immediately after Resume returns. A failed Resume therefore
+// overwrites the previous successful one's values, which is intended: they describe an
+// attempt, not a VM.
 type resumePhaser interface {
 	ResumePhases() (vmResume, vsockDial, mount time.Duration)
 }

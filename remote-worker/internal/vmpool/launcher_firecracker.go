@@ -831,10 +831,14 @@ func (v *firecrackerVM) Resume(ctx context.Context) error {
 	// these steps is when knowing which one matters most -- so each assignment happens
 	// before the error check, and stashPhases runs via defer.
 	var phVMResume, phVsockDial, phMount time.Duration
-	phaseStart := time.Now()
 	defer func() { v.stashResumePhases(phVMResume, phVsockDial, phMount) }()
 
 	fc := newFCClient(v.apiSockHost)
+	// The clock starts BELOW newFCClient so phVMResume is the PATCH alone, which is what
+	// Phases.VMResume documents it as. newFCClient only allocates (fcapi.go) so this is a
+	// sub-microsecond correction against a 361 us measurement, but the stamp should mean
+	// what its comment says.
+	phaseStart := time.Now()
 	resumeErr := fc.Resume(ctx)
 	phVMResume = time.Since(phaseStart)
 	if resumeErr != nil {
