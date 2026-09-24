@@ -116,6 +116,9 @@ type pool struct {
 	ticker      Timer
 	reclaimQ    chan reclaimBatch
 	reclaimDone sync.WaitGroup
+	// reaper is nil unless Config.DeferReapWorkers > 0. When set, destroy hands each VM's
+	// reap tail to it after the barrier instead of running it under execGate (#307).
+	reaper *reaper
 
 	// inFlightWarms counts background replenishment warms that have been admitted but
 	// not yet settled, so Close can wait for them. Not guarded by mu: it is a
@@ -162,6 +165,9 @@ func New(cfg Config, lc Launcher, clk Clock) (Pool, error) {
 		clk = RealClock()
 	}
 	p := &pool{cfg: cfg, lc: lc, clk: clk, serialize: lc.SerializesExecsPerRun(), runs: map[string]*runPool{}, counters: newCounters()}
+	// nil unless DeferReapWorkers > 0, and nil is the whole "off" implementation: destroy
+	// below checks it, and reaper's methods are nil-safe.
+	p.reaper = newReaper(cfg.DeferReapWorkers)
 	// Sized so a full host's worth of sweeps queues rather than blocking; a full
 	// queue falls back to an inline destroy (see sweep).
 	p.reclaimQ = make(chan reclaimBatch, 64)
@@ -480,6 +486,34 @@ func (p *pool) destroy(key string, vm VM) {
 		p.scheduleReplenishLocked(rp)
 	}
 	p.mu.Unlock()
+	// The deferred path (#307). ExecPhased registers this before the gate-release defer, so
+	// returning here IS the gate opening -- which is why only the barrier needs to have
+	// happened first, and the reap tail can finish on a background worker. Measured: the
+	// barrier is 1.41 ms median at c=64 against a 52.88 ms reap, and 96% of that reap runs
+	// after the VMM has closed every descriptor, so it cannot touch workspace.img during it.
+	//
+	// The budget is already released above, BEFORE any teardown, exactly as it was -- so
+	// deferring the tail does not widen the accounting window by a byte. It does not widen it
+	// physically either: exit_mm completes before kvm_vm_release, so the guest RAM is returned
+	// during the expensive part.
+	if dr, ok := vm.(deferredReaper); ok && p.reaper != nil {
+		if err := dr.KillAndBarrier(); err != nil {
+			// THE BARRIER IS THE WHOLE LICENCE. Deferring without it would open the gate on
+			// an argument this code cannot check, so an unobservable barrier falls back to the
+			// OLD ordering: finish the entire teardown here, synchronously, before returning --
+			// and returning is what opens the gate (see ExecPhased's defer order). Slower, and
+			// exactly as safe as before the deferral existed.
+			p.counters.barrierUnobserved()
+			log.Printf("vmpool: barrier for %q: %v; reaping synchronously under the gate", key, err)
+			if rErr := dr.Reap(); rErr != nil {
+				p.counters.destroyFailed()
+				log.Printf("vmpool: destroy VM for %q: %v", key, rErr)
+			}
+			return
+		}
+		p.reaper.submit(dr)
+		return
+	}
 	if err := vm.Destroy(); err != nil {
 		p.counters.destroyFailed()
 		log.Printf("vmpool: destroy VM for %q: %v", key, err)
@@ -594,6 +628,9 @@ func (p *pool) Stats() Stats {
 	s.CommittedBytes = p.committedLocked()
 	p.mu.Unlock()
 	p.counters.snapshot(&s)
+	// Read off the reaper rather than the counters: it owns the number, and a nil reaper
+	// (deferral off) reports 0 without a branch here.
+	s.ReapsInline = p.reaper.inlineCount()
 	return s
 }
 
@@ -669,5 +706,10 @@ func (p *pool) Close() error {
 	// cold warm.
 	close(p.reclaimQ)
 	p.reclaimDone.Wait()
+	// Deferred reaps last, after the victims above have been destroyed synchronously: this
+	// drains every tail still in flight. Without it Close returns with jail directories
+	// unlinked by nobody and cgroups never returned to the pool -- #255's accumulation by
+	// another route, collectable only by the NEXT process's startup sweep.
+	p.reaper.close()
 	return firstErr
 }

@@ -21,6 +21,18 @@ type Stats struct {
 	Replenishments    uint64
 	ReplenishFailures uint64
 	DestroyFailures   uint64
+	// ReapsInline counts deferred reaps that ran on the caller's goroutine because the
+	// reaper's queue was full -- i.e. teardowns that paid today's synchronous cost anyway.
+	// Nonzero means the reaper is saturated, which is the first thing to check when a
+	// deferral arm measures flat: the arm was partly not applied.
+	ReapsInline uint64
+	// BarrierUnobserved counts teardowns whose descriptor barrier could not be read, each of
+	// which fell back to reaping synchronously under execGate. A SEPARATE reason from
+	// ReapsInline, and separate from DestroyFailures: the destroy succeeded, it just did not
+	// get to be deferred. Folding it into DestroyFailures made one VM contribute twice when
+	// its barrier was unreadable AND its reap then failed, which over-reports against the VM
+	// count -- the ratio you would use to decide whether the fallback is firing.
+	BarrierUnobserved uint64
 	// TimeoutsClamped counts Execs whose timeout_s this package had to bound
 	// (clampTimeoutS): absent/zero, or above MaxExecTimeoutS. A nonzero and growing
 	// figure is a caller-side fact, not a pool fault — most likely a relay that omits
@@ -38,6 +50,7 @@ type counters struct {
 	replenishments    uint64
 	replenishFailures uint64
 	destroyFailures   uint64
+	barrierUnobs      uint64
 	timeoutsClamped   uint64
 }
 
@@ -57,6 +70,8 @@ func (c *counters) replenishFailed() { c.mu.Lock(); c.replenishFailures++; c.mu.
 
 func (c *counters) destroyFailed() { c.mu.Lock(); c.destroyFailures++; c.mu.Unlock() }
 
+func (c *counters) barrierUnobserved() { c.mu.Lock(); c.barrierUnobs++; c.mu.Unlock() }
+
 func (c *counters) timeoutClamped() { c.mu.Lock(); c.timeoutsClamped++; c.mu.Unlock() }
 
 func (c *counters) snapshot(into *Stats) {
@@ -66,6 +81,7 @@ func (c *counters) snapshot(into *Stats) {
 	into.Replenishments = c.replenishments
 	into.ReplenishFailures = c.replenishFailures
 	into.DestroyFailures = c.destroyFailures
+	into.BarrierUnobserved = c.barrierUnobs
 	into.TimeoutsClamped = c.timeoutsClamped
 	into.ColdAcquires = make(map[ColdCause]uint64, len(c.cold))
 	for k, v := range c.cold {

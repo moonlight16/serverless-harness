@@ -437,7 +437,12 @@ type diagStats struct {
 	Replenishments    uint64            `json:"replenishments"`
 	ReplenishFailures uint64            `json:"replenishFailures"`
 	DestroyFailures   uint64            `json:"destroyFailures"`
-	TimeoutsClamped   uint64            `json:"timeoutsClamped"`
+	// Both "the deferral did not apply" reasons, each with its own number: a saturated reaper
+	// and an unreadable barrier are different problems and the first thing to check when a
+	// deferral arm measures flat.
+	ReapsInline       uint64 `json:"reapsInline"`
+	BarrierUnobserved uint64 `json:"barrierUnobserved"`
+	TimeoutsClamped   uint64 `json:"timeoutsClamped"`
 }
 
 func toDiagStats(st vmpool.Stats, maxConcurrent int) diagStats {
@@ -455,6 +460,8 @@ func toDiagStats(st vmpool.Stats, maxConcurrent int) diagStats {
 		Replenishments:       st.Replenishments,
 		ReplenishFailures:    st.ReplenishFailures,
 		DestroyFailures:      st.DestroyFailures,
+		ReapsInline:          st.ReapsInline,
+		BarrierUnobserved:    st.BarrierUnobserved,
 		TimeoutsClamped:      st.TimeoutsClamped,
 	}
 	for k, v := range st.ColdAcquires {

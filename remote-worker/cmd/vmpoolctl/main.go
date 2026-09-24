@@ -31,6 +31,17 @@ type runResult struct {
 	Mode        string `json:"mode"`
 	Iterations  int    `json:"iterations"`
 	Concurrency int    `json:"concurrency"`
+	// DeferReapWorkers records WHICH ARM this rung ran, because the deferred reap (#307)
+	// is an A/B on one binary. 0 is the synchronous teardown.
+	// ReapsInline counts deferred reaps that ran on the caller's goroutine because the
+	// reaper was saturated, i.e. teardowns that paid the synchronous cost anyway. Nonzero
+	// means the arm was only PARTLY applied, which is the first thing to check when a
+	// deferral rung measures flat.
+	ReapsInline      uint64 `json:"reaps_inline"`
+	DeferReapWorkers int    `json:"defer_reap_workers"`
+	// ReplenishDelayMs is recorded for the same reason: it is the grace before a popped slot
+	// is refilled, and at 64 slots the 200 ms default is longer than a slot's whole cycle.
+	ReplenishDelayMs int `json:"replenish_delay_ms"`
 	// Keys is recorded because on the Firecracker arm it, not Concurrency, bounds how
 	// many VMs were ever alive at once (SerializesExecsPerRun). A record carrying
 	// concurrency without keys is the one that cannot be read back correctly -- #307's
@@ -98,6 +109,16 @@ func realMain(args []string, stdout io.Writer) error {
 				"reports SerializesExecsPerRun, so a run's execGate admits one Exec at a time "+
 				"and --concurrency alone only queues goroutines at that gate. --keys=1 "+
 				"(the default) reproduces the historical single-key behaviour")
+		replenishMs = fs.Int("replenish-delay-ms", int(vmpool.DefaultReplenishDelay/time.Millisecond),
+			"grace before refilling a popped standby slot. The 200ms default exceeds a slot's whole "+
+				"cycle at 64 slots, so replenishment starts after the slot has already gone cold (#307)")
+		deferReap = fs.Int("defer-reap-workers", 0,
+			"move the VM reap tail (cmd.Wait, jail unlink, cgroup release) off the execGate-held "+
+				"path onto this many background workers, releasing the gate at the descriptor barrier "+
+				"instead (#307). 0 keeps teardown synchronous, which is the arm to compare against. "+
+				"64 is the size to reach for: the pipeline turns over ~870 VMs/s at its peak and a "+
+				"reap is ~53 ms, so ~46 tails are in flight there, and they are blocking latency "+
+				"rather than CPU -- the kernel absorbs reaps concurrently (49/s at c=1 to 1131/s at c=64)")
 		timeoutS = fs.Uint("timeout-s", 30, "per-Exec timeout")
 		asJSON   = fs.Bool("json", false, "emit one runResult JSON record")
 		mode     = fs.String("mode", "exec",
@@ -159,6 +180,23 @@ func realMain(args []string, stdout io.Writer) error {
 		return fmt.Errorf("--concurrency=%d needs --keys>=%d on the firecracker arm: it "+
 			"SerializesExecsPerRun, so %d key(s) admit at most %d Exec(s) at a time and the rest "+
 			"would queue, recording a concurrency this run never reached", *concurrency, *concurrency, *keys, *keys)
+	}
+	// A mode that ignores --concurrency must REFUSE it, never run at c=1 under a c=N
+	// label. Before this, every mode except exec accepted the flag, echoed "conc=4" into
+	// its own record, and ran a serial loop -- so a teardown or replenishment rung swept
+	// across concurrency produced a table whose columns differed by nothing at all. That
+	// is not hypothetical: #307's "flat across c=8/c=16" finding was published from the
+	// same defect one layer over, where a single shared execGate rather than a serial loop
+	// did the flattening. Same posture as the mode dispatcher's default case below: make
+	// two lists that must agree disagree LOUDLY.
+	switch *mode {
+	case "exec", "replenish": // these honour it; every other mode is serial by construction
+	default:
+		if *concurrency > 1 {
+			return fmt.Errorf("--mode=%s runs serially and ignores --concurrency=%d: it would "+
+				"report a c=%d rung measured at c=1. Use --mode=exec or --mode=replenish to "+
+				"sweep concurrency", *mode, *concurrency, *concurrency)
+		}
 	}
 	// Spec §7.5: "The first restore differs from the hundredth (page cache, THP,
 	// fragmentation). Discard warmup, report steady state." -1 is the "unset"
@@ -232,6 +270,8 @@ func realMain(args []string, stdout io.Writer) error {
 		GuestRAMBytes:     *guestMB << 20,
 		MaxRuns:           *maxRuns,
 		MaxCommittedBytes: *committedMB << 20,
+		DeferReapWorkers:  *deferReap,
+		ReplenishDelay:    time.Duration(*replenishMs) * time.Millisecond,
 	}
 	pool, err := vmpool.New(cfg, lc, vmpool.RealClock())
 	if err != nil {
@@ -259,8 +299,10 @@ func realMain(args []string, stdout io.Writer) error {
 		VMM: *vmm, Host: host, Key: *key, Command: command, Mode: *mode,
 		Iterations: *iterations, Concurrency: *concurrency, Keys: keysUsed(*mode, *keys),
 		StandbyDepth: cfg.StandbyDepth, GuestRAMMB: *guestMB,
-		Substrate: *substrate,
-		Limits:    gatherLimits(),
+		Substrate:        *substrate,
+		Limits:           gatherLimits(),
+		DeferReapWorkers: *deferReap,
+		ReplenishDelayMs: *replenishMs,
 	}
 
 	// --pin-memfile: mlock the snapshot's memory file so restores across VMs share
@@ -288,7 +330,7 @@ func realMain(args []string, stdout io.Writer) error {
 	case "exec":
 		samples, firstErr = runExecMode(pool, *key, command, []byte(*stdin), *timeoutS, *iterations, warmupN, *concurrency, *keys, &res)
 	case "replenish":
-		samples, firstErr = runReplenishMode(hooks, *key, *iterations, warmupN, &res)
+		samples, firstErr = runReplenishMode(hooks, *key, *iterations, warmupN, *concurrency, &res)
 	case "teardown-inflight", "teardown-standby":
 		samples, firstErr = runTeardownPerVMMode(hooks, *mode, *key, *wsRoot, *iterations, warmupN, &res)
 	case "teardown-bulk":
@@ -321,6 +363,7 @@ func realMain(args []string, stdout io.Writer) error {
 
 	st := pool.Stats()
 	res.WarmAcquires = st.WarmAcquires
+	res.ReapsInline = st.ReapsInline
 	res.ColdAcquires = map[string]uint64{}
 	for k, v := range st.ColdAcquires {
 		res.ColdAcquires[string(k)] = v
@@ -443,7 +486,7 @@ func runExecMode(pool vmpool.Pool, key, command string, stdin []byte, timeoutS u
 // job). No command ever runs, so run/resume/destroy all stay at their zero value on
 // every sample: reporting a run figure here would invite reading this rung as a hot
 // path rung.
-func runReplenishMode(hooks vmpool.BenchmarkHooks, key string, iterations, warmupN int, res *runResult) ([]sample, error) {
+func runReplenishMode(hooks vmpool.BenchmarkHooks, key string, iterations, warmupN, concurrency int, res *runResult) ([]sample, error) {
 	for i := 0; i < warmupN; i++ {
 		if vm, err := hooks.RestoreOne(context.Background(), key); err == nil {
 			_ = vm.Destroy()
@@ -453,22 +496,44 @@ func runReplenishMode(hooks vmpool.BenchmarkHooks, key string, iterations, warmu
 	measured := iterations - warmupN
 	samples := make([]sample, measured)
 	var firstErr error
+	var mu sync.Mutex
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
 	start := time.Now()
 	for i := 0; i < measured; i++ {
-		t0 := time.Now()
-		vm, err := hooks.RestoreOne(context.Background(), key)
-		d := time.Since(t0)
-		samples[i].acquire = d
-		samples[i].total = d
-		if err != nil {
-			res.Failures++
-			if firstErr == nil {
-				firstErr = err
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			t0 := time.Now()
+			vm, err := hooks.RestoreOne(context.Background(), key)
+			d := time.Since(t0)
+			mu.Lock()
+			samples[i].acquire = d
+			samples[i].total = d
+			if err != nil {
+				res.Failures++
+				if firstErr == nil {
+					firstErr = err
+				}
 			}
-			continue
-		}
-		_ = vm.Destroy()
+			mu.Unlock()
+			if err != nil {
+				return
+			}
+			// Destroyed inside the goroutine but AFTER the sample is stamped, so it stays
+			// out of the per-restore timing exactly as it did when this loop was serial.
+			// It is inside the WALL window on purpose: at concurrency > 1 a real host is
+			// restoring and reaping at the same time, so wall_ms/measured is the sustained
+			// rate the pipeline can hold rather than a reciprocal of restore latency. That
+			// is the quantity #307's deferred-reap question needs, and it makes this an
+			// UPPER BOUND on Exec/s: every Exec must do at least this restore and this
+			// destroy, plus a Resume and a Run this mode never issues.
+			_ = vm.Destroy()
+		}(i)
 	}
+	wg.Wait()
 	res.WallMs = time.Since(start).Milliseconds()
 	return samples, firstErr
 }

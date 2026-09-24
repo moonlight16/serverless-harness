@@ -52,9 +52,14 @@ type Config struct {
 	SnapshotDir   string  // golden snapshots; vmtouch -dl'd at start
 	WorkspaceRoot string  // per-run workspaces
 
-	StandbyDepth  int   // D
-	GuestRAMBytes int64 // the dominant density term (spec §7.3)
-	MaxRuns       int   // concurrent workspace_keys; BACKSTOP only, see below
+	StandbyDepth int // D
+	// DeferReapWorkers > 0 moves the reap tail (cmd.Wait, jail unlink, cgroup release) off
+	// the execGate-held path onto that many background workers, releasing the gate at the
+	// observable barrier instead -- see deferredReaper. 0 keeps teardown fully synchronous.
+	// A knob rather than a build-time choice so an arm is an A/B on ONE binary.
+	DeferReapWorkers int
+	GuestRAMBytes    int64 // the dominant density term (spec §7.3)
+	MaxRuns          int   // concurrent workspace_keys; BACKSTOP only, see below
 
 	// MaxCommittedBytes and MemoryReserveBytes gate admission on a computable
 	// budget. MaxRuns alone cannot: CoW growth is workload-dependent (spec §6).
