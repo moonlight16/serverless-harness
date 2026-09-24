@@ -171,3 +171,46 @@ func TestResumeSubPhasesAreZeroWithoutTheSeam(t *testing.T) {
 			ph.VMResume, ph.VsockDial, ph.Mount)
 	}
 }
+
+// TestPhaseLineReportsResumeSubPhasesByValue pins the ORDER of the three sub-phases in the
+// phase line, which is the last place they are copied positionally with nothing checking
+// the slots.
+//
+// TestRunnerEmitsEveryPhase covers the field NAMES, and for acquire/resume/run/destroy that
+// is the most it can: the fake clock does not advance, so those are legitimately 0. The
+// sub-phases are different -- they are not clock-derived, they come from ResumePhases() --
+// so a fake can return fixed values and the line can be checked against them. Without this,
+// transposing ph.VsockDial and ph.Mount in logPhases prints
+// `vsockdial_us=20000 mount_us=2000`, relabelling 78-81% of the phase as the dial, and both
+// packages stay green.
+//
+// It goes through Runner.Run, not ExecPhased: logPhases is called from the Runner
+// (runner.go), so an ExecPhased call emits no line at all and there would be nothing to
+// assert against.
+func TestPhaseLineReportsResumeSubPhasesByValue(t *testing.T) {
+	lines := capturePhaseLog(t)
+
+	pl := &phasingLauncher{
+		fakeLauncher: newFakeLauncher(),
+		vmResume:     300 * time.Microsecond,
+		vsockDial:    2 * time.Millisecond,
+		mount:        20 * time.Millisecond,
+	}
+	p, _ := testPoolWith(t, pl)
+	r := Runner{Pool: p}
+	if _, err := r.Run(context.Background(), wexec.Spec{
+		ReqID: 1, WorkspaceKey: "k1", Command: "true", TimeoutS: 5,
+	}, newFrameSink()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(*lines) != 1 {
+		t.Fatalf("want exactly one phase line, got %d: %v", len(*lines), *lines)
+	}
+	got := (*lines)[0]
+	// Distinct values, so a transposition fails rather than merely printing three keys.
+	for _, want := range []string{"vmresume_us=300", "vsockdial_us=2000", "mount_us=20000"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("phase line missing %q -- the sub-phases are mislabelled or dropped: %s", want, got)
+		}
+	}
+}

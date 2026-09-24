@@ -22,7 +22,12 @@ missing phase rather than as an error.
 run had been spent. At c=1 over 24 iterations the three sub-phases sum to 22891 µs against a
 `resume_us` of 22916 µs — a **+0.11% residual**, which is `checkNotDestroyed` plus the error
 checks. (The p95 residual is −2.2% and is not an error: p95-of-a-sum is not the sum-of-p95s,
-because each sub-phase's p95 comes from a different iteration. The p50 identity is the check.)
+because each sub-phase's p95 comes from a different iteration.) **The p50 identity is the check
+at c=1 only.** On the concurrent ladder below, p50 is non-additive for the same reason p95 is —
+each sub-phase's median comes from a different Exec — and the residual grows with concurrency:
+0.53% at 8 slots, 0.78% at 16, 1.76% at 32, 2.68% at 64. That is percentile arithmetic, not
+un-instrumented code, and no residual of that size touches the finding that `mount` dominates
+at 77.7–80.5%.
 
 ## The breakdown
 
@@ -62,8 +67,9 @@ Three immediate readings:
 - **`Resume` is BIGGER than the campaign table says.** The task brief put it at ~23 ms of a
   ~102 ms Exec at 64 slots; it is **35.5 ms of 82.2 ms (43.3%)** there. The ~23 ms figure is
   the ≤8-slot value. The on-disk record it was drawn from (`i307-e2e1/s64-rep1-on.json`)
-  reads `p50_resume_us=34287`, which agrees with this measurement, so the brief's table — not
-  this run — is the thing that was off.
+  reads `p50_resume_us=34287` — within 3.7% of this run's 35545, and nowhere near the brief's
+  ~23 ms — so the brief's table, not this run, is the thing that was off. The gap between the
+  two measurements is an order of magnitude smaller than the error being corrected.
 
 ## `run_us` is a free control, and it is what makes `mount_us` interpretable
 
@@ -73,16 +79,17 @@ trip, against which `mount_us` can be read.
 
 At 8 slots, reading the ladder table above: `run_us` = 2762 µs covers a dial, a round trip, the
 command and its `sync`, versus `mount_us` = 19225 µs for a round trip carrying only the mount.
-**The mount command's own execution is ~16.5 ms** (19225 − 2762 = 16463 µs), i.e. about 7x a
-comparable complete round trip. The arms table's arm A reads 2756 and 19261 for the same two
-terms, a 0.2% difference that changes nothing here.
+**The mount command's own execution is ~16.5 ms** (19225 − 2762 = 16463 µs), i.e. about 6x a
+comparable complete round trip (16463 / 2762 = 5.96). The un-subtracted ratio, 19225 / 2762, is
+7.0x; 6x is the one that follows from the subtraction this sentence just did. The arms table's
+arm A reads 2756 and 19261 for the same two terms, a 0.2% difference that changes nothing here.
 
 One consequence is worth stating separately: **`vsockdial_us` (4159 µs at 8 slots) is larger
 than Run's entire dial + round trip + `sync` (2762 µs).** Both are the ladder's 8-slot row; the
 arms sweep reads 4196 and 2756 and the inequality is the same either way. Resume's dial is
 therefore not measuring dial mechanics — it is measuring how long the just-unpaused guest takes to become able to answer a
-`CONNECT`. `PATCH /vm` returns in 368 µs; the guest kernel and agent then have to be
-scheduled, and that wait lands in `vsockdial_us`.
+`CONNECT`. `PATCH /vm` returns in 361 µs at that same 8-slot rung; the guest kernel and agent
+then have to be scheduled, and that wait lands in `vsockdial_us`.
 
 ## The journal hypothesis: present, and refuted as a cost
 

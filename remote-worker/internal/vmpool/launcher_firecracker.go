@@ -821,15 +821,20 @@ func (v *firecrackerVM) Key() string { return v.key }
 // merely necessary: it re-reads the device's metadata, retiring the stale-metadata
 // hazard a pre-mounted standby would carry (spec §4.3).
 func (v *firecrackerVM) Resume(ctx context.Context) error {
-	if err := v.checkNotDestroyed(); err != nil {
-		return err
-	}
-
 	// Sub-phase timing for resumePhaser. time.Now(), not a Clock, for the reason the
 	// runOverConn call below already documents: VM implementations have none injected.
 	// Every stamp is recorded even on a failure path -- a Resume that failed IN one of
 	// these steps is when knowing which one matters most -- so each assignment happens
 	// before the error check, and stashResumePhases runs via defer.
+	//
+	// REGISTERED BEFORE THE FIRST RETURN, INCLUDING checkNotDestroyed's. Below the guard
+	// it was skipped on that path, which left the previous values in place -- so
+	// resumePhaser's "a failed Resume overwrites the previous one's values" had an
+	// exception, and a caller reading the stash after a refused Resume (pool.go does,
+	// unconditionally, on the error path) saw another attempt's real measurements rather
+	// than zeros. Entry now always resets the stash, so that invariant holds with no
+	// exception. TestFirecrackerResumeResetsPhasesOnRefusal pins it: that guard returns
+	// before any Firecracker contact, so unlike the stamps below it IS unit-testable.
 	//
 	// THE MOUNT IS STAMPED IN THIS SAME CLOSURE, ON PURPOSE. It used to have a defer of
 	// its own, registered later, and was therefore correct only by LIFO: regroup the two
@@ -847,6 +852,10 @@ func (v *firecrackerVM) Resume(ctx context.Context) error {
 		}
 		v.stashResumePhases(phVMResume, phVsockDial, phMount)
 	}()
+
+	if err := v.checkNotDestroyed(); err != nil {
+		return err
+	}
 
 	fc := newFCClient(v.apiSockHost)
 	// The clock starts BELOW newFCClient so phVMResume is the PATCH alone, which is what

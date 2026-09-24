@@ -62,8 +62,9 @@ type fakeHostVM struct {
 
 func (v *fakeHostVM) Key() string { return v.key }
 
-// FakeResumePhases are the sub-phase durations fakeHostVM reports, exported so a test in
-// another package can assert against them rather than restating magic numbers.
+// FakeVMResumeUs, FakeVsockDialUs and FakeMountUs are the sub-phase durations fakeHostVM
+// reports, exported so a test in another package can assert against them rather than
+// restating magic numbers.
 //
 // They are DISTINCT, and that is the point: the three fields have the same type, so a
 // transposition anywhere along the copy chain (VM -> Phases -> sample -> runResult)
