@@ -223,8 +223,10 @@ type Phases struct {
 	// tables compare resume_us across runs, and a silently redefined field reads as a
 	// missing phase rather than as an error (#336 kept total_us the same way).
 	//
-	// Resume was the last opaque phase on the execGate-held critical path -- ~23 ms of
-	// a ~102 ms Exec at 64 slots with nothing inside it.
+	// Resume was the last opaque phase on the execGate-held critical path -- ~35.5 ms of
+	// an ~82 ms Exec at 64 slots (43%) with nothing inside it. Of that, the guest's
+	// /workspace mount is 78-81% at every rung from 8 to 64 slots; see
+	// docs/notes/2026-09-23-307-resume-decomposition.md for the ladder those come from.
 	VMResume  time.Duration // PATCH /vm {state: Resumed} -- Firecracker un-pauses the vcpus
 	VsockDial time.Duration // host-initiated vsock dial + "CONNECT <port>" handshake
 	Mount     time.Duration // guest round trip running the /workspace mount

@@ -37,9 +37,11 @@ iterations per slot, cheapest rung repeated last as an anchor. p50 µs.
 | 8    | 240.6  | 31104 | 1       | 23871  | 361        | 4159        | 19225   | 2762 | 1977    | 0.331    | 0              |
 | 8'   | 237.8  | 31596 | 1       | 23896  | 367        | 4172        | 19251   | 2761 | 2027    | 0.343    | 0              |
 
-**Anchor drift: +0.07% on `resume`, +0.05% on `mount`, −1.14% on throughput.** The session
-held still, so these are readable. (#336 measured 12.4% on one sweep, which disqualified a
-whole column.)
+**Anchor drift, rung 8 vs 8′: +0.10% on `resume`, +0.14% on `mount`, −1.14% on throughput.**
+The session held still, so these are readable. (#336 measured 12.4% on one sweep, which
+disqualified a whole column.) Every drift figure in this note is labelled with the sweep it
+comes from: the arms table below has its own anchor, and quoting one sweep's drift against the
+other's table is a mistake an earlier draft of this note made.
 
 The composition is remarkably stable across the whole ladder:
 
@@ -53,8 +55,9 @@ The composition is remarkably stable across the whole ladder:
 
 Three immediate readings:
 
-- **`vmresume` is not a finding.** `PATCH /vm {state: Resumed}` is 361–368 µs at ≤32 slots,
-  1.2 ms at 64. Sub-millisecond as predicted; the vcpu un-pause is not the cost.
+- **`vmresume` is not a finding.** `PATCH /vm {state: Resumed}` is 361–563 µs at ≤32 slots
+  (361/367 at 8 and 8′, 412 at 16, 563 at 32) and 1.2 ms at 64. Sub-millisecond as predicted;
+  the vcpu un-pause is not the cost.
 - **`mount` is 78–81% of `Resume` at every rung.** This is the term.
 - **`Resume` is BIGGER than the campaign table says.** The task brief put it at ~23 ms of a
   ~102 ms Exec at 64 slots; it is **35.5 ms of 82.2 ms (43.3%)** there. The ~23 ms figure is
@@ -68,13 +71,16 @@ Three immediate readings:
 and `run_us` covers all of it including a `sync`. So `run_us` prices a complete warm round
 trip, against which `mount_us` can be read.
 
-At 8 slots: `run_us` = 2756 µs for dial + round trip + command + `sync`, versus `mount_us` =
-19261 µs for a round trip carrying only the mount. **The mount command's own execution is
-~16.5 ms**, i.e. about 7x a comparable complete round trip.
+At 8 slots, reading the ladder table above: `run_us` = 2762 µs covers a dial, a round trip, the
+command and its `sync`, versus `mount_us` = 19225 µs for a round trip carrying only the mount.
+**The mount command's own execution is ~16.5 ms** (19225 − 2762 = 16463 µs), i.e. about 7x a
+comparable complete round trip. The arms table's arm A reads 2756 and 19261 for the same two
+terms, a 0.2% difference that changes nothing here.
 
-One consequence is worth stating separately: **`vsockdial_us` (4196 µs) is larger than Run's
-entire dial + round trip + `sync` (2756 µs).** Resume's dial is therefore not measuring dial
-mechanics — it is measuring how long the just-unpaused guest takes to become able to answer a
+One consequence is worth stating separately: **`vsockdial_us` (4159 µs at 8 slots) is larger
+than Run's entire dial + round trip + `sync` (2762 µs).** Both are the ladder's 8-slot row; the
+arms sweep reads 4196 and 2756 and the inequality is the same either way. Resume's dial is
+therefore not measuring dial mechanics — it is measuring how long the just-unpaused guest takes to become able to answer a
 `CONNECT`. `PATCH /vm` returns in 368 µs; the guest kernel and agent then have to be
 scheduled, and that wait lands in `vsockdial_us`.
 
@@ -115,7 +121,9 @@ real fix would occupy. Arms at 8 slots, 2000 iterations each, `A` repeated last 
 | C `cd /; umount /workspace`  | **18710**  | **5052** | 32611 | 44016     | **228.7** | **clean**        |
 | A' `true` (anchor)           | 19271      | 2758     | 31322 | —         | 240.0     | `needs_recovery` |
 
-Anchor drift on this rung: +0.05% `mount`, +0.35% throughput — so the arm deltas are real.
+Anchor drift, A vs A′ on this arms rung: +0.07% `resume`, +0.05% `mount`, +0.35% throughput —
+so the arm deltas are real. (Distinct from the ladder's own anchor above; these two sweeps
+are separate runs and each is read against its own repeat.)
 
 - Arm C **provably applied**: the `fsstate` probe shows `needs_recovery` gone after C and
   present after A, B and A'. This is the check that keeps a silently-failed `umount` from

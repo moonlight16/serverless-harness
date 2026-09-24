@@ -39,11 +39,15 @@ func TestPhaseLogIsOffByDefault(t *testing.T) {
 	logPhases(&Phases{})
 }
 
-// TestRunnerEmitsAllFourPhases is the regression this package did not have: the relayed
-// path used Pool.Exec with a throwaway Phases, so Acquire/Resume/Run/Destroy were
-// unobservable on the path the worker actually runs (#305, #307). If someone swaps
-// ExecPhased back to Exec, the phases silently become zero and this fails.
-func TestRunnerEmitsAllFourPhases(t *testing.T) {
+// TestRunnerEmitsEveryPhase is the regression this package did not have: the relayed
+// path used Pool.Exec with a throwaway Phases, so the phases were unobservable on the
+// path the worker actually runs (#305, #307). If someone swaps ExecPhased back to Exec,
+// they silently become zero and this fails.
+//
+// Named for the property, not the count: it was TestRunnerEmitsAllFourPhases until this
+// decomposition added three more, and a name that counts has to be renamed by whoever
+// adds the next one -- which is exactly the drift line 79 says this test exists to catch.
+func TestRunnerEmitsEveryPhase(t *testing.T) {
 	lines := capturePhaseLog(t)
 
 	p, lc, _ := testPool(t)
@@ -70,9 +74,9 @@ func TestRunnerEmitsAllFourPhases(t *testing.T) {
 	}
 	got := (*lines)[0]
 	// Every phase must be NAMED. Asserting on durations would be a clock test -- the fake
-	// clock does not advance, so all four are legitimately 0 even on correct code. What the
-	// field set catches is a dropped phase or a rename, which is the failure that makes an
-	// aggregated run silently miss a term.
+	// clock does not advance, so every one of them is legitimately 0 even on correct code.
+	// What the field set catches is a dropped phase or a rename, which is the failure that
+	// makes an aggregated run silently miss a term.
 	for _, field := range []string{
 		"acquire_us=", "resume_us=",
 		// Resume's sub-phases (#307 follow-up). Named here for the same reason as the

@@ -829,9 +829,24 @@ func (v *firecrackerVM) Resume(ctx context.Context) error {
 	// runOverConn call below already documents: VM implementations have none injected.
 	// Every stamp is recorded even on a failure path -- a Resume that failed IN one of
 	// these steps is when knowing which one matters most -- so each assignment happens
-	// before the error check, and stashPhases runs via defer.
+	// before the error check, and stashResumePhases runs via defer.
+	//
+	// THE MOUNT IS STAMPED IN THIS SAME CLOSURE, ON PURPOSE. It used to have a defer of
+	// its own, registered later, and was therefore correct only by LIFO: regroup the two
+	// defers -- which reads as tidier -- and mount_us reports 0 forever while resume_us
+	// keeps reporting normally, on the term that is 78-81% of the phase. One closure
+	// leaves no order to get wrong. mountStart stays zero until the mount is actually
+	// reached, which is what preserves the documented partial-failure shape: a Resume
+	// that fails earlier reports zero for the steps it never entered (see resumePhaser
+	// in diag.go), rather than a duration measured from an unset clock.
 	var phVMResume, phVsockDial, phMount time.Duration
-	defer func() { v.stashResumePhases(phVMResume, phVsockDial, phMount) }()
+	var mountStart time.Time
+	defer func() {
+		if !mountStart.IsZero() {
+			phMount = time.Since(mountStart)
+		}
+		v.stashResumePhases(phVMResume, phVsockDial, phMount)
+	}()
 
 	fc := newFCClient(v.apiSockHost)
 	// The clock starts BELOW newFCClient so phVMResume is the PATCH alone, which is what
@@ -851,8 +866,7 @@ func (v *firecrackerVM) Resume(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("firecracker: resume %s: dial vsock: %w", v.id, err)
 	}
-	mountStart := time.Now()
-	defer func() { phMount = time.Since(mountStart) }()
+	mountStart = time.Now()
 	// runOverConn closes conn itself (guestconn.go), and this is a FRESH connection
 	// used for exactly this one internal command — never reused by Run, which dials
 	// its own (see runOverConn's doc comment on why: established connections are

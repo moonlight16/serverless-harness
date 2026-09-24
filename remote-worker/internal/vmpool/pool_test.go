@@ -35,11 +35,12 @@ func testPool(t *testing.T) (Pool, *fakeLauncher, *fakeClock) {
 //
 // It exists so the launcher goes in through New rather than being assigned afterwards.
 // New starts `go p.reclaimLoop()` before it returns, and p.lc is read from warm, which
-// that goroutine can reach — so `p.(*pool).lc = lc` after construction is an
-// unsynchronized write to a field a live goroutine may read. It happens to stay green
-// under -race today only because this helper leaves StandbyPerKey unset, so the reclaim
-// path never reaches warm; that makes it a tripwire armed for whoever gives this helper a
-// standby count, and it would surface as a flake somewhere else entirely.
+// that goroutine can reach — so `p.(*pool).lc = lc` after construction WAS an
+// unsynchronized write to a field a live goroutine may read. That write would have stayed
+// green under -race only because this helper leaves StandbyPerKey unset and the reclaim
+// path therefore never reaches warm: a tripwire for whoever gave the helper a standby
+// count, surfacing as a flake somewhere else entirely. Passing the launcher to New
+// removes it rather than documenting it, so there is no live hazard here to hunt for.
 func testPoolWith(t *testing.T, lc Launcher) (Pool, *fakeClock) {
 	t.Helper()
 	clk := newFakeClock()

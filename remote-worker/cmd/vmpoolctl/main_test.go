@@ -90,9 +90,39 @@ func TestRunsOneExecInAVMAndReportsItAsJSON(t *testing.T) {
 	// mount, exactly a cost this benchmark exists to expose. The fake's Resume is
 	// a no-op so it may legitimately measure ~0us; what must hold is that the
 	// field is present in the contract, not that it's nonzero.
+	// Resume's sub-phases are asserted BY VALUE, not by key presence. A
+	// strings.Contains on the tag is satisfied by Go marshalling a zero int64, so it
+	// cannot tell a populated record from a ladder that reads mount_us=0 at every
+	// rung -- which is the failure that would silently void the whole decomposition,
+	// and which presence-only checks let through at two separate points (the sample
+	// copy in runExecMode and the pct call in realMain).
+	//
+	// The presence-only justification above does NOT carry over to these three: they
+	// are not clock-derived, so the fake cannot legitimately measure ~0. They come
+	// from fakeHostVM.ResumePhases, which returns three DISTINCT canned durations, so
+	// comparing against those also pins the slot ordering along the whole copy chain
+	// (VM -> Phases -> sample -> runResult) -- a transposition of two same-typed
+	// fields compiles silently and would relabel the mount as the dial.
+	for _, tc := range []struct {
+		name string
+		got  int64
+		want int64
+	}{
+		{"p50_vmresume_us", rec.P50VMResumeUs, vmpool.FakeVMResumeUs},
+		{"p95_vmresume_us", rec.P95VMResumeUs, vmpool.FakeVMResumeUs},
+		{"p50_vsockdial_us", rec.P50VsockDialUs, vmpool.FakeVsockDialUs},
+		{"p95_vsockdial_us", rec.P95VsockDialUs, vmpool.FakeVsockDialUs},
+		{"p50_mount_us", rec.P50MountUs, vmpool.FakeMountUs},
+		{"p95_mount_us", rec.P95MountUs, vmpool.FakeMountUs},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %d, want %d — the value is not reaching the JSON record, so a ladder "+
+				"would read this term as zero at every rung", tc.name, tc.got, tc.want)
+		}
+	}
 	for _, f := range []string{
-		// Resume's sub-phases must reach the JSON record, or a ladder cannot read the
-		// decomposition back even though the worker log has it (#307 follow-up).
+		// The tags themselves still have to appear, so a rename is caught as well as a
+		// dropped value (the struct fields above would follow a rename silently).
 		`"p50_vmresume_us"`, `"p95_vmresume_us"`,
 		`"p50_vsockdial_us"`, `"p95_vsockdial_us"`,
 		`"p50_mount_us"`, `"p95_mount_us"`,
