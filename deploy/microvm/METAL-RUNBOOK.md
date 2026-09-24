@@ -389,6 +389,66 @@ rung 4 being the long pole of E10 outside rung 1.
 **Do not edit `deploy/microvm/predictions.json`.** Falsified predictions get reported as
 plainly as confirmed ones — that is the point of having pinned them.
 
+## 6a. Four traps that have each cost real time
+
+Each of these produced a wrong or empty measurement on this host, so they are recorded rather
+than re-learned. All four share a shape: the instrument reports something plausible, and silence
+or a clean-looking number is indistinguishable from a working probe.
+
+### Per-rung results go in `RESULTS=`, and only `RESULTS=`
+
+```bash
+sudo env ... RESULTS="$REPO/deploy/microvm/.results-myrung-c64" bash e11-density.sh
+```
+
+There is **no `SH_E11_RESULTS_DIR`**. An unrecognised name is silently ignored, every rung then
+writes to the default `.results/`, and two things follow that are easy to miss: a rung record is
+overwritten by any later rung with the same `c`, and the worker log is **truncated per
+invocation**, so only the last rung's `SH_DIAG_PHASES` lines survive. A ladder sweeping one
+variable across eight rungs can complete with `EXIT:0` everywhere and yield phase data for one
+of them. This cost a full ladder on 2026-09-22.
+
+### `sched_schedstats` is off, so `/proc/<pid>/sched` has no `wait_sum`
+
+There are no `se.statistics.*` fields on this host. A probe that reads
+`se.statistics.wait_sum` to ask "was this process runnable but waiting for CPU?" measures
+nothing and reports nothing, which reads exactly like "the process was never starved". Check
+the field exists before building on it, or enable schedstats deliberately.
+
+### Never put `sudo` inside a timing clock
+
+`sudo` is a setuid binary doing PAM work. Timing `sudo <thing>` measured **~16 ms** for a
+process whose real cost was ~3 ms — most of the reading was `sudo` itself. Pay it once, outside
+the loop:
+
+```bash
+sudo bash -c 'for i in 1 2 3; do s=$(date +%s%N); thing; e=$(date +%s%N); ...; done'
+```
+
+Calibrate the harness too. Each `$(date +%s%N)` is itself a fork+exec, which on this host makes
+the floor of a shell-timed measurement **~2.4 ms** — the same order as several phases worth
+measuring. Time `/bin/true` the same way and subtract, or use `strace -tt` for anything finer.
+
+### A leftover socket reads as this run's socket coming up
+
+`waitForUnixSocket` **dials**, so a previous VMM's live listener satisfies it instantly.
+`fcJailOccupied` exists to refuse exactly this, and its comment says so. Any hand-rolled jail
+or VM experiment must **reap the previous VMM and delete the socket** before timing the next
+one, or it measures the leftover.
+
+The signature is repeated attempts agreeing far too closely — two runs within 17 us of each
+other is not reproducibility, it is a constant. One 2026-09-22 measurement reported a 2x
+speed-up from jail reuse on exactly that basis; the real figure was -31%, and the change it
+motivated turned out to cost 9% throughput (see
+`docs/notes/2026-09-22-328-jail-pool-design.md`).
+
+### Related: counting VMMs and killing them
+
+Count as root via `/proc/*/exe`; an unprivileged probe reports a flat `0`, which reads as
+"nothing is running". Kill by cgroup membership or by port, never `pkill -f` — see section 3a,
+and note that `pgrep -f` also self-matches through its own ssh and sudo argv, so it will report
+your own session as a hit.
+
 ## 7. Reading the verdict
 
 The script computes and prints the decision-rule row rather than leaving it to judgment:
