@@ -73,10 +73,10 @@ out of `runLeaf` (which the sync route turned into a `500`). That matches what t
 solve paths have always done, and `classifyOutcome` already treats `error` as retryable, so the
 async queue behaves the same as before.
 
-- Still deferred: a **workload-addressed** prompt leaf (`workloadId`) continues to ignore the
-  workload's own `sandboxSelector`, and the API boundary still logs that warning. The envelope's
-  `sandboxPoolSelector` is honored now, so only the workload-resolver special case remains, and
-  whether a workload's pool should bound its prompt leaves is a separate call from this one.
+- **Amended 2026-09-18:** a workload-addressed prompt leaf now uses the workload's
+  `sandboxSelector`, just like other leaf kinds. This makes `workloadId` sufficient to route a
+  delegated prompt into the sandbox and workspace allocated for that workload; callers do not need
+  to know or supply a Kubernetes selector.
 
 ---
 

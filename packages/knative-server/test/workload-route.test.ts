@@ -1,15 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { records, runLeaf, configured, createWorkload, getWorkload, deleteWorkload } = vi.hoisted(
-  () => ({
+const { records, runLeaf, enqueue, configured, createWorkload, getWorkload, deleteWorkload } =
+  vi.hoisted(() => ({
     records: new Map<string, string>(),
     runLeaf: vi.fn(),
+    enqueue: vi.fn(async () => '1-0'),
     configured: vi.fn(),
     createWorkload: vi.fn(),
     getWorkload: vi.fn(),
     deleteWorkload: vi.fn(),
-  }),
-);
+  }));
+vi.mock('@sh/work-queue', () => ({
+  RedisWorkQueue: class {
+    ensureGroup = async () => {};
+    enqueue = enqueue;
+  },
+}));
 vi.mock('@sh/harness/leaf-result-store', async (orig) => {
   const actual = await orig<typeof import('@sh/harness/leaf-result-store')>();
   class FakeStore {
@@ -53,6 +59,7 @@ let base: string;
 beforeEach(() => {
   records.clear();
   runLeaf.mockReset();
+  enqueue.mockClear();
   configured.mockReset().mockReturnValue(true);
   createWorkload.mockReset().mockResolvedValue(record);
   getWorkload.mockReset().mockResolvedValue(record);
@@ -144,9 +151,8 @@ describe('optional workload lifecycle', () => {
     );
   });
 
-  it('gates a prompt leaf on its workload but ignores the pool selector (ADR 0028)', async () => {
+  it('routes a prompt leaf through its workload pool', async () => {
     await json('POST', '/workloads', { name: 'demo-workload' });
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     runLeaf.mockResolvedValue({ status: 'responded', text: 'a summary' });
     const response = await json('POST', '/runs', {
       workloadId: 'demo-workload',
@@ -157,11 +163,24 @@ describe('optional workload lifecycle', () => {
     });
     expect(response.status).toBe(200);
     expect(runLeaf).toHaveBeenCalledWith(
-      expect.not.objectContaining({ sandboxPoolSelector: expect.anything() }),
+      expect.objectContaining({ sandboxPoolSelector: 'context.rossoctl.io/pool=demo-workload' }),
       expect.any(Object),
     );
-    expect(warn).toHaveBeenCalled();
-    warn.mockRestore();
+  });
+
+  it('queues a prompt leaf with its workload pool selector', async () => {
+    await json('POST', '/workloads', { name: 'demo-workload' });
+    const response = await json('POST', '/runs', {
+      workloadId: 'demo-workload',
+      sessionId: 'run/p1',
+      kind: 'prompt',
+      prompt: 'Summarize the repo.',
+      async: true,
+    });
+    expect(response.status).toBe(202);
+    expect(enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ sandboxPoolSelector: 'context.rossoctl.io/pool=demo-workload' }),
+    );
   });
 
   it('deletes the workload through Context Service', async () => {
