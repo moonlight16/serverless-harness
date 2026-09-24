@@ -26,6 +26,15 @@ func init() {
 // logPhases emits one line per Exec. Kept here rather than inline in Runner.Run so the
 // field names are in one place: they are parsed by whatever is aggregating a run, and a
 // silently renamed field reads as a missing phase rather than as an error.
+//
+// WHAT THE TESTS DO AND DO NOT PIN. Every field NAME here is asserted exactly, by key, in
+// TestRunnerEmitsEveryPhase (via phaseFields -- a Contains would match across token
+// boundaries, since "resume_us=" is a substring of "vmresume_us="). The three sub-phase
+// VALUES are asserted too, because they come from ResumePhases() and a fake can return
+// fixed ones. acquire_us / resume_us / run_us / destroy_us have no value check and cannot
+// get one here: they are clock-derived, and the fake clock does not advance, so asserting
+// on them would be a clock test. So feeding the wrong Phases field into one of those four
+// slots -- resume_us carrying VMResume, say -- is caught by review, not by a test.
 func logPhases(ph *Phases) {
 	if phaseLog == nil {
 		return

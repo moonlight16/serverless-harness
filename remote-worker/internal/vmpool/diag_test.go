@@ -27,6 +27,39 @@ func capturePhaseLog(t *testing.T) *[]string {
 	return &lines
 }
 
+// phaseFields parses one phase line into an exact key -> value map.
+//
+// IT EXISTS BECAUSE strings.Contains CANNOT ASSERT ON THIS LINE. The fields are
+// space-delimited `key=value` pairs with no anchor, so a bare Contains matches across token
+// boundaries in both directions:
+//
+//   - "resume_us=" is a substring of "vmresume_us=", so once this PR added the sub-phases,
+//     a check for "resume_us=" was satisfied by vmresume_us and renaming or deleting
+//     resume_us outright became invisible -- on the one field whose stability is the PR's
+//     whole compatibility claim.
+//   - "vsockdial_us=2000" is a PREFIX of "vsockdial_us=20000", so a value assertion using
+//     the 2 ms dial fixture passed against the 20 ms mount value. Distinct fixtures are not
+//     enough; they have to be prefix-free, or the match has to be anchored.
+//
+// Splitting removes the class rather than the two instances: exact map lookups cannot match
+// a neighbouring token whatever the fixtures are. The JSON sink already had this right by
+// accident, asserting `"p50_resume_us"` with the quotes (main_test.go), which anchors it.
+func phaseFields(t *testing.T, line string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, tok := range strings.Fields(line) {
+		k, v, ok := strings.Cut(tok, "=")
+		if !ok {
+			continue // the "vmpool: exec phases" prefix
+		}
+		out[k] = v
+	}
+	if len(out) == 0 {
+		t.Fatalf("no key=value fields in phase line: %s", line)
+	}
+	return out
+}
+
 // TestPhaseLogIsOffByDefault pins the cost-when-off contract: an Exec on a worker that
 // has not opted in must emit nothing at all. A default-on diagnostic would put a log line
 // on the hot path of every Exec in production.
@@ -77,15 +110,20 @@ func TestRunnerEmitsEveryPhase(t *testing.T) {
 	// clock does not advance, so every one of them is legitimately 0 even on correct code.
 	// What the field set catches is a dropped phase or a rename, which is the failure that
 	// makes an aggregated run silently miss a term.
+	//
+	// EXACT keys, via phaseFields, not Contains: "resume_us=" is a substring of
+	// "vmresume_us=", so a Contains check for it is satisfied by the sub-phase this PR
+	// added, and renaming or dropping resume_us stops failing anything.
+	fields := phaseFields(t, got)
 	for _, field := range []string{
-		"acquire_us=", "resume_us=",
+		"acquire_us", "resume_us",
 		// Resume's sub-phases (#307 follow-up). Named here for the same reason as the
 		// rest: resume_us was the last opaque phase on the gate-held path, and a rename
 		// or a drop would make an aggregated run silently miss a term rather than fail.
-		"vmresume_us=", "vsockdial_us=", "mount_us=",
-		"run_us=", "destroy_us=", "cold=",
+		"vmresume_us", "vsockdial_us", "mount_us",
+		"run_us", "destroy_us", "cold",
 	} {
-		if !strings.Contains(got, field) {
+		if _, ok := fields[field]; !ok {
 			t.Errorf("phase line is missing %q: %s", field, got)
 		}
 	}
@@ -95,8 +133,9 @@ func TestRunnerEmitsEveryPhase(t *testing.T) {
 	// ExecPhased sets ph.Cold, and this is a fresh pool's first Exec on an unseen key, so
 	// the cause is deterministically first-exec -- no clock involved. Swap ExecPhased back
 	// to Exec and ph stays zero, leaving cold="" here.
-	if want := fmt.Sprintf("cold=%q", string(ColdFirstExec)); !strings.Contains(got, want) {
-		t.Errorf("phase line has no %s -- Phases was not populated (Exec, not ExecPhased): %s", want, got)
+	if want := fmt.Sprintf("%q", string(ColdFirstExec)); fields["cold"] != want {
+		t.Errorf("phase line has cold=%s, want %s -- Phases was not populated (Exec, not ExecPhased): %s",
+			fields["cold"], want, got)
 	}
 }
 
@@ -207,10 +246,18 @@ func TestPhaseLineReportsResumeSubPhasesByValue(t *testing.T) {
 		t.Fatalf("want exactly one phase line, got %d: %v", len(*lines), *lines)
 	}
 	got := (*lines)[0]
-	// Distinct values, so a transposition fails rather than merely printing three keys.
-	for _, want := range []string{"vmresume_us=300", "vsockdial_us=2000", "mount_us=20000"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("phase line missing %q -- the sub-phases are mislabelled or dropped: %s", want, got)
+	// EXACT values, via phaseFields. Distinct fixtures alone were not enough: 2000 is a
+	// prefix of 20000, so the dial assertion passed against the mount's value and only the
+	// mount assertion was doing any killing.
+	fields := phaseFields(t, got)
+	for _, tc := range []struct{ key, want string }{
+		{"vmresume_us", "300"},
+		{"vsockdial_us", "2000"},
+		{"mount_us", "20000"},
+	} {
+		if fields[tc.key] != tc.want {
+			t.Errorf("%s = %q, want %q -- the sub-phases are mislabelled or dropped: %s",
+				tc.key, fields[tc.key], tc.want, got)
 		}
 	}
 }

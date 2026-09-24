@@ -218,10 +218,14 @@ type Phases struct {
 	Cold    ColdCause // "" when the acquire was warm
 
 	// Resume's three sub-phases, populated only by a launcher implementing
-	// resumePhaser (Firecracker does; CHV does not, and reports zeros). They SUM to
-	// Resume, which is deliberately left meaning the whole phase: several campaign
-	// tables compare resume_us across runs, and a silently redefined field reads as a
-	// missing phase rather than as an error (#336 kept total_us the same way).
+	// resumePhaser (Firecracker does; CHV does not, and reports zeros). They sum to
+	// Resume PER EXEC, to ~0.1% -- the remainder is checkNotDestroyed, newFCClient and
+	// the pre-mount error checks. Aggregated percentiles do NOT add: each sub-phase's
+	// p50 comes from a different Exec, so the ladder's columns leave 0.5% at 8 slots
+	// rising to 2.7% at 64 (the note has the figures). Resume is deliberately left
+	// meaning the whole phase: several campaign tables compare resume_us across runs,
+	// and a silently redefined field reads as a missing phase rather than as an error
+	// (#336 kept total_us the same way).
 	//
 	// Resume was the last opaque phase on the execGate-held critical path -- ~35.5 ms of
 	// an ~82 ms Exec at 64 slots (43%) with nothing inside it. Of that, the guest's

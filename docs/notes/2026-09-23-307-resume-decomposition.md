@@ -20,14 +20,15 @@ missing phase rather than as an error.
 
 **Verified before the ladder**, since three probes in this campaign failed only after a long
 run had been spent. At c=1 over 24 iterations the three sub-phases sum to 22891 µs against a
-`resume_us` of 22916 µs — a **+0.11% residual**, which is `checkNotDestroyed` plus the error
-checks. (The p95 residual is −2.2% and is not an error: p95-of-a-sum is not the sum-of-p95s,
+`resume_us` of 22916 µs — a **+0.11% residual**: `checkNotDestroyed`, `newFCClient`, and the
+two error checks that sit BEFORE the mount. The two after it are inside `mount_us`, because
+that stamp closes when `Resume` returns (see the closure in `launcher_firecracker.go`). (The p95 residual is −2.2% and is not an error: p95-of-a-sum is not the sum-of-p95s,
 because each sub-phase's p95 comes from a different iteration.) **The p50 identity is the check
 at c=1 only.** On the concurrent ladder below, p50 is non-additive for the same reason p95 is —
 each sub-phase's median comes from a different Exec — and the residual grows with concurrency:
 0.53% at 8 slots, 0.78% at 16, 1.76% at 32, 2.68% at 64. That is percentile arithmetic, not
 un-instrumented code, and no residual of that size touches the finding that `mount` dominates
-at 77.7–80.5%.
+at 77.7–80.6%.
 
 ## The breakdown
 
@@ -121,12 +122,12 @@ more than it saves. Measured with no code change at all, by passing the unmount 
 command (`-- 'cd /;' 'umount /workspace'`), which lands it on the same `execGate`-held path a
 real fix would occupy. Arms at 8 slots, 2000 iterations each, `A` repeated last as an anchor:
 
-| arm                          | `mount_us` | `run_us` | total | p95 total | thru/s    | fs left          |
-| ---------------------------- | ---------- | -------- | ----- | --------- | --------- | ---------------- |
-| A `true` (baseline)          | 19261      | 2756     | 31223 | 41986     | 239.2     | `needs_recovery` |
-| B `mountpoint -q /workspace` | 19271      | 4066     | 32230 | —         | 233.5     | `needs_recovery` |
-| C `cd /; umount /workspace`  | **18710**  | **5052** | 32611 | 44016     | **228.7** | **clean**        |
-| A' `true` (anchor)           | 19271      | 2758     | 31322 | —         | 240.0     | `needs_recovery` |
+| arm                          | `resume` | `mount_us` | `run_us` | total | p95 total | thru/s    | fs left          |
+| ---------------------------- | -------- | ---------- | -------- | ----- | --------- | --------- | ---------------- |
+| A `true` (baseline)          | 23934    | 19261      | 2756     | 31223 | 41986     | 239.2     | `needs_recovery` |
+| B `mountpoint -q /workspace` | 23947    | 19271      | 4066     | 32230 | —         | 233.5     | `needs_recovery` |
+| C `cd /; umount /workspace`  | 23384    | **18710**  | **5052** | 32611 | 44016     | **228.7** | **clean**        |
+| A' `true` (anchor)           | 23951    | 19271      | 2758     | 31322 | —         | 240.0     | `needs_recovery` |
 
 Anchor drift, A vs A′ on this arms rung: +0.07% `resume`, +0.05% `mount`, +0.35% throughput —
 so the arm deltas are real. (Distinct from the ladder's own anchor above; these two sweeps

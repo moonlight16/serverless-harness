@@ -844,6 +844,13 @@ func (v *firecrackerVM) Resume(ctx context.Context) error {
 	// reached, which is what preserves the documented partial-failure shape: a Resume
 	// that fails earlier reports zero for the steps it never entered (see resumePhaser
 	// in diag.go), rather than a duration measured from an unset clock.
+	//
+	// ONE IMPRECISION, ACCEPTED DELIBERATELY: because phMount closes in the closure, it
+	// runs to Resume's RETURN, so it also covers the two checks after runOverConn (the
+	// error and the exit code) -- two comparisons against a 19.2 ms measurement. Capturing
+	// a mountEnd after them would make the stamp exact, and moving the stamp out of the
+	// closure would too, but the latter reinstates the LIFO hazard above; that trade is the
+	// wrong way round, so the boundary is documented instead of moved.
 	var phVMResume, phVsockDial, phMount time.Duration
 	var mountStart time.Time
 	defer func() {
