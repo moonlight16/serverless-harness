@@ -27,14 +27,21 @@ func init() {
 // field names are in one place: they are parsed by whatever is aggregating a run, and a
 // silently renamed field reads as a missing phase rather than as an error.
 //
-// WHAT THE TESTS DO AND DO NOT PIN. Every field NAME here is asserted exactly, by key, in
+// WHAT THE TESTS PIN. Every field NAME here is asserted exactly, by key, in
 // TestRunnerEmitsEveryPhase (via phaseFields -- a Contains would match across token
 // boundaries, since "resume_us=" is a substring of "vmresume_us="). The three sub-phase
 // VALUES are asserted too, because they come from ResumePhases() and a fake can return
-// fixed ones. acquire_us / resume_us / run_us / destroy_us have no value check and cannot
-// get one here: they are clock-derived, and the fake clock does not advance, so asserting
-// on them would be a clock test. So feeding the wrong Phases field into one of those four
-// slots -- resume_us carrying VMResume, say -- is caught by review, not by a test.
+// fixed ones.
+//
+// The other four -- acquire_us / resume_us / run_us / destroy_us -- are clock-derived, so
+// there is no fixture to compare them against. They are pinned anyway, and the fake clock
+// is what makes that possible rather than what forbids it: it does not advance, so all four
+// read exactly 0 in TestPhaseLineReportsResumeSubPhasesByValue while the sub-phases carry
+// 300/2000/20000. Zero there is an independent witness, not a restatement of this function
+// and not a clock test, and it is what catches the wrong Phases field reaching one of those
+// four slots -- resume_us carrying VMResume, say, which otherwise leaves both packages
+// green (confirmed by mutation). It matters most on resume_us, whose unchanged whole-phase
+// meaning is this decomposition's compatibility claim.
 func logPhases(ph *Phases) {
 	if phaseLog == nil {
 		return

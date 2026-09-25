@@ -78,8 +78,10 @@ func TestPhaseLogIsOffByDefault(t *testing.T) {
 // they silently become zero and this fails.
 //
 // Named for the property, not the count: it was TestRunnerEmitsAllFourPhases until this
-// decomposition added three more, and a name that counts has to be renamed by whoever
-// adds the next one -- which is exactly the drift line 79 says this test exists to catch.
+// decomposition added three more, and a name that counts has to be renamed by whoever adds
+// the next one -- which is exactly the drift the field-set rationale below says this test
+// exists to catch. (Named, not cited by line number: the hunk that added this comment moved
+// the line the first draft pointed at.)
 func TestRunnerEmitsEveryPhase(t *testing.T) {
 	lines := capturePhaseLog(t)
 
@@ -197,9 +199,16 @@ func TestExecPhasedReportsResumeSubPhases(t *testing.T) {
 // TestResumeSubPhasesAreZeroWithoutTheSeam is the other half: a launcher that does NOT
 // implement resumePhaser must report zeros rather than panicking on the assertion. That
 // is the CHV arm, whose Resume has no workspace mount to decompose.
+//
+// The Phases handed in is PRE-POPULATED, which is what makes this assert the contract
+// resumePhaser documents ("reports zeros") rather than the weaker fact that a fresh struct
+// starts zeroed. ExecPhased writes ph.Resume unconditionally, so before the else branch in
+// the type assertion the three sub-phases were the one group left to a caller's discipline;
+// all three production callers do allocate fresh (cmd/vmpoolctl/main.go, runner.go), so
+// this pins the function's own guarantee, not a reachable bug.
 func TestResumeSubPhasesAreZeroWithoutTheSeam(t *testing.T) {
 	p, _, _ := testPool(t)
-	var ph Phases
+	ph := Phases{VMResume: time.Second, VsockDial: time.Second, Mount: time.Second}
 	if _, err := p.ExecPhased(context.Background(), "k1", Exec{
 		ReqID: 1, Command: "true", TimeoutS: 5,
 	}, &capturingSink{}, &ph); err != nil {
@@ -258,6 +267,19 @@ func TestPhaseLineReportsResumeSubPhasesByValue(t *testing.T) {
 		if fields[tc.key] != tc.want {
 			t.Errorf("%s = %q, want %q -- the sub-phases are mislabelled or dropped: %s",
 				tc.key, fields[tc.key], tc.want, got)
+		}
+	}
+	// The other four fields are clock-derived, so there is no fixture to compare them
+	// against -- but the fake clock does not advance, so on correct code they read exactly
+	// 0 here while the sub-phases carry 300/2000/20000. That makes 0 an INDEPENDENT witness
+	// rather than a clock test: it cannot hold once a ResumePhases-derived value lands in
+	// one of these slots. Without it, feeding ph.VMResume into the resume_us slot leaves
+	// both packages green -- verified by mutation, and resume_us is the one field whose
+	// whole-phase meaning this PR's compatibility claim rests on.
+	for _, key := range []string{"acquire_us", "resume_us", "run_us", "destroy_us"} {
+		if fields[key] != "0" {
+			t.Errorf("%s = %q, want 0 -- a sub-phase value reached a clock-derived slot: %s",
+				key, fields[key], got)
 		}
 	}
 }

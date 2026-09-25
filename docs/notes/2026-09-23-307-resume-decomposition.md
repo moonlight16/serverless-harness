@@ -86,9 +86,10 @@ comparable complete round trip (16463 / 2762 = 5.96). The un-subtracted ratio, 1
 arm A reads 2756 and 19261 for the same two terms, a 0.2% difference that changes nothing here.
 
 One consequence is worth stating separately: **`vsockdial_us` (4159 µs at 8 slots) is larger
-than Run's entire dial + round trip + `sync` (2762 µs).** Both are the ladder's 8-slot row; the
-arms sweep reads 4196 and 2756 and the inequality is the same either way. Resume's dial is
-therefore not measuring dial mechanics — it is measuring how long the just-unpaused guest takes to become able to answer a
+than Run's entire dial + round trip + `sync` (2762 µs).** Both figures are the ladder's 8-slot
+row, and the comparison is made there only — the arms table below carries no `vsockdial`
+column, so it cannot second the inequality. Resume's dial is therefore not measuring dial
+mechanics: it is measuring how long the just-unpaused guest takes to become able to answer a
 `CONNECT`. `PATCH /vm` returns in 361 µs at that same 8-slot rung; the guest kernel and agent
 then have to be scheduled, and that wait lands in `vsockdial_us`.
 
@@ -116,6 +117,15 @@ so recovery genuinely runs on every mount. Host cost, mount syscall only:
 | `data=writeback`                               | 4669               |
 | fresh image, with journal                      | 4860 / 5168        |
 | fresh image, **`-O ^has_journal`**             | 4625 / 5072 / 4574 |
+
+**Read that table for whether recovery happens, not for what it costs.** Its dirty-vs-clean
+delta is 8584 − 4946 = 3638 µs, which is 6.6x the 551 µs arm C actually removes below, and
+scaled into the guest by the ≈3.8x host ratio derived further down it would predict ~14 ms —
+about 25x. The delta is inflated because 8584 is the **first** mount of that image while 4946
+is the **second and third of the same one**, so it prices cold page cache and dentry population
+alongside journal replay. **Arm C is the figure to trust**, and every ceiling in this note is
+computed from it: 2000 warm iterations either side, one image, the same gate-held path, the only
+difference being whether the previous Exec left the journal dirty.
 
 **The second half is refuted.** Recovery is real but small, and removing it end to end costs
 more than it saves. Measured with no code change at all, by passing the unmount as the user

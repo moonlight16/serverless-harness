@@ -340,6 +340,12 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 		// the three steps is exactly when knowing which one matters most.
 		if rp, ok := vm.(resumePhaser); ok {
 			ph.VMResume, ph.VsockDial, ph.Mount = rp.ResumePhases()
+		} else {
+			// Zero them rather than leaving whatever the struct held. "A launcher
+			// without the seam reports zeros" is resumePhaser's documented contract
+			// (diag.go), and writing it here makes it a property of this function
+			// instead of one every caller upholds by allocating a fresh Phases.
+			ph.VMResume, ph.VsockDial, ph.Mount = 0, 0, 0
 		}
 	}
 	if resumeErr != nil {
