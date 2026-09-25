@@ -368,16 +368,27 @@ Go supervisor and a second language boundary around worker lifecycle and config.
 
 Named here so an implementer does not invent names, and so §7's tests have something to assert.
 
-| Variable                       | Default            | Meaning                                                       |
-| ------------------------------ | ------------------ | ------------------------------------------------------------- |
-| `SH_WORKERS`                   | `os.cpus().length` | W — worker processes in the pool                              |
-| `SH_TURNS_PER_WORKER`          | _required_         | S — per-worker soft cap on **in-flight turns** (§3.5)         |
-| `SH_ROUTING_POLICY`            | `leastInFlight`    | `leastInFlight` \| `stickyBySession` (§3.4)                   |
-| `SH_SANDBOX_DISCOVERY`         | see §4.2           | `pods` \| `records` \| `both`                                 |
-| `SH_WORKER_RESTART_BACKOFF_MS` | `250`              | Base for exponential backoff on worker exit                   |
-| `PORT`                         | `8080`             | Existing; the supervisor binds it instead of the server       |
-| `SH_ADMIN_PORT`                | `8081`             | `/metrics` listener, loopback only (§5.2); `0` ⇒ ephemeral    |
-| `SH_STATS_INTERVAL_MS`         | `1000`             | Worker advisory-telemetry interval (§5.2); read by the worker |
+| Variable                       | Default                     | Meaning                                                       |
+| ------------------------------ | --------------------------- | ------------------------------------------------------------- |
+| `SH_WORKERS`                   | `os.availableParallelism()` | W — worker processes in the pool                              |
+| `SH_TURNS_PER_WORKER`          | _required_                  | S — per-worker soft cap on **in-flight turns** (§3.5)         |
+| `SH_ROUTING_POLICY`            | `leastInFlight`             | `leastInFlight` \| `stickyBySession` (§3.4)                   |
+| `SH_SANDBOX_DISCOVERY`         | see §4.2                    | `pods` \| `records` \| `both`                                 |
+| `SH_WORKER_RESTART_BACKOFF_MS` | `250`                       | Base for exponential backoff on worker exit                   |
+| `PORT`                         | `8080`                      | Existing; the supervisor binds it instead of the server       |
+| `SH_ADMIN_PORT`                | `8081`                      | `/metrics` listener, loopback only (§5.2); `0` ⇒ ephemeral    |
+| `SH_STATS_INTERVAL_MS`         | `1000`                      | Worker advisory-telemetry interval (§5.2); read by the worker |
+
+**`SH_WORKERS` defaults to the CPU count this deployment may use, not the host's.** `os.cpus()`
+enumerates the host's physical CPUs and never consults a cgroup CPU quota, so under a
+`docker run --cpus=N` or a Kubernetes CPU limit it reports the whole machine — W would describe the
+hardware the deployment cannot touch, giving an oversized, thrashing pool with no error and any density
+number gathered there a measurement of the host rather than of the deployment (§5.1). Node documents
+the rule outright: "`os.cpus().length` should not be used to calculate the amount of parallelism
+available to an application." `os.availableParallelism()` wraps libuv's `uv_available_parallelism()`,
+which reads `cpu.max` (cgroup v2) / `cpu.cfs_quota_us` (v1) and clamps to the quota. It is a default
+only, never a ceiling: an operator pinning W across an E8 ladder sets `SH_WORKERS` and gets exactly
+that.
 
 **`SH_ADMIN_PORT` opens a listener whether or not you set it.** It defaults to `8081`, so a supervisor
 started with no admin configuration at all is still serving `/metrics` — on `127.0.0.1` only, and

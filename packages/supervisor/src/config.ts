@@ -1,4 +1,4 @@
-import { cpus } from 'node:os';
+import { availableParallelism } from 'node:os';
 import { policyFromName, type RoutingPolicy } from './routing.js';
 
 export interface SupervisorConfig {
@@ -29,13 +29,15 @@ function readInt(
     // for it; it is a real net for anything else declared required later.
     if (fallback === undefined) throw new Error(`${name} is required and has no default`);
     // `bounds` apply to the fallback too, or the sentence above is only true of values an
-    // OPERATOR typed. `SH_WORKERS` passes a COMPUTED one (`cpus().length`), and `os.cpus()` is
-    // documented as possibly returning an empty array: an unchecked 0 there booted a supervisor
-    // that logged `supervisor_listening ... workers: 0`, forked nothing, and answered 429 to
-    // everything forever, since `isSaturated([])` is true by design -- with no error anywhere.
-    // `defaultWorkers` now makes that particular value legal by construction, so this branch is
-    // unreachable for it, exactly as the blank check above makes the `undefined` throw
-    // unreachable for `SH_TURNS_PER_WORKER`. Both are nets for the next default, not dead code.
+    // OPERATOR typed. `SH_WORKERS` passes a COMPUTED one (`availableParallelism()`). Back when that
+    // source was `cpus().length` -- and `os.cpus()` is documented as possibly returning an empty
+    // array -- an unchecked 0 booted a supervisor that logged `supervisor_listening ... workers: 0`,
+    // forked nothing, and answered 429 to everything forever, since `isSaturated([])` is true by
+    // design -- with no error anywhere. Two things make that value unreachable here now:
+    // `availableParallelism()` is documented to always return a value greater than zero, and
+    // `defaultWorkers` clamps regardless. So this branch is unreachable for it, exactly as the blank
+    // check above makes the `undefined` throw unreachable for `SH_TURNS_PER_WORKER`. Both are nets
+    // for the next default, not dead code.
     if (!Number.isInteger(fallback) || fallback < bounds.min || fallback > max) {
       throw new Error(`${name} default ${fallback} is not an integer in [${bounds.min}, ${max}]`);
     }
@@ -49,14 +51,18 @@ function readInt(
 }
 
 /**
- * W's default, from a CPU count that may legitimately be 0.
+ * W's default, clamped so a CPU count of 0 cannot become a wedged supervisor.
  *
- * `os.cpus()` is documented as possibly returning an empty array, and 0 is not a legal W: the
- * supervisor forks nothing, and `isSaturated([])` is `true` by design, so it answers 429 to every
- * request for the lifetime of the process. Clamped rather than thrown, because failed CPU detection
- * is a property of the host and not an operator error -- one worker is a working deployment, and a
- * supervisor that refuses to boot over it would be a worse answer than a quiet one. An operator who
- * wants more sets `SH_WORKERS`, which is validated as an operator value like every other knob.
+ * 0 is not a legal W: the supervisor forks nothing, and `isSaturated([])` is `true` by design, so it
+ * answers 429 to every request for the lifetime of the process. That is reachable from
+ * `cpus().length`, since `os.cpus()` is documented as possibly returning an empty array.
+ * `readConfig` no longer reads that source -- `availableParallelism()` is documented to always
+ * return a value greater than zero -- but this stays a pure clamp of whatever count it is handed,
+ * so the guarantee holds in one place whichever source a caller picks. Clamped rather than thrown,
+ * because failed CPU detection is a property of the host and not an operator error -- one worker is
+ * a working deployment, and a supervisor that refuses to boot over it would be a worse answer than
+ * a quiet one. An operator who wants more sets `SH_WORKERS`, which is validated as an operator
+ * value like every other knob.
  */
 export function defaultWorkers(cpuCount: number): number {
   return Math.max(1, cpuCount);
@@ -87,7 +93,16 @@ export function readConfig(env: NodeJS.ProcessEnv): SupervisorConfig {
   // `assertKeysetUsable` -- the precedent for "validate at boot, not per request" -- already lives.
   return {
     port,
-    workers: readInt(env, 'SH_WORKERS', defaultWorkers(cpus().length), { min: 1 }),
+    // `availableParallelism()`, not `cpus().length`: `os.cpus()` enumerates the HOST's physical
+    // CPUs and never consults a cgroup CPU quota, so under `docker run --cpus=N` or a Kubernetes
+    // CPU limit W silently described a machine this deployment cannot use -- an oversized,
+    // thrashing pool with no error and no warning, and any P6 density number gathered there
+    // measuring the host rather than the deployment (§5.1; E8/E9). Node documents the rule
+    // outright -- "`os.cpus().length` should not be used to calculate the amount of parallelism
+    // available to an application" -- since `availableParallelism()` wraps libuv's
+    // `uv_available_parallelism()`, which reads `cpu.max` (cgroup v2) / `cpu.cfs_quota_us` (v1)
+    // and clamps to the quota.
+    workers: readInt(env, 'SH_WORKERS', defaultWorkers(availableParallelism()), { min: 1 }),
     turnsPerWorker: readInt(env, 'SH_TURNS_PER_WORKER', undefined, { min: 1 }),
     policy: policyFromName(env.SH_ROUTING_POLICY),
     restartBackoffMs: readInt(env, 'SH_WORKER_RESTART_BACKOFF_MS', 250, { min: 0 }),
