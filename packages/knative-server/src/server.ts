@@ -437,21 +437,6 @@ async function resolveRunWorkload(body: any, res: ServerResponse): Promise<any |
     res.writeHead(404, JSON_HEADERS).end(JSON.stringify({ error: 'workload_not_found' }));
     return null;
   }
-  if (body.kind === 'prompt') {
-    // A prompt leaf DOES lease a pool sandbox now, and honors an envelope `sandboxPoolSelector`
-    // (ADR 0028 amendment, 2026-09-01) — but a *workload-addressed* one still ignores the
-    // workload's own selector. The workloadId gates existence (404 above) and nothing more.
-    // Whether a workload's pool should bound its prompt leaves is a separate decision from
-    // making the lease work at all; until it is taken, warn rather than change behavior here.
-    if (record.sandboxSelector) {
-      // Log the resolved record.workloadId (the exact key findWorkload matched, validated against
-      // WORKLOAD_NAME at creation) rather than the raw request field — self-evidently not log-injectable.
-      console.warn(
-        `workload '${record.workloadId}': sandbox pool selector ignored for kind:prompt leaf (ADR 0028)`,
-      );
-    }
-    return body;
-  }
   return { ...body, sandboxPoolSelector: record.sandboxSelector };
 }
 

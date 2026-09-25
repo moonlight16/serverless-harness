@@ -847,22 +847,16 @@ The slice-2 design is a **tenant-labelled pool partition**: the control plane su
 label, and a lease can only ever match its own partition. This preserves the warm pool and the P2/P3
 density work, at the cost of a minimum idle pod count per active tenant.
 
-**This is not blocked on [#237](https://github.com/rossoctl/serverless-harness/issues/237)** — an
-earlier draft of this section said it was, and that inverted the dependency. There are **two distinct
-selectors**, and `server.ts:308-311` says so in the same breath:
+There are two ways a prompt leaf can receive a selector. Both now route through the same leasing
+path:
 
-> A prompt leaf DOES lease a pool sandbox now, and honors an envelope `sandboxPoolSelector`
-> (ADR 0028 amendment, 2026-09-01) — but a _workload-addressed_ one still ignores the workload's own
-> selector.
+| Selector                                                                                        | Honoured for `kind: 'prompt'`? | Governed by                                       |
+| ----------------------------------------------------------------------------------------------- | ------------------------------ | ------------------------------------------------- |
+| **Envelope** `sandboxPoolSelector` (what the control plane would inject after the `:553` scrub) | **yes**, today                 | —                                                 |
+| **Workload-addressed** `WorkloadRecord.sandboxSelector`                                         | **yes**                        | [ADR 0028](../adrs/0028-async-prompt-dispatch.md) |
 
-| Selector                                                                                        | Honoured for `kind: 'prompt'`? | Governed by                                                       |
-| ----------------------------------------------------------------------------------------------- | ------------------------------ | ----------------------------------------------------------------- |
-| **Envelope** `sandboxPoolSelector` (what the control plane would inject after the `:553` scrub) | **yes**, today                 | —                                                                 |
-| **Workload-addressed** `WorkloadRecord.sandboxSelector`                                         | no — ignored with a warn       | [#237](https://github.com/rossoctl/serverless-harness/issues/237) |
-
-#237 governs only the second. The mechanism this section proposes is the first, and it already works
-on the `/runs` path: `sandboxEnvironment()` (`run-leaf.ts:124-128`) is **not gated on `kind`**, and
-`runPromptLeaf` reaches it at `:390`. `selectPoolSandbox` also takes its environment as an
+Both work on the `/runs` path: `sandboxEnvironment()` (`run-leaf.ts:124-128`) is **not gated on
+`kind`**, and `runPromptLeaf` reaches it at `:390`. `selectPoolSandbox` also takes its environment as an
 **argument** (`select-sandbox.ts:75`), so the selector is already request-scoped rather than
 process-global — exactly what a per-tenant partition needs.
 
@@ -997,19 +991,13 @@ holds with the deployment's own key present in the environment.
 
 ## 11. Open decisions owed
 
-1. **Should a workload's pool bound its `kind: 'prompt'` leaves?** Deferred at
-   `server.ts:308-320` under ADR-0028, tracked as
-   [#237](https://github.com/rossoctl/serverless-harness/issues/237). Still a real open decision, but
-   **it does not gate §8.2's tenant partition** — that uses the _envelope_ selector, which prompt
-   leaves already honour, not the _workload-addressed_ one #237 is about (§8.2). Left undecided here
-   because it predates this spec and affects the non-multi-user `/runs` path too.
-2. **Tenant granularity.** This spec treats one subject as one tenant. Teams and shared sessions would
+1. **Tenant granularity.** This spec treats one subject as one tenant. Teams and shared sessions would
    introduce a tenant that is not a user, changing the owner zset into a membership lookup. Deliberately
    not designed now (YAGNI), but the `tenant` field exists in the session hash and the token so the
    change is additive.
-3. **IdP-driven revocation of scheduled runs** (§5.5) — needs a stored OIDC offline grant if it becomes
+2. **IdP-driven revocation of scheduled runs** (§5.5) — needs a stored OIDC offline grant if it becomes
    a requirement.
-4. **Per-user pool cost.** A tenant-labelled partition implies idle pods per active tenant; the
+3. **Per-user pool cost.** A tenant-labelled partition implies idle pods per active tenant; the
    provisioning ratio from P3 was measured for a shared pool and would need revisiting.
 
 ---
