@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { cpus } from 'node:os';
+import { availableParallelism } from 'node:os';
 import { defaultWorkers, readConfig } from '../src/config.js';
 
 const base = { SH_TURNS_PER_WORKER: '8' } as NodeJS.ProcessEnv;
@@ -9,7 +9,9 @@ describe('readConfig', () => {
   it('fills the defaults spec §3.8 names', () => {
     const c = readConfig(env());
     expect(c.port).toBe(8080);
-    expect(c.workers).toBe(defaultWorkers(cpus().length));
+    // Both sources agree on an unconstrained host, so this cannot tell them apart; the CPU source is
+    // pinned where they disagree, in config-workers-cpu-source.test.ts.
+    expect(c.workers).toBe(defaultWorkers(availableParallelism()));
     expect(c.restartBackoffMs).toBe(250);
     expect(c.policy.name).toBe('leastInFlight');
   });
@@ -52,11 +54,12 @@ describe('readConfig', () => {
   });
 
   it('never defaults W to 0, however many CPUs the host reports', () => {
-    // `readInt` returned its `fallback` unchecked, and `SH_WORKERS`'s fallback is COMPUTED:
-    // `cpus().length`, where `os.cpus()` is documented as possibly returning an empty array. With
-    // `SH_WORKERS` unset on such a host the supervisor booted successfully, logged
-    // `supervisor_listening ... workers: 0`, forked nothing, and then answered 429 to every request
-    // for the life of the process -- `isSaturated([])` is `true` by design -- with no error
+    // `readInt` returned its `fallback` unchecked, and `SH_WORKERS`'s fallback is COMPUTED. When
+    // that computation was `cpus().length` -- and `os.cpus()` is documented as possibly returning
+    // an empty array -- with `SH_WORKERS` unset on such a host the supervisor booted
+    // successfully, logged `supervisor_listening ... workers: 0`, forked nothing, and then answered
+    // 429 to every request for the life of the process -- `isSaturated([])` is `true` by design
+    // -- with no error
     // anywhere to say why. 0 is not a legal W, and the host is not the operator's mistake, so the
     // default is clamped rather than made a boot failure.
     expect(defaultWorkers(0)).toBe(1);
