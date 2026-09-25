@@ -216,6 +216,24 @@ type Phases struct {
 	Run     time.Duration
 	Destroy time.Duration
 	Cold    ColdCause // "" when the acquire was warm
+
+	// Resume's three sub-phases, populated only by a launcher implementing
+	// resumePhaser (Firecracker does; CHV does not, and reports zeros). They sum to
+	// Resume PER EXEC, to ~0.1% -- the remainder is checkNotDestroyed, newFCClient and
+	// the pre-mount error checks. Aggregated percentiles do NOT add: each sub-phase's
+	// p50 comes from a different Exec, so the ladder's columns leave 0.5% at 8 slots
+	// rising to 2.7% at 64 (the note has the figures). Resume is deliberately left
+	// meaning the whole phase: several campaign tables compare resume_us across runs,
+	// and a silently redefined field reads as a missing phase rather than as an error
+	// (#336 kept total_us the same way).
+	//
+	// Resume was the last opaque phase on the execGate-held critical path -- ~35.5 ms of
+	// an ~82 ms Exec at 64 slots (43%) with nothing inside it. Of that, the guest's
+	// /workspace mount is 78-81% at every rung from 8 to 64 slots; see
+	// docs/notes/2026-09-23-307-resume-decomposition.md for the ladder those come from.
+	VMResume  time.Duration // PATCH /vm {state: Resumed} -- Firecracker un-pauses the vcpus
+	VsockDial time.Duration // host-initiated vsock dial + "CONNECT <port>" handshake
+	Mount     time.Duration // guest round trip running the /workspace mount
 }
 
 // ExecPhased is Exec with instrumentation. Exec delegates to it with a throwaway
@@ -318,6 +336,17 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 	resumeErr := vm.Resume(runCtx)
 	if ph != nil {
 		ph.Resume = p.clk.Now().Sub(t0)
+		// Read the sub-phases even on the error path: a Resume that failed IN one of
+		// the three steps is exactly when knowing which one matters most.
+		if rp, ok := vm.(resumePhaser); ok {
+			ph.VMResume, ph.VsockDial, ph.Mount = rp.ResumePhases()
+		} else {
+			// Zero them rather than leaving whatever the struct held. "A launcher
+			// without the seam reports zeros" is resumePhaser's documented contract
+			// (diag.go), and writing it here makes it a property of this function
+			// instead of one every caller upholds by allocating a fresh Phases.
+			ph.VMResume, ph.VsockDial, ph.Mount = 0, 0, 0
+		}
 	}
 	if resumeErr != nil {
 		if cErr := p.classify(ctx, &timedOut, timeoutS); cErr != nil {

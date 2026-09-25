@@ -788,6 +788,25 @@ type firecrackerVM struct {
 	// would read as missing phases.
 	phKill, phBarrier time.Duration
 	barrierSeen       bool
+	// Resume's three sub-phases, from the LAST Resume. Stashed rather than returned
+	// because Resume's signature is the VM interface's, shared with a launcher this
+	// decomposition does not apply to -- see resumePhaser in diag.go. Written by
+	// Resume and read by ResumePhases, both under mu: Resume runs on the Exec's
+	// goroutine while the deferred reaper may be touching this same VM's mu.
+	phVMResume, phVsockDial, phMount time.Duration
+}
+
+// ResumePhases implements resumePhaser (diag.go). Zero until the first Resume.
+func (v *firecrackerVM) ResumePhases() (vmResume, vsockDial, mount time.Duration) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.phVMResume, v.phVsockDial, v.phMount
+}
+
+func (v *firecrackerVM) stashResumePhases(vmResume, vsockDial, mount time.Duration) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.phVMResume, v.phVsockDial, v.phMount = vmResume, vsockDial, mount
 }
 
 func (v *firecrackerVM) Key() string { return v.key }
@@ -802,19 +821,68 @@ func (v *firecrackerVM) Key() string { return v.key }
 // merely necessary: it re-reads the device's metadata, retiring the stale-metadata
 // hazard a pre-mounted standby would carry (spec §4.3).
 func (v *firecrackerVM) Resume(ctx context.Context) error {
+	// Sub-phase timing for resumePhaser. time.Now(), not a Clock, for the reason the
+	// runOverConn call below already documents: VM implementations have none injected.
+	// Every stamp is recorded even on a failure path -- a Resume that failed IN one of
+	// these steps is when knowing which one matters most -- so each assignment happens
+	// before the error check, and stashResumePhases runs via defer.
+	//
+	// REGISTERED BEFORE THE FIRST RETURN, INCLUDING checkNotDestroyed's. Below the guard
+	// it was skipped on that path, which left the previous values in place -- so
+	// resumePhaser's "a failed Resume overwrites the previous one's values" had an
+	// exception, and a caller reading the stash after a refused Resume (pool.go does,
+	// unconditionally, on the error path) saw another attempt's real measurements rather
+	// than zeros. Entry now always resets the stash, so that invariant holds with no
+	// exception. TestFirecrackerResumeResetsPhasesOnRefusal pins it: that guard returns
+	// before any Firecracker contact, so unlike the stamps below it IS unit-testable.
+	//
+	// THE MOUNT IS STAMPED IN THIS SAME CLOSURE, ON PURPOSE. It used to have a defer of
+	// its own, registered later, and was therefore correct only by LIFO: regroup the two
+	// defers -- which reads as tidier -- and mount_us reports 0 forever while resume_us
+	// keeps reporting normally, on the term that is 78-81% of the phase. One closure
+	// leaves no order to get wrong. mountStart stays zero until the mount is actually
+	// reached, which is what preserves the documented partial-failure shape: a Resume
+	// that fails earlier reports zero for the steps it never entered (see resumePhaser
+	// in diag.go), rather than a duration measured from an unset clock.
+	//
+	// ONE IMPRECISION, ACCEPTED DELIBERATELY: because phMount closes in the closure, it
+	// runs to Resume's RETURN, so it also covers the two checks after runOverConn (the
+	// error and the exit code) -- two comparisons against a 19.2 ms measurement. Capturing
+	// a mountEnd after them would make the stamp exact, and moving the stamp out of the
+	// closure would too, but the latter reinstates the LIFO hazard above; that trade is the
+	// wrong way round, so the boundary is documented instead of moved.
+	var phVMResume, phVsockDial, phMount time.Duration
+	var mountStart time.Time
+	defer func() {
+		if !mountStart.IsZero() {
+			phMount = time.Since(mountStart)
+		}
+		v.stashResumePhases(phVMResume, phVsockDial, phMount)
+	}()
+
 	if err := v.checkNotDestroyed(); err != nil {
 		return err
 	}
 
 	fc := newFCClient(v.apiSockHost)
-	if err := fc.Resume(ctx); err != nil {
-		return fmt.Errorf("firecracker: resume %s: %w", v.id, err)
+	// The clock starts BELOW newFCClient so phVMResume is the PATCH alone, which is what
+	// Phases.VMResume documents it as. newFCClient only allocates (fcapi.go) so this is a
+	// sub-microsecond correction against a 361 us measurement, but the stamp should mean
+	// what its comment says.
+	phaseStart := time.Now()
+	resumeErr := fc.Resume(ctx)
+	phVMResume = time.Since(phaseStart)
+	if resumeErr != nil {
+		return fmt.Errorf("firecracker: resume %s: %w", v.id, resumeErr)
 	}
 
+	dialStart := time.Now()
 	conn, err := dialVsock(v.vsockHostPath, v.vsockPort)
+	phVsockDial = time.Since(dialStart)
 	if err != nil {
 		return fmt.Errorf("firecracker: resume %s: dial vsock: %w", v.id, err)
 	}
+	mountStart = time.Now()
 	// runOverConn closes conn itself (guestconn.go), and this is a FRESH connection
 	// used for exactly this one internal command — never reused by Run, which dials
 	// its own (see runOverConn's doc comment on why: established connections are

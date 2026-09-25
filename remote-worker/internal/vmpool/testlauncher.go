@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os/exec"
 	"sync"
+	"time"
 )
 
 // FakeLauncher runs commands with `bash -c` ON THE HOST instead of in a VM. It
@@ -60,6 +61,31 @@ type fakeHostVM struct {
 }
 
 func (v *fakeHostVM) Key() string { return v.key }
+
+// FakeVMResumeUs, FakeVsockDialUs and FakeMountUs are the sub-phase durations fakeHostVM
+// reports, exported so a test in another package can assert against them rather than
+// restating magic numbers.
+//
+// They are DISTINCT, and that is the point: the three fields have the same type, so a
+// transposition anywhere along the copy chain (VM -> Phases -> sample -> runResult)
+// compiles silently, and on real data would relabel the mount -- 78-81% of the phase --
+// as the dial. Equal placeholders could not tell those apart. They are also all non-zero,
+// so a dropped copy reads as 0 against an expectation rather than matching it.
+const (
+	FakeVMResumeUs  = 11
+	FakeVsockDialUs = 222
+	FakeMountUs     = 3333
+)
+
+// ResumePhases implements resumePhaser (diag.go), so the --vmm=fake path exercises the
+// same decomposition the Firecracker arm reports. Canned rather than measured on purpose:
+// this launcher's Resume does no work, so a clock-derived value would be ~0 and could not
+// distinguish "the value arrived" from "the value was dropped".
+func (v *fakeHostVM) ResumePhases() (vmResume, vsockDial, mount time.Duration) {
+	return FakeVMResumeUs * time.Microsecond,
+		FakeVsockDialUs * time.Microsecond,
+		FakeMountUs * time.Microsecond
+}
 
 func (v *fakeHostVM) Resume(ctx context.Context) error {
 	v.mu.Lock()

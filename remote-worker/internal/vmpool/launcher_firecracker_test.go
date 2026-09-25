@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // requireKVM skips unless SH_KVM=1, following the repo's SH_LIVE_RELAY / M3_LIVE_SMOKE
@@ -445,5 +446,62 @@ func TestDestroyEmitsNothingWithoutDiagPhases(t *testing.T) {
 
 	if logged.Len() != 0 {
 		t.Errorf("Destroy logged %q with SH_DIAG_PHASES unset, want nothing", logged.String())
+	}
+}
+
+// TestFirecrackerResumePhasesRoundTrip pins the stash/read pair that carries Resume's
+// decomposition out of the launcher. Resume itself cannot run without a real Firecracker,
+// so the stamps inside it are not covered here — what IS covered is that a stashed value
+// comes back, in the right slot, under the mutex, and that a fresh VM reads zero.
+//
+// The slot ordering matters enough to assert with three DISTINCT values: the three fields
+// have the same type, so transposing two of them at either end compiles, and would
+// silently relabel 78-81% of the phase as the dial.
+func TestFirecrackerResumePhasesRoundTrip(t *testing.T) {
+	v := &firecrackerVM{}
+
+	// Zero before any Resume -- this is the value resumePhaser (diag.go) documents as
+	// "not decomposed", and the shape a partially-failed Resume reports for the steps it
+	// never entered.
+	if vm, vd, mo := v.ResumePhases(); vm != 0 || vd != 0 || mo != 0 {
+		t.Fatalf("fresh VM: ResumePhases() = (%v, %v, %v), want all zero", vm, vd, mo)
+	}
+
+	wantVM, wantDial, wantMount := 300*time.Microsecond, 2*time.Millisecond, 20*time.Millisecond
+	v.stashResumePhases(wantVM, wantDial, wantMount)
+	gotVM, gotDial, gotMount := v.ResumePhases()
+	if gotVM != wantVM || gotDial != wantDial || gotMount != wantMount {
+		t.Errorf("ResumePhases() = (%v, %v, %v), want (%v, %v, %v)",
+			gotVM, gotDial, gotMount, wantVM, wantDial, wantMount)
+	}
+
+	// Last-write-wins, which is what "the LAST Resume's" means in the struct comment: a
+	// second attempt on the same VM must not blend with the first.
+	v.stashResumePhases(time.Millisecond, 2*time.Millisecond, 3*time.Millisecond)
+	if vm, vd, mo := v.ResumePhases(); vm != time.Millisecond || vd != 2*time.Millisecond || mo != 3*time.Millisecond {
+		t.Errorf("after restash: ResumePhases() = (%v, %v, %v), want (1ms, 2ms, 3ms)", vm, vd, mo)
+	}
+}
+
+// TestFirecrackerResumeResetsPhasesOnRefusal pins the one branch of Resume that needs no
+// hypervisor: checkNotDestroyed returns before any Firecracker contact.
+//
+// The stash defer must be registered ABOVE that guard. Below it, this path stashed nothing
+// and left the previous values in place -- so resumePhaser's "a failed Resume overwrites
+// the previous one's values" had a silent exception, and pool.go, which reads the stash
+// unconditionally on the error path, would attribute another attempt's real measurements to
+// the refused one. Zeros it has a story for; someone else's numbers it does not.
+func TestFirecrackerResumeResetsPhasesOnRefusal(t *testing.T) {
+	v := &firecrackerVM{id: "vm-refused"}
+	v.stashResumePhases(300*time.Microsecond, 2*time.Millisecond, 20*time.Millisecond)
+	v.destroyed = true
+
+	if err := v.Resume(context.Background()); err == nil {
+		t.Fatal("Resume on a destroyed VM returned nil, want a used-after-Destroy error")
+	}
+	if vm, vd, mo := v.ResumePhases(); vm != 0 || vd != 0 || mo != 0 {
+		t.Errorf("after a refused Resume: ResumePhases() = (%v, %v, %v), want all zero -- "+
+			"the stash defer is below the checkNotDestroyed guard, so the refused attempt "+
+			"is reporting the previous attempt's measurements as its own", vm, vd, mo)
 	}
 }
